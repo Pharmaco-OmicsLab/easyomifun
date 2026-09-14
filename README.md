@@ -1,5 +1,7 @@
 # EasyOmiFun
 
+[![Try It Here](https://img.shields.io/badge/🚀_Try_It_Here!-easyverse.app%2Feasyomifun-2ea44f?style=for-the-badge)](https://easyverse.app/easyomifun/)
+
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 [![R: 4.4.3](https://img.shields.io/badge/R-4.4.3-276DC3.svg)](https://www.r-project.org/)
 [![Python: 3.11.15](https://img.shields.io/badge/Python-3.11.15-3776AB.svg)](https://www.python.org/)
@@ -30,7 +32,12 @@ An interactive, modular analytical framework designed for multi-omics biomarker 
 ## Overview
 
 **EasyOmiFun** - An Open-source Analytical Platform for Rapid Omics Data Analysis and Clinically Actionable Biomarker Discovery
-Lower the technical barrier for scientists with user-friendly interface. Utilizing state-of-the-art machine learning algorithms to transform raw omics data into actionable insights.
+
+Lowering the technical barrier for scientists with user-friendly interface. Utilizing state-of-the-art machine learning algorithms to transform raw omics data into actionable insights.
+
+> **Experience EasyOmiFun Online (Zero Installation Required)**  
+> Run end-to-end omics analysis, explore built-in demo datasets, and generate publication-ready visualizations directly in your browser:  
+> **👉 [Launch Interactive Platform ➔ https://easyverse.app/easyomifun/](https://easyverse.app/easyomifun/)**
 
 ---
 
@@ -129,7 +136,7 @@ The platform uses a decoupled client-server architecture:
 
 ## Sample Data
 
-Demonstration datasets are provided in [`backend/sample_data/`](file:///home/doan-trung-kien/Documents/Pharmaco-Omics_Lab/easyomifun/easyomifun_public/backend/sample_data):
+Demonstration datasets are provided in [`backend/sample_data/`](backend/sample_data):
 
 - `expression.csv`: Normalized RNA-Seq count matrix (genes × samples).
 - `clinical.csv`: Corresponding sample metadata with condition classes and covariates.
@@ -320,7 +327,7 @@ Rscript app.R
 
 ```bash
 cd frontend
-npm run dev
+VITE_ELECTRON=true npm run dev
 ```
 
 > The Vite development server will start on **`http://localhost:5173`** and proxy `/api` requests to `http://localhost:8080`.
