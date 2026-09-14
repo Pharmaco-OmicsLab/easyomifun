@@ -6,7 +6,7 @@
 [![Node: >= 18](https://img.shields.io/badge/Node-%3E%3D%2018-339933.svg)](https://nodejs.org/)
 [![TypeScript](https://img.shields.io/badge/TypeScript-5.x-3178C6.svg)](https://www.typescriptlang.org/)
 
-An interactive, modular analytical framework designed for multi-omics data preprocessing, differential expression analysis, machine learning biomarker selection, and functional pathway enrichment.
+An interactive, modular analytical framework designed for multi-omics biomarker identification, complemented with analysis modules for biological interpretation.
 
 > **Note**: This repository contains the source code accompanying the manuscript for journal review and academic code display.
 
@@ -29,7 +29,8 @@ An interactive, modular analytical framework designed for multi-omics data prepr
 
 ## Overview
 
-**EasyOmiFun** a platform designed for clinically relevant biomarkers discovery. Transforming raw omics data into actionable insights with publication-ready figures, statistical summaries, and downloadable analysis reports.
+**EasyOmiFun** - An Open-source Analytical Platform for Rapid Omics Data Analysis and Clinically Actionable Biomarker Discovery
+Lower the technical barrier for scientists with user-friendly interface. Utilizing state-of-the-art machine learning algorithms to transform raw omics data into actionable insights.
 
 ---
 
@@ -80,7 +81,7 @@ The platform uses a decoupled client-server architecture:
 - Visualizations: Dot plots, pathway bar charts, and gene-concept networks.
 
 ### 4. Data Processing & Quality Control
-- **Probe/Feature Annotation**: Maps platform-specific probe IDs and Ensembl IDs to standard NCBI Gene Symbols across common human and mouse platforms.
+- **Probe/Feature Annotation**: Maps platform-specific probe IDs and Ensembl IDs to standard Gene Symbols.
 - **Filtering & Imputation**: Custom zero/missing value thresholds, low-expression filtering, and missing-value imputation.
 - **Normalization**: Supports platform-appropriate normalization strategies:
   - RNA-Seq: DESeq2 Median-of-Ratios, edgeR TMM, CPM, FPKM/TPM.
@@ -286,8 +287,8 @@ Rscript backend/install_packages.R
 | `preprocessCore` | `1.68.0` | Microarray preprocessing & quantile normalization |
 | `SummarizedExperiment` | `1.36.0` | Genomic assays & experiment data container |
 | `sva` | `3.54.0` | ComBat batch effect removal |
-| `vsn` | Bioc 3.20 | Variance stabilization normalization |
-| `impute` | Bioc 3.20 | Microarray imputation |
+| `vsn` | `3.74.0` | Variance stabilization normalization |
+| `impute` | `1.80.0` | Microarray imputation |
 
 #### 5. Frontend Setup
 
