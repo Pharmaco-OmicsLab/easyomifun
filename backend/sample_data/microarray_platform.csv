@@ -1,0 +1,14 @@
+organisms,Platform,Platform name,cdf,annotation
+Homo sapeins,Affymetrix,HG-U133A 2.0,hgu133a2cdf,hgu133a2.db
+Homo sapiens,Affymetrix,HG-U133 Plus 2.0,hgu133plus2cdf,hgu133plus2.db
+Homo sapiens,Affymetrix,HG-U219,hgu219cdf,hgu219.db
+Homo sapeins,Affymetrix,Human Gene 1.0 ST,hugene10stcdf*,hugene10sttranscriptcluster.db
+Mus musculus,Affymetrix,MoGene 1.0 ST,mogene10stcdf*,mogene10sttranscriptcluster.db
+Mus musculus,Affymetrix,MoGene 2.0 ST,mogene20stcdf*,mogene20sttranscriptcluster.db
+Rattus norvegicus,Affymetrix,Rat Gene 1.0 ST,ragene10stcdf*,ragene10sttranscriptcluster.db
+Gallus gallus,Affymetrix,Chicken Genome Array,chickencdf,chicken.db
+Sus scrofa,Affymetrix,Porcine Genome Array,porcinecdf,porcine.db
+Homo sapeins,Illumina,HumanHT-12 v3,,illuminaHumanv3.db
+Homo sapeins,Illumina,HumanHT-12 v4,,illuminaHumanv4.db
+Mus musculus,Illumina,MouseRef-8 v2,,illuminaMousev2.db
+Rattus norvegicus,Illumina,RatRef-12,,illuminaRatv1.db
