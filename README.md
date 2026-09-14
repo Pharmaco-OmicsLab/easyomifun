@@ -1,7 +1,5 @@
 # EasyOmiFun
 
-[![Try It Here](https://img.shields.io/badge/🚀_Try_It_Here!-easyverse.app%2Feasyomifun-2ea44f?style=for-the-badge)](https://easyverse.app/easyomifun/)
-
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 [![R: 4.4.3](https://img.shields.io/badge/R-4.4.3-276DC3.svg)](https://www.r-project.org/)
 [![Python: 3.11.15](https://img.shields.io/badge/Python-3.11.15-3776AB.svg)](https://www.python.org/)
@@ -10,7 +8,11 @@
 
 An interactive, modular analytical framework designed for multi-omics biomarker identification, complemented with analysis modules for biological interpretation.
 
-> **Note**: This repository contains the source code accompanying the manuscript for journal review and academic code display.
+
+> ## 🚀 [Click Here to Launch the Live Web App (easyverse.app/easyomifun)](https://easyverse.app/easyomifun/)
+> **No installation or setup required!** 
+>
+> End-to-end interactive platform for multi-omics biomarker discovery with machine learning-based feature selection methods, differential expression, and functional pathway enrichment interactively in your browser.
 
 ---
 
@@ -34,10 +36,6 @@ An interactive, modular analytical framework designed for multi-omics biomarker 
 **EasyOmiFun** - An Open-source Analytical Platform for Rapid Omics Data Analysis and Clinically Actionable Biomarker Discovery
 
 Lowering the technical barrier for scientists with user-friendly interface. Utilizing state-of-the-art machine learning algorithms to transform raw omics data into actionable insights.
-
-> **Experience EasyOmiFun Online (Zero Installation Required)**  
-> Run end-to-end omics analysis, explore built-in demo datasets, and generate publication-ready visualizations directly in your browser:  
-> **👉 [Launch Interactive Platform ➔ https://easyverse.app/easyomifun/](https://easyverse.app/easyomifun/)**
 
 ---
 
@@ -91,8 +89,8 @@ The platform uses a decoupled client-server architecture:
 - **Probe/Feature Annotation**: Maps platform-specific probe IDs and Ensembl IDs to standard Gene Symbols.
 - **Filtering & Imputation**: Custom zero/missing value thresholds, low-expression filtering, and missing-value imputation.
 - **Normalization**: Supports platform-appropriate normalization strategies:
-  - RNA-Seq: DESeq2 Median-of-Ratios, edgeR TMM, CPM, FPKM/TPM.
-  - Microarray: Quantile normalization, RMA-like background adjustment.
+  - RNA-Seq: Regularized log transformation, edgeR TMM, CPM, VST.
+  - Microarray: Quantile normalization, Variance stabilizing normalization.
 - **Batch Effect Removal**: ComBat-based empirical Bayes batch correction (`sva`) with pre- and post-correction PCA visualizations.
 
 ### 5. Reproducibility & Export
