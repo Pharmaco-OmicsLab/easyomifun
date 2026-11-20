@@ -11,6 +11,18 @@
 
 cat("=== EasyOmiFun: Installing R dependencies ===\n")
 
+args        <- commandArgs(trailingOnly = TRUE)
+r_only      <- "--r-only" %in% args || Sys.getenv("EASYOMIFUN_R_ONLY") == "TRUE"
+app_mode    <- Sys.getenv("EASYOMIFUN_APP_MODE", unset = "")
+with_python <- "--with-python" %in% args ||
+               Sys.getenv("EASYOMIFUN_INSTALL_PYTHON") == "TRUE" ||
+               (identical(app_mode, "desktop") && !r_only)
+
+if (r_only) {
+  cat("R-only mode enabled: Skipping Python/Miniconda setup.\n")
+} else if (with_python) {
+  cat("Desktop/Python mode enabled: Will configure Miniconda3 and pinned Python/STABL packages.\n")
+}
 
 # ── Global options ────────────────────────────────────────────────────────────
 options(download.file.method = "libcurl")
@@ -50,6 +62,7 @@ options(install.packages.ask = FALSE)
 options(menu.graphics = FALSE)
 options(device.ask.default = FALSE)
 Sys.setenv(DEBIAN_FRONTEND = "noninteractive")
+Sys.setenv(PIP_NO_INPUT = "1")
 # Enable parallel downloads and package compilation/extraction where supported by R
 options(Ncpus = max(1, parallel::detectCores()))
 
@@ -121,7 +134,6 @@ script.dir <- if (length(script.name) > 0) dirname(normalizePath(script.name)) e
 
 env_custom_lib <- Sys.getenv("EASYOMIFUN_RLIB", unset = "")
 env_user_lib   <- Sys.getenv("R_LIBS_USER", unset = "")
-app_mode       <- Sys.getenv("EASYOMIFUN_APP_MODE", unset = "")
 
 local_lib <- if (nzchar(env_custom_lib)) {
   env_custom_lib
@@ -141,10 +153,13 @@ if (dir.exists(bundled_lib) && bundled_lib != local_lib) {
 }
 .libPaths(unique(c(paths_to_set, .Library)))
 Sys.setenv(R_LIBS_USER = local_lib)
-Sys.setenv(R_LIBS_SITE = local_lib)
+Sys.setenv(R_LIBS_SITE = if (dir.exists(bundled_lib)) bundled_lib else local_lib)
 Sys.setenv(R_LIBS = paste(.libPaths(), collapse = .Platform$path.sep))
 
 cat(sprintf("Using R library: %s\n", local_lib))
+if (dir.exists(bundled_lib) && bundled_lib != local_lib) {
+  cat(sprintf("Bundled R library: %s\n", bundled_lib))
+}
 flush.console()
 
 # ── Package Definitions (CRAN & Bioconductor pinned versions) ───────────────
@@ -276,9 +291,9 @@ cran_pkgs <- c(
 
 # ── Helper: version string normalization ──────────────────────────────────────
 normalize_ver <- function(v) {
-  if (is.null(v) || is.na(v)) return("")
-  gsub("-", ".", v, fixed = TRUE)
-}
+    if (is.null(v) || is.na(v) || !nzchar(v)) return("")
+    tryCatch(as.character(package_version(v)), error = function(e) gsub("-", ".", v, fixed = TRUE))
+  }
 
 # ── Helper: get installed package version ─────────────────────────────────────
 get_pkg_version <- function(pkg) {
@@ -757,14 +772,13 @@ install_with_retry_and_deps <- function(pkgs) {
     repo_url <- db[pkg, "Repository"]
     is_src <- grepl("src/contrib", repo_url, fixed = TRUE)
     
+    is_bin_type <- grepl("binary", getOption("pkgType", ""))
     pkg_ext <- if (is_src) {
       ".tar.gz"
+    } else if (is_bin_type || grepl("/bin/windows/|/bin/macosx/", repo_url)) {
+      if (.Platform$OS.type == "windows" || grepl("/bin/windows/", repo_url)) ".zip" else ".tgz"
     } else {
-      if (getOption("pkgType") == "binary") {
-        if (.Platform$OS.type == "windows") ".zip" else ".tgz"
-      } else {
-        ".tar.gz"
-      }
+      ".tar.gz"
     }
     
     filename <- paste0(pkg, "_", db[pkg, "Version"], pkg_ext)
@@ -772,12 +786,12 @@ install_with_retry_and_deps <- function(pkgs) {
     dest <- file.path(tmp_dir, filename)
     
     if (pkg == "Boruta" && !is.null(cran_versions[["Boruta"]]) && cran_versions[["Boruta"]] == "9.0.0") {
-      if (.Platform$OS.type == "windows" && getOption("pkgType") == "binary") {
+      if (.Platform$OS.type == "windows" && is_bin_type) {
         url <- "https://cloud.r-project.org/bin/windows/contrib/4.4/Boruta_9.0.0.zip"
         filename <- "Boruta_9.0.0.zip"
         dest <- file.path(tmp_dir, filename)
         is_src <- FALSE
-      } else if (Sys.info()[["sysname"]] == "Darwin" && getOption("pkgType") == "binary") {
+      } else if (Sys.info()[["sysname"]] == "Darwin" && is_bin_type) {
         arch <- if (grepl("arm|aarch64", Sys.info()["machine"])) "big-sur-arm64" else "big-sur-x86_64"
         url <- sprintf("https://cloud.r-project.org/bin/macosx/%s/contrib/4.4/Boruta_9.0.0.tgz", arch)
         filename <- "Boruta_9.0.0.tgz"
@@ -797,13 +811,28 @@ install_with_retry_and_deps <- function(pkgs) {
       FALSE
     })
     
+    if (!dl_ok && !is_src) {
+      src_repo_url <- sub("/bin/(windows|macosx[^/]*)/contrib/[^/]+$", "/src/contrib", repo_url)
+      src_filename <- paste0(pkg, "_", db[pkg, "Version"], ".tar.gz")
+      src_url      <- paste0(src_repo_url, "/", src_filename)
+      src_dest     <- file.path(tmp_dir, src_filename)
+      cat(sprintf("  [FALLBACK] Trying source package for '%s' from %s...\n", pkg, src_url))
+      flush.console()
+      dl_ok <- tryCatch({
+        download_with_retry(src_url, src_dest)
+        dest <- src_dest
+        is_src <- TRUE
+        TRUE
+      }, error = function(e) {
+        cat(sprintf("  [ERROR] Source fallback also failed for '%s': %s\n", pkg, conditionMessage(e)))
+        FALSE
+      })
+    }
+    
     if (dl_ok) {
       downloaded_files <- c(downloaded_files, dest)
     } else {
-      # Try fallback to source if binary download failed and we are not on Windows
-      if (!is_src && getOption("pkgType") == "binary") {
-        # Check if source package is available
-        # But since wininet should succeed with retries, we stop on error
+      if (!is_src && is_bin_type) {
         stop(sprintf("Failed to download required package dependency: %s", pkg))
       }
     }
@@ -927,6 +956,187 @@ sync_from_renv_lock <- function() {
 # Run synchronization if renv.lock is present
 sync_from_renv_lock()
 
+# ── Helper: download and install pure-Python knockpy (avoids C compiler) ─────
+install_pure_knockpy <- function(conda_path, pip_exe) {
+  cat("Downloading and installing pure-Python knockpy...\n"); flush.console()
+  temp_dir <- file.path(conda_path, "knockpy-temp")
+  if (dir.exists(temp_dir)) unlink(temp_dir, recursive = TRUE, force = TRUE)
+  dir.create(temp_dir, recursive = TRUE, showWarnings = FALSE)
+
+  tar_url  <- "https://files.pythonhosted.org/packages/source/k/knockpy/knockpy-1.3.1.tar.gz"
+  tar_path <- file.path(temp_dir, "knockpy-1.3.1.tar.gz")
+
+  download_ok <- tryCatch({
+    download_with_retry(tar_url, tar_path, mode = "wb")
+    TRUE
+  }, error = function(e) FALSE)
+
+  if (!download_ok) {
+    cat("  Fallback: downloading via pip...\n"); flush.console()
+    system2(pip_exe, args = c("download", "knockpy==1.3.1", "--no-binary", ":all:", "--no-deps", "-d", temp_dir, "--timeout", "120", "--retries", "5"), stdout = FALSE, stderr = FALSE)
+    tar_files <- list.files(temp_dir, pattern = "\\.tar\\.gz$", full.names = TRUE)
+    if (length(tar_files) > 0) tar_path <- tar_files[1]
+  }
+
+  untar(tar_path, exdir = temp_dir)
+
+  tar_files     <- list.files(temp_dir, pattern = "\\.tar\\.gz$", full.names = TRUE)
+  tar_basename  <- if (length(tar_files) > 0) basename(tar_files[1]) else basename(tar_path)
+  dir_name      <- sub("\\.tar\\.gz$", "", tar_basename)
+  extracted_dir <- file.path(temp_dir, dir_name)
+  setup_py      <- file.path(extracted_dir, "setup.py")
+
+  if (file.exists(setup_py)) {
+    lines     <- readLines(setup_py, warn = FALSE)
+    new_lines <- gsub("ext_modules\\s*=\\s*ext_modules", "ext_modules = []", lines)
+    new_lines <- gsub("ext_modules\\s*=\\s*\\[[^\\]]*\\]", "ext_modules = []", new_lines)
+    writeLines(new_lines, setup_py)
+
+    mlr_py <- file.path(extracted_dir, "knockpy", "mlr", "mlr.py")
+    if (file.exists(mlr_py)) {
+      cat("  Mocking Cython imports in knockpy/mlr/mlr.py...\n"); flush.console()
+      mlr_lines <- readLines(mlr_py, warn = FALSE)
+      mlr_lines <- gsub("from \\._mlr_spikeslab_fx import _sample_mlr_spikeslab_fx",
+                        "try:\n    from ._mlr_spikeslab_fx import _sample_mlr_spikeslab_fx\nexcept ImportError:\n    def _sample_mlr_spikeslab_fx(*args, **kwargs):\n        raise RuntimeError('MLR_FX_Spikeslab is not available (Cython extension not compiled).')",
+                        mlr_lines)
+      mlr_lines <- gsub("from \\._mlr_spikeslab import _sample_mlr_spikeslab",
+                        "try:\n    from ._mlr_spikeslab import _sample_mlr_spikeslab\nexcept ImportError:\n    def _sample_mlr_spikeslab(*args, **kwargs):\n        raise RuntimeError('MLR_Spikeslab is not available (Cython extension not compiled).')",
+                        mlr_lines)
+      mlr_lines <- gsub("from \\._mlr_spikeslab_group import _sample_mlr_spikeslab_group",
+                        "try:\n    from ._mlr_spikeslab_group import _sample_mlr_spikeslab_group\nexcept ImportError:\n    def _sample_mlr_spikeslab_group(*args, **kwargs):\n        raise RuntimeError('MLR_Spikeslab_Group is not available (Cython extension not compiled).')",
+                        mlr_lines)
+      mlr_lines <- gsub("from \\._mlr_oracle import _sample_mlr_oracle_gaussian, _sample_mlr_oracle_logistic",
+                        "try:\n    from ._mlr_oracle import _sample_mlr_oracle_gaussian, _sample_mlr_oracle_logistic\nexcept ImportError:\n    def _sample_mlr_oracle_gaussian(*args, **kwargs):\n        raise RuntimeError('OracleMLR (Gaussian) is not available (Cython extension not compiled).')\n    def _sample_mlr_oracle_logistic(*args, **kwargs):\n        raise RuntimeError('OracleMLR (Logistic) is not available (Cython extension not compiled).')",
+                        mlr_lines)
+      writeLines(mlr_lines, mlr_py)
+    }
+
+    cat("  Installing stripped knockpy...\n"); flush.console()
+    old_wd <- getwd()
+    setwd(extracted_dir)
+    status <- system2(pip_exe, args = c("install", ".", "--no-deps"), stdout = "", stderr = "")
+    setwd(old_wd)
+
+    if (status == 0) {
+      cat("  Pure-Python knockpy installed successfully!\n"); flush.console()
+    } else {
+      stop("Failed to install modified knockpy package.")
+    }
+  } else {
+    stop("Could not extract knockpy setup.py")
+  }
+
+  unlink(temp_dir, recursive = TRUE, force = TRUE)
+}
+
+# ── Helper: custom Miniconda silent installer ─────────────────────────────────
+install_miniconda_silent <- function(conda_path) {
+  tmp <- tempdir()
+
+  if (.Platform$OS.type == "windows") {
+    url  <- "https://repo.anaconda.com/miniconda/Miniconda3-latest-Windows-x86_64.exe"
+    inst <- file.path(tmp, "Miniconda3-installer.exe")
+    cat(sprintf("Downloading and installing Miniconda from %s...\n", url)); flush.console()
+    tryCatch(
+      download_with_retry(url, inst, mode = "wb"),
+      error = function(e) { cat("[ERROR] Miniconda download failed:", conditionMessage(e), "\n"); flush.console(); stop(e) }
+    )
+    cat("Running Miniconda silent installer...\n"); flush.console()
+    conda_win <- normalizePath(conda_path, winslash = "\\", mustWork = FALSE)
+    status <- system2(inst, args = c("/S", paste0("/D=", conda_win)),
+                      stdout = "", stderr = "")
+    unlink(inst)
+
+  } else if (Sys.info()["sysname"] == "Darwin") {
+    electron_arch <- Sys.getenv("EASYOMIFUN_ELECTRON_ARCH", "")
+    uname_m <- tryCatch(trimws(system("uname -m", intern = TRUE, ignore.stderr = TRUE)), error = function(e) "")
+    is_arm <- identical(electron_arch, "arm64") ||
+              grepl("arm64|aarch64", uname_m, ignore.case = TRUE) ||
+              identical(R.version$arch, "aarch64") ||
+              (identical(Sys.info()[["machine"]], "arm64") && !identical(R.version$arch, "x86_64"))
+    arch <- if (is_arm) "arm64" else "x86_64"
+    url  <- sprintf("https://repo.anaconda.com/miniconda/Miniconda3-latest-MacOSX-%s.sh", arch)
+    inst <- file.path(tmp, "Miniconda3-installer.sh")
+    cat(sprintf("Downloading and installing Miniconda (%s) from %s...\n", arch, url)); flush.console()
+    tryCatch(
+      download_with_retry(url, inst, mode = "wb"),
+      error = function(e) { cat("[ERROR] Miniconda download failed:", conditionMessage(e), "\n"); flush.console(); stop(e) }
+    )
+    Sys.chmod(inst, mode = "0755")
+    cat("Running Miniconda silent installer...\n"); flush.console()
+    cmd_str <- sprintf("'%s' -b -p '%s' -u", inst, conda_path)
+    status <- system(cmd_str)
+    unlink(inst)
+
+  } else {
+    url  <- "https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh"
+    inst <- file.path(tmp, "Miniconda3-installer.sh")
+    cat(sprintf("Downloading and installing Miniconda from %s...\n", url)); flush.console()
+    tryCatch(
+      download_with_retry(url, inst, mode = "wb"),
+      error = function(e) { cat("[ERROR] Miniconda download failed:", conditionMessage(e), "\n"); flush.console(); stop(e) }
+    )
+    Sys.chmod(inst, mode = "0755")
+    cat("Running Miniconda silent installer...\n"); flush.console()
+    cmd_str <- sprintf("'%s' -b -p '%s' -u", inst, conda_path)
+    status <- system(cmd_str)
+    unlink(inst)
+  }
+
+  if (status == 0) {
+    cat("Miniconda installation complete!\n"); flush.console()
+    return(TRUE)
+  }
+  cat(sprintf("[ERROR] Miniconda installer exited with code %s\n", status)); flush.console()
+  return(FALSE)
+}
+
+# ── Helper: find conda binary ─────────────────────────────────────────────────
+get_conda_bin <- function(conda_path) {
+  candidates <- if (.Platform$OS.type == "windows") {
+    c(file.path(conda_path, "Scripts", "conda.exe"),
+      file.path(conda_path, "condabin", "conda.bat"),
+      file.path(conda_path, "Library", "bin", "conda.bat"),
+      file.path(conda_path, "bin", "conda.exe"))
+  } else {
+    c(file.path(conda_path, "bin", "conda"),
+      file.path(conda_path, "condabin", "conda"),
+      file.path(conda_path, "_conda"))
+  }
+  found <- candidates[file.exists(candidates)]
+  if (length(found) > 0) found[1] else NULL
+}
+
+# ── Helper: find Python binary in Miniconda ───────────────────────────────────
+get_conda_python <- function(conda_path) {
+  candidates <- if (.Platform$OS.type == "windows") {
+    c(file.path(conda_path, "python.exe"),
+      file.path(conda_path, "Scripts", "python.exe"))
+  } else {
+    c(file.path(conda_path, "bin", "python"),
+      file.path(conda_path, "bin", "python3"))
+  }
+  found <- candidates[file.exists(candidates)]
+  if (length(found) > 0) found[1] else NULL
+}
+
+# ── Helper: check if Miniconda is functional ──────────────────────────────────
+is_miniconda_functional <- function(conda_path) {
+  if (!dir.exists(conda_path)) return(FALSE)
+  !is.null(get_conda_python(conda_path)) && !is.null(get_conda_bin(conda_path))
+}
+
+# ── Helper: check if STABL is installed and importable in Miniconda ───────────
+is_stabl_functional <- function(conda_path) {
+  py_exe <- get_conda_python(conda_path)
+  if (is.null(py_exe)) return(FALSE)
+  status <- tryCatch(
+    system2(py_exe, args = c("-c", "\"import stabl, knockpy, sklearn, fpdf\""), stdout = FALSE, stderr = FALSE),
+    error = function(e) 1L
+  )
+  identical(as.integer(status), 0L)
+}
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # STEP 1 — Bootstrap: pre-install pure-R packages with no R 4.4 binary
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -973,11 +1183,177 @@ if (!is_pkg_ok("reticulate")) {
   stop("Failed to install required package: reticulate.")
 }
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# STEP 3 — Desktop / Python Mode: Install Miniconda3 & Pinned STABL Stack
+# (Executed only for Local Electron Desktop App or when --with-python is set;
+#  skipped when users run standalone `Rscript install_packages.R` from GitHub)
+# ═══════════════════════════════════════════════════════════════════════════════
+conda_path_target <- NULL
+if (with_python) {
+  cat("\n=== STEP 3: Configuring Python & STABL Environment (Miniconda3) ===\n"); flush.console()
+  env_conda <- Sys.getenv("RETICULATE_MINICONDA_PATH", unset = "")
+  conda_path_target <- if (nzchar(env_conda)) env_conda else {
+    if (Sys.info()["sysname"] == "Darwin") {
+      file.path(Sys.getenv("HOME"), "Library", "EasyOmiFun", "miniconda")
+    } else if (.Platform$OS.type == "windows") {
+      appdata <- Sys.getenv("APPDATA", "")
+      p <- if (nzchar(appdata)) file.path(appdata, "EasyOmiFun", "miniconda") else ""
+      if (nzchar(p) && nchar(p) <= 68) {
+        p
+      } else {
+        home_p <- file.path(Sys.getenv("USERPROFILE"), ".easyomifun", "miniconda")
+        if (nzchar(home_p) && nchar(home_p) <= 68) home_p else "C:/EasyOmiFun/miniconda"
+      }
+    } else {
+      file.path(script.dir, "miniconda")
+    }
+  }
+
+  # Guard against Windows Miniconda NSIS 68-character MAX_PATH limit
+  if (.Platform$OS.type == "windows" && nchar(conda_path_target) > 68) {
+    cat(sprintf("[Miniconda] Warning: Selected target path is %d characters (> 68 character Windows limit): %s\n",
+                nchar(conda_path_target), conda_path_target))
+    appdata <- Sys.getenv("APPDATA", "")
+    short_target <- if (nzchar(appdata)) file.path(appdata, "EasyOmiFun", "miniconda") else ""
+    if (nzchar(short_target) && nchar(short_target) <= 68) {
+      conda_path_target <- short_target
+    } else {
+      home_p <- file.path(Sys.getenv("USERPROFILE"), ".easyomifun", "miniconda")
+      if (nzchar(home_p) && nchar(home_p) <= 68) {
+        conda_path_target <- home_p
+      } else {
+        conda_path_target <- "C:/EasyOmiFun/miniconda"
+      }
+    }
+    cat(sprintf("[Miniconda] Automatically adjusted target path to: %s (%d characters)\n",
+                conda_path_target, nchar(conda_path_target)))
+  }
+
+  conda_path_target <- tryCatch(normalizePath(conda_path_target, winslash = "/", mustWork = FALSE), error = function(e) conda_path_target)
+  Sys.setenv(RETICULATE_MINICONDA_PATH = conda_path_target)
+  cat(sprintf("Using Miniconda path: %s\n", conda_path_target)); flush.console()
+
+  if (!is_miniconda_functional(conda_path_target)) {
+    if (dir.exists(conda_path_target)) {
+      cat("Removing incomplete/empty Miniconda directory for a fresh install...\n"); flush.console()
+      unlink(conda_path_target, recursive = TRUE, force = TRUE)
+    }
+    cat("Miniconda (~90 MB) not found - downloading now...\n")
+    cat("This can take 5-15 minutes on slower connections - please wait.\n")
+    flush.console()
+    install_ok <- tryCatch(
+      install_miniconda_silent(conda_path_target),
+      error = function(e) {
+        cat(sprintf("[ERROR] Miniconda setup error: %s\n", conditionMessage(e)))
+        FALSE
+      }
+    )
+    if (!isTRUE(install_ok)) {
+      stop(sprintf("Miniconda silent installation failed for target: %s", conda_path_target))
+    }
+  } else {
+    cat("Miniconda already installed and functional.\n"); flush.console()
+  }
+
+  conda_bin <- get_conda_bin(conda_path_target)
+  if (is.null(conda_bin)) stop("Cannot locate conda binary inside Miniconda installation.")
+
+  if (is_stabl_functional(conda_path_target)) {
+    cat("Python and STABL dependencies already installed and verified!\n"); flush.console()
+    cat("Python and STABL dependencies configured successfully!\n"); flush.console()
+  } else {
+    cat(sprintf("Using conda binary: %s\n", conda_bin)); flush.console()
+
+    # 3a: Accept Anaconda ToS (required by Miniconda >= 26.x)
+    cat("Accepting Anaconda channel Terms of Service...\n"); flush.console()
+    for (ch in c("https://repo.anaconda.com/pkgs/main",
+                 "https://repo.anaconda.com/pkgs/r",
+                 "https://repo.anaconda.com/pkgs/msys2")) {
+      tryCatch(
+        system2(conda_bin,
+                args   = c("tos", "accept", "--override-channels", "--channel", ch),
+                stdout = TRUE, stderr = TRUE),
+        error = function(e) NULL
+      )
+      cat(sprintf("  [ToS] %s: accepted\n", ch)); flush.console()
+    }
+
+    # Configure conda network timeouts and retries for stability
+    tryCatch({
+      cat("Configuring Conda network settings for reliability...\n"); flush.console()
+      system2(conda_bin, args = c("config", "--set", "remote_connect_timeout_secs", "60.0"), stdout = FALSE, stderr = FALSE)
+      system2(conda_bin, args = c("config", "--set", "remote_read_timeout_secs", "300.0"), stdout = FALSE, stderr = FALSE)
+      system2(conda_bin, args = c("config", "--set", "remote_max_retries", "5"), stdout = FALSE, stderr = FALSE)
+    }, error = function(e) NULL)
+
+    tryCatch({
+      # 3b: Install all necessary compiled dependencies from conda-forge (pinned versions)
+      cat("[1/3] Installing core Python libraries (conda-forge, pinned versions)...\n"); flush.console()
+      reticulate::conda_install(
+        envname  = conda_path_target,
+        packages = c(
+          "python=3.11.15",          # pinned: 3.11.15 (conda-forge)
+          "numpy=2.4.6",             # pinned
+          "pandas=3.0.5",            # pinned
+          "scipy=1.17.1",            # pinned
+          "scikit-learn=1.9.0",      # pinned
+          "matplotlib=3.11.1",       # pinned
+          "statsmodels=0.14.6",      # pinned
+          "networkx=3.6.1",          # pinned
+          "cvxpy=1.9.2",             # pinned
+          "joblib=1.5.3",            # pinned
+          "seaborn=0.13.2",          # pinned
+          "openpyxl=3.1.5",          # pinned
+          "tqdm=4.70.0",             # pinned
+          "adjusttext=1.4.0"         # pinned
+        ),
+        conda    = conda_bin,
+        channel  = "conda-forge"
+      )
+
+      # 3c: Determine path to pip inside the conda environment
+      pip_exe <- if (.Platform$OS.type == "windows") {
+        file.path(conda_path_target, "Scripts", "pip.exe")
+      } else {
+        file.path(conda_path_target, "bin", "pip")
+      }
+
+      # 3d: Install knockpy — pinned to 1.3.5 (with pure-Python fallback)
+      cat("[2/3] Installing knockpy==1.3.5 (pinned)...\n"); flush.console()
+      knockpy_status <- system2(pip_exe,
+        args   = c("install", "--no-deps", "--timeout", "120", "--retries", "5",
+                   "knockpy==1.3.5"),
+        stdout = "", stderr = "")
+      if (knockpy_status != 0) {
+        cat("  [WARN] pip install knockpy==1.3.5 failed — falling back to pure-Python mode.\n")
+        flush.console()
+        install_pure_knockpy(conda_path_target, pip_exe)
+      }
+
+      # 3e: Install Stabl itself (pure Python) via pip — pinned to v1.0.1-lw
+      cat("[3/3] Installing Stabl from GitHub ZIP archive via pip...\n"); flush.console()
+      status <- system2(pip_exe, args = c("install", "--no-deps", "--timeout", "120", "--retries", "5",
+                                          "https://github.com/gregbellan/Stabl/archive/refs/tags/v1.0.1-lw.zip"),
+                        stdout = "", stderr = "")
+      if (status != 0) stop("Failed to install Stabl package via pip.")
+
+      # 3f: Install fpdf2 for instant cross-platform PDF generation
+      cat("Installing fpdf2 for PDF report generation...\n"); flush.console()
+      tryCatch({
+        system2(pip_exe, args = c("install", "--timeout", "120", "--retries", "5", "fpdf2"), stdout = "", stderr = "")
+      }, error = function(e) cat("[WARN] Failed to install fpdf2:", conditionMessage(e), "\n"))
+
+      cat("Python and STABL dependencies configured successfully!\n"); flush.console()
+    }, error = function(e) {
+      stop(sprintf("Failed to install Python dependencies: %s", conditionMessage(e)))
+    })
+  }
+}
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# STEP 3 — Install BiocManager
+# STEP 4 — Install BiocManager
 # ═══════════════════════════════════════════════════════════════════════════════
-cat("\n=== STEP 3: Installing BiocManager ===\n"); flush.console()
+cat("\n=== STEP 4: Installing BiocManager & CRAN dependencies ===\n"); flush.console()
 if (!is_pkg_ok("BiocManager")) {
   cat("Installing CRAN package: BiocManager...\n"); flush.console()
   install_cran("BiocManager")
@@ -989,7 +1365,6 @@ if (!is_pkg_ok("BiocManager")) {
   stop("Failed to install required package: BiocManager.")
 }
 
-# ── Configure BiocManager to use Posit Package Manager ───────────────────────
 # ── Configure Bioconductor repositories ───────────────────────────────────────
 # We use official bioconductor.org for software & annotation binaries (R 4.4 Windows .zip / macOS .tgz)
 # and Posit Package Manager for CRAN packages.
@@ -1014,9 +1389,9 @@ cat("  Bioconductor official binary repositories configured.\n"); flush.console(
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# STEP 4 — Install Packages and Dependencies (CRAN & Bioconductor)
+# STEP 5 — Install Packages and Dependencies (CRAN & Bioconductor)
 # ═══════════════════════════════════════════════════════════════════════════════
-cat("\n=== STEP 4: Installing packages and all dependencies ===\n"); flush.console()
+cat("\n=== STEP 5: Installing packages and all Bioconductor dependencies ===\n"); flush.console()
 tryCatch({
   install_with_retry_and_deps(c(cran_pkgs, bioc_pkgs))
 }, error = function(e) {
@@ -1073,8 +1448,8 @@ for (pkg in all_pkgs_to_verify) {
   inst_ver <- get_pkg_version(pkg)
   
   normalize_ver <- function(v) {
-    if (is.null(v) || is.na(v)) return("")
-    gsub("-", ".", v, fixed = TRUE)
+    if (is.null(v) || is.na(v) || !nzchar(v)) return("")
+    tryCatch(as.character(package_version(v)), error = function(e) gsub("-", ".", v, fixed = TRUE))
   }
   
   status <- "UNKNOWN"
@@ -1131,6 +1506,16 @@ if (length(version_diffs) > 0) {
   }
   cat("\n")
   flush.console()
+}
+
+# Verify Python + STABL when in desktop/with_python mode
+if (with_python && !is.null(conda_path_target)) {
+  if (!is_stabl_functional(conda_path_target)) {
+    stop(sprintf("Python STABL verification FAILED in Miniconda environment: %s", conda_path_target))
+  } else {
+    cat(sprintf("[OK] Verified Miniconda Python & STABL package at: %s\n\n", conda_path_target))
+    flush.console()
+  }
 }
 
 # Fatal stop if any required package could not be loaded or is missing

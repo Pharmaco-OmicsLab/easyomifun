@@ -1,13 +1,13 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import { useAppStore } from "../../store/appStore";
 import Spinner from "../Spinner";
 import type { MetaMethod } from "../../dataObject";
 import { isMetaEligible } from "../../dataObject";
 import ChangeWarnModal from "../shared/ChangeWarnModal";
 import DiscardWarnModal from "../shared/DiscardWarnModal";
-import { runInlineDEMetaAPI, redoStepAPI, fetchDatasetInfoAPI } from "../../lib/api";
+import { runInlineDEMetaAPI, redoStepAPI, fetchDatasetInfoAPI, cancelComputeJobAPI } from "../../lib/api";
 import { useToast } from "../../hooks/use-toast";
-import { AlertTriangle, CheckCircle } from "lucide-react";
+import { AlertTriangle, CheckCircle, CheckCircle2, RotateCcw } from "lucide-react";
 import {
   ScatterChart, Scatter, XAxis, YAxis, CartesianGrid, Tooltip,
   ReferenceLine, ResponsiveContainer, Cell,
@@ -165,6 +165,18 @@ export default function InlineDEMeta() {
   const { state, dispatch } = useAppStore();
   const { toast } = useToast();
   const [loading, setLoading] = useState(false);
+  const abortControllerRef = useRef<AbortController | null>(null);
+  const activeJobIdRef = useRef<string | null>(null);
+
+  const handleCancel = async () => {
+    abortControllerRef.current?.abort();
+    if (activeJobIdRef.current) {
+      await cancelComputeJobAPI(activeJobIdRef.current);
+    }
+    setLoading(false);
+    activeJobIdRef.current = null;
+  };
+
   const [done, setDone] = useState(!!state.dpDeMetaMethod);
 
   const selected = state.dpDeMetaMethod;
@@ -355,22 +367,40 @@ export default function InlineDEMeta() {
   if (!hasSameTypeMultiple) return null;
 
   const runMeta = async () => {
+    abortControllerRef.current = new AbortController();
     setLoading(true);
     if (done) {
       try {
-        await redoStepAPI("meta-analysis", state.dpDatasets.map(d => d.id));
-      } catch (e) {
+        await redoStepAPI(
+          "meta-analysis",
+          state.dpDatasets.map(d => d.id),
+          (info) => { activeJobIdRef.current = info.jobId; },
+          abortControllerRef.current.signal
+        );
+      } catch (e: any) {
+        if (e?.name === "AbortError" || abortControllerRef.current?.signal.aborted) {
+          setLoading(false);
+          return;
+        }
         console.error(e);
       }
     }
     try {
-      const metaRes = await runInlineDEMetaAPI(selected as MetaMethod, {
-        pvalueMethod: selected === "combine_pvalue" ? pvalueMethod : "",
-        effectSizeModel: selected === "effect_size" ? effectSizeModel : "",
-        votes: selected === "vote_counting" ? (state.dpDeMetaVotes ?? state.deMetaVotes) : "",
-        pValueThreshold: state.deConfig.pValueThreshold,
-        logFcThreshold: state.deConfig.logFcThreshold
-      }, state.dpDatasets);
+      const metaRes = await runInlineDEMetaAPI(
+        selected as MetaMethod,
+        {
+          pvalueMethod: selected === "combine_pvalue" ? pvalueMethod : "",
+          effectSizeModel: selected === "effect_size" ? effectSizeModel : "",
+          votes: selected === "vote_counting" ? (state.dpDeMetaVotes ?? state.deMetaVotes) : "",
+          pValueThreshold: state.dpInlineDeConfig.pValueThreshold,
+          logFcThreshold: state.dpInlineDeConfig.logFcThreshold
+        },
+        state.dpDatasets,
+        (info) => {
+          activeJobIdRef.current = info.jobId;
+        },
+        abortControllerRef.current.signal
+      );
 
       const rawRows = toArray(metaRes?.full_results).length > 0
         ? toArray(metaRes.full_results)
@@ -421,6 +451,9 @@ export default function InlineDEMeta() {
       dispatch({ type: "SET_DP_INLINE_META_DONE", done: true });
       setDone(true);
     } catch (err: any) {
+      if (err?.name === "AbortError" || err?.message?.includes("Aborted") || err?.message?.includes("Unknown job id")) {
+        return;
+      }
       console.error(err);
       toast({
         title: "Meta-analysis Error",
@@ -429,6 +462,7 @@ export default function InlineDEMeta() {
       });
     } finally {
       setLoading(false);
+      activeJobIdRef.current = null;
     }
   };
 
@@ -466,7 +500,7 @@ export default function InlineDEMeta() {
 
 return (
     <>
-      {loading && <Spinner label="Running meta-analysis…" sublabel={`Method: ${META_OPTIONS.find(m => m.id === selected)?.label ?? "—"}`} />}
+      {loading && <Spinner label="Running meta-analysis…" sublabel={`Method: ${META_OPTIONS.find(m => m.id === selected)?.label ?? "—"}`} onCancel={handleCancel} />}
 
 
 
@@ -726,8 +760,9 @@ return (
             <div className="card-title" style={{ margin: "0 0 8px 0" }}>
               Meta-analysis Results {hasSettingsChanged && <span style={{ fontSize: 12, color: "hsl(38 85% 35%)", fontWeight: 400, marginLeft: 8 }}>(Outdated - settings changed)</span>}
             </div>
-            <div className="banner success" style={{ marginBottom: 12 }}>
-              ✅ Meta-analysis complete using <strong>{META_OPTIONS.find(m => m.id === activeSnapshotMethod)?.label}</strong> across {runDatasetNames.length} datasets.
+            <div className="banner success" style={{ marginBottom: 12, display: "flex", alignItems: "center", gap: 6 }}>
+              <CheckCircle2 size={15} style={{ flexShrink: 0 }} />
+              <span>Meta-analysis complete using <strong>{META_OPTIONS.find(m => m.id === activeSnapshotMethod)?.label}</strong> across {runDatasetNames.length} datasets.</span>
             </div>
             <div className="chips-row">
               <div className="stat-chip"><div className="stat-chip-val">{numDatasetsVal}</div><div className="stat-chip-lbl">Datasets</div></div>
@@ -757,7 +792,7 @@ return (
                   {snapshotVolcanoPlot ? (
                     <img src={`data:image/png;base64,${snapshotVolcanoPlot}`} style={{ width: "100%", height: "auto", borderRadius: 8 }} alt="Volcano Plot" />
                   ) : (
-                    <VolcanoPlot results={rawMetaList} pThresh={state.deConfig.pValueThreshold} fcThresh={state.deConfig.logFcThreshold} />
+                    <VolcanoPlot results={rawMetaList} pThresh={state.dpInlineDeConfig.pValueThreshold} fcThresh={state.dpInlineDeConfig.logFcThreshold} />
                   )}
                 </div>
               </div>
@@ -769,7 +804,7 @@ return (
                   {snapshotVolcanoPlot ? (
                     <img src={`data:image/png;base64,${snapshotVolcanoPlot}`} style={{ width: "100%", height: "auto", borderRadius: 8 }} alt="Volcano Plot" />
                   ) : (
-                    <VolcanoPlot results={rawMetaList} pThresh={state.deConfig.pValueThreshold} fcThresh={state.deConfig.logFcThreshold} />
+                    <VolcanoPlot results={rawMetaList} pThresh={state.dpInlineDeConfig.pValueThreshold} fcThresh={state.dpInlineDeConfig.logFcThreshold} />
                   )}
                 </div>
                 <div className="chart-box" style={{ display: "flex", flexDirection: "column", border: "1px solid var(--border)", borderRadius: 8, padding: 12, background: "white" }}>
@@ -941,8 +976,9 @@ return (
                     }
                   }}
                   data-testid="btn-redo-meta"
+                  style={{ display: "inline-flex", alignItems: "center", gap: 6 }}
                 >
-                  🔄 Redo Meta-analysis
+                  <RotateCcw size={14} /> Redo Meta-analysis
                 </button>
               )}
               <button

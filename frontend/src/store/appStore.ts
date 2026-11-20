@@ -38,6 +38,12 @@ export interface AppState {
   dpDeResults: Record<string, any>;
   dpDeMetaMethod: MetaMethod | null;
   dpDeMetaVotes: number;
+  dpInlineDeConfig: DEConfig;
+  dpInlineDeSubmittedConfig: DEConfig | null;
+  dpInlineFsConfig: FSConfig;
+  dpInlineFsSubmittedConfig: FSConfig | null;
+  dpInlineEnConfig: EnrichmentConfig;
+  dpInlineEnSubmittedConfig: EnrichmentConfig | null;
 
   // DE Analysis
   deDatasets: DatasetConfig[];
@@ -50,6 +56,8 @@ export interface AppState {
   deSelectedContext: string;
   deSelectedModule: SelectedModule;
   deInlineEaDone: boolean;
+  deInlineEnConfig: EnrichmentConfig;
+  deInlineEnSubmittedConfig: EnrichmentConfig | null;
   dePanelOpen: boolean;
 
   // Feature Selection
@@ -60,6 +68,7 @@ export interface AppState {
   fsSelectedContext: string;
   fsPanelOpen: boolean;
   standaloneFsDone: boolean;
+  fsSharedFeatureCounts: Record<string, number>;
 
   // Enrichment Analysis
   enDatasets: DatasetConfig[];
@@ -102,6 +111,14 @@ export type AppAction =
   | { type: "DE_SUBMIT_CONFIG" }
   | { type: "FS_SUBMIT_CONFIG" }
   | { type: "EN_SUBMIT_CONFIG" }
+  | { type: "DP_INLINE_DE_SET_CONFIG"; patch: Partial<DEConfig> }
+  | { type: "DP_INLINE_DE_SUBMIT_CONFIG" }
+  | { type: "DP_INLINE_FS_SET_CONFIG"; patch: Partial<FSConfig> }
+  | { type: "DP_INLINE_FS_SUBMIT_CONFIG" }
+  | { type: "DP_INLINE_EN_SET_CONFIG"; patch: Partial<EnrichmentConfig> }
+  | { type: "DP_INLINE_EN_SUBMIT_CONFIG" }
+  | { type: "DE_INLINE_EN_SET_CONFIG"; patch: Partial<EnrichmentConfig> }
+  | { type: "DE_INLINE_EN_SUBMIT_CONFIG" }
   // Store
   | { type: "RESET_STORE"; pipelineMode?: boolean }
   | { type: "SET_PIPELINE_MODE"; mode: boolean }
@@ -114,6 +131,7 @@ export type AppAction =
   | { type: "DE_INLINE_EN_SET_RESULTS"; id: string; results: { oraResults: any[]; gseaResults: any[] } }
   | { type: "DE_SET_MODULE"; module: SelectedModule }
   | { type: "SET_STANDALONE_FS_DONE"; done: boolean }
+  | { type: "SET_FS_SHARED_COUNTS"; counts: Record<string, number> }
   | { type: "SET_STANDALONE_EN_DONE"; done: boolean }
   | { type: "EN_SET_RESULTS"; id: string; results: { oraResults: any[]; gseaResults: any[] } }
   | { type: "PREPARE_DE_FROM_DP" }
@@ -261,7 +279,15 @@ export const initialState: AppState = {
 
   dpDatasets: [defaultDP], dpCurrentDatasetId: defaultDP.id,
   dpStep: "upload", dpSelectedContext: defaultDP.id, dpSelectedModule: null,
-  dpProcessingConfig: { filterMethod: "", cpmThreshold: null, minSamples: null, countThreshold: null, varianceThreshold: null, missingMethod: "", knnK: null, naRemovePercent: 20, applyFilter: null, applyMissing: null, rcFilterMethod: "", normRcFilterMethod: "", maFilterMethod: "", protFilterMethod: "", othFilterMethod: "", rcVariance: null, normRcVariance: null, maVariance: null, protVariance: null, othVariance: null },
+  dpProcessingConfig: {
+    filterMethod: "", cpmThreshold: 1, minSamples: 2, varianceThreshold: 10, missingMethod: "knn", knnK: 10, naRemovePercent: 50, applyFilter: null, applyMissing: null,
+    rcFilterMethod: "", normRcFilterMethod: "", maFilterMethod: "", protFilterMethod: "", othFilterMethod: "",
+    rcReadcountThreshold: 10, rcSamplePercent: 50, rcVariance: 10,
+    normRcAbundanceMethod: "mean", normRcAbundanceThreshold: 10, normRcVariance: 10,
+    maAbundanceMethod: "mean", maAbundanceThreshold: 10, maVariance: 10,
+    protAbundanceMethod: "mean", protAbundanceThreshold: 10, protVariance: 10,
+    othAbundanceMethod: "mean", othAbundanceThreshold: 10, othVariance: 10
+  },
   dpNormConfig: { method: "tmm", logTransform: true, transformationType: "log2", priorCount: 0.5 },
   dpBatchConfig: { method: "combat_seq", methodOthers: "combat", batchVariable: "" },
   dpAnnotationConfig: { selectOrganism: "Human (Homo sapiens)", annotationSource: "ensembl", geneBiotype: "Protein-coding", multiMappedStrategy: "keep-first" },
@@ -282,11 +308,19 @@ export const initialState: AppState = {
   dpDeResults: {},
   dpDeMetaMethod: null,
   dpDeMetaVotes: 2,
+  dpInlineDeConfig: { method: "deseq2", referenceGroup: "", comparisonGroup: "", pValueThreshold: 0.05, logFcThreshold: 1.0, adjustMethod: "BH" },
+  dpInlineDeSubmittedConfig: null,
+  dpInlineFsConfig: { trainRatio: 0.7, cvEnabled: true, cvFolds: 5, cvMethod: "k_fold", selectedModels: [], maxFeaturesSelect: 10, multiDatasetMode: "combine", validationStrategy: "train-test-split" },
+  dpInlineFsSubmittedConfig: null,
+  dpInlineEnConfig: { methods: ["gsea"], oraDatabase: ["KEGG", "GO:BP"], gseaDatabase: ["KEGG", "GO:BP"], rankByCol: "", pValueCutoff: 0.05, qValueCutoff: 0.2, minGeneSetSize: 10, maxGeneSetSize: 500, organism: "Human (Homo sapiens)" },
+  dpInlineEnSubmittedConfig: null,
 
   deDatasets: [defaultDE], deCurrentDatasetId: defaultDE.id,
   deStep: "upload", deSelectedContext: defaultDE.id, deSelectedModule: null,
   deInlineEaDone: false,
   deConfig: { method: "deseq2", referenceGroup: "", comparisonGroup: "", pValueThreshold: 0.05, logFcThreshold: 1.0, adjustMethod: "BH" },
+  deInlineEnConfig: { methods: ["gsea"], oraDatabase: ["KEGG", "GO:BP"], gseaDatabase: ["KEGG", "GO:BP"], rankByCol: "", pValueCutoff: 0.05, qValueCutoff: 0.2, minGeneSetSize: 10, maxGeneSetSize: 500, organism: "Human (Homo sapiens)" },
+  deInlineEnSubmittedConfig: null,
   deResults: {}, deMetaMethod: null, deMetaVotes: 2,
   dePanelOpen: true,
 
@@ -295,6 +329,7 @@ export const initialState: AppState = {
   fsConfig: { trainRatio: 0.7, cvEnabled: true, cvFolds: 5, cvMethod: "k_fold", selectedModels: [], maxFeaturesSelect: 10, multiDatasetMode: "combine", validationStrategy: "train-test-split" },
   fsPanelOpen: true,
   standaloneFsDone: false,
+  fsSharedFeatureCounts: {},
   fsTrainingResultsCache: null,
   fsCvResultsCache: null,
   fsTestingResultsCache: null,
@@ -333,7 +368,15 @@ export function appReducer(state: AppState, action: AppAction): AppState {
 
         dpDatasets: [dp], dpCurrentDatasetId: dp.id,
         dpStep: "upload", dpSelectedContext: dp.id, dpSelectedModule: null,
-        dpProcessingConfig: { filterMethod: "", cpmThreshold: null, minSamples: null, countThreshold: null, varianceThreshold: null, missingMethod: "", knnK: null, naRemovePercent: 20, applyFilter: null, applyMissing: null, rcFilterMethod: "", normRcFilterMethod: "", maFilterMethod: "", protFilterMethod: "", othFilterMethod: "", rcVariance: null, normRcVariance: null, maVariance: null, protVariance: null, othVariance: null },
+        dpProcessingConfig: {
+          filterMethod: "", cpmThreshold: 1, minSamples: 2, varianceThreshold: 10, missingMethod: "knn", knnK: 10, naRemovePercent: 50, applyFilter: null, applyMissing: null,
+          rcFilterMethod: "", normRcFilterMethod: "", maFilterMethod: "", protFilterMethod: "", othFilterMethod: "",
+          rcReadcountThreshold: 10, rcSamplePercent: 50, rcVariance: 10,
+          normRcAbundanceMethod: "mean", normRcAbundanceThreshold: 10, normRcVariance: 10,
+          maAbundanceMethod: "mean", maAbundanceThreshold: 10, maVariance: 10,
+          protAbundanceMethod: "mean", protAbundanceThreshold: 10, protVariance: 10,
+          othAbundanceMethod: "mean", othAbundanceThreshold: 10, othVariance: 10
+        },
         dpNormConfig: { method: "tmm", logTransform: true, transformationType: "log2", priorCount: 0.5 },
         dpBatchConfig: { method: "combat_seq", methodOthers: "combat", batchVariable: "" },
         dpAnnotationConfig: { selectOrganism: "Human (Homo sapiens)", annotationSource: "ensembl", geneBiotype: "Protein-coding", multiMappedStrategy: "keep-first" },
@@ -354,6 +397,12 @@ export function appReducer(state: AppState, action: AppAction): AppState {
         dpDeResults: {},
         dpDeMetaMethod: null,
         dpDeMetaVotes: 2,
+        dpInlineDeConfig: { method: "deseq2", referenceGroup: "", comparisonGroup: "", pValueThreshold: 0.05, logFcThreshold: 1.0, adjustMethod: "BH" },
+        dpInlineDeSubmittedConfig: null,
+        dpInlineFsConfig: { trainRatio: 0.7, cvEnabled: true, cvFolds: 5, cvMethod: "k_fold", selectedModels: [], maxFeaturesSelect: 10, multiDatasetMode: "combine", validationStrategy: "train-test-split" },
+        dpInlineFsSubmittedConfig: null,
+        dpInlineEnConfig: { methods: ["gsea"], oraDatabase: ["KEGG", "GO:BP"], gseaDatabase: ["KEGG", "GO:BP"], rankByCol: "", pValueCutoff: 0.05, qValueCutoff: 0.2, minGeneSetSize: 10, maxGeneSetSize: 500, organism: "Human (Homo sapiens)" },
+        dpInlineEnSubmittedConfig: null,
 
         dpSubmittedAnnotationConfig: null,
         dpSubmittedProcessingConfig: null,
@@ -367,6 +416,8 @@ export function appReducer(state: AppState, action: AppAction): AppState {
         deStep: "upload", deSelectedContext: de.id, deSelectedModule: null,
         deInlineEaDone: false,
         deConfig: { method: "deseq2", referenceGroup: "", comparisonGroup: "", pValueThreshold: 0.05, logFcThreshold: 1.0, adjustMethod: "BH" },
+        deInlineEnConfig: { methods: ["gsea"], oraDatabase: ["KEGG", "GO:BP"], gseaDatabase: ["KEGG", "GO:BP"], rankByCol: "", pValueCutoff: 0.05, qValueCutoff: 0.2, minGeneSetSize: 10, maxGeneSetSize: 500, organism: "Human (Homo sapiens)" },
+        deInlineEnSubmittedConfig: null,
         deResults: {}, deMetaMethod: null, deMetaVotes: 2,
         dePanelOpen: true,
 
@@ -608,6 +659,31 @@ export function appReducer(state: AppState, action: AppAction): AppState {
       };
     }
     case "EN_SUBMIT_CONFIG": return { ...state, enSubmittedConfig: { ...state.enConfig } };
+    case "DP_INLINE_DE_SUBMIT_CONFIG": return { ...state, dpInlineDeSubmittedConfig: { ...state.dpInlineDeConfig } };
+    case "DP_INLINE_FS_SUBMIT_CONFIG": {
+      const ratios: Record<string, number> = {};
+      const purposes: Record<string, string> = {};
+      const strategies: Record<string, string> = {};
+      const internals: Record<string, boolean> = {};
+      state.dpDatasets.forEach(d => {
+        ratios[d.id] = d.fs_trainRatio ?? 0.7;
+        purposes[d.id] = d.fs_datasetPurpose || "train-and-test";
+        strategies[d.id] = d.fs_validationStrategy || "train-test-split";
+        internals[d.id] = d.fs_isInternalValidation ?? false;
+      });
+      return {
+        ...state,
+        dpInlineFsSubmittedConfig: {
+          ...state.dpInlineFsConfig,
+          fs_trainRatios: ratios,
+          fs_datasetPurposes: purposes,
+          fs_validationStrategies: strategies,
+          fs_isInternalValidations: internals
+        }
+      };
+    }
+    case "DP_INLINE_EN_SUBMIT_CONFIG": return { ...state, dpInlineEnSubmittedConfig: { ...state.dpInlineEnConfig } };
+    case "DE_INLINE_EN_SUBMIT_CONFIG": return { ...state, deInlineEnSubmittedConfig: { ...state.deInlineEnConfig } };
 
     case "RESET_DOWNSTREAM_STEPS": {
       const { datasetId, fromStep } = action;
@@ -738,17 +814,32 @@ export function appReducer(state: AppState, action: AppAction): AppState {
             nextState.dpSubmittedProcessingConfig = null;
             nextState.dpSubmittedNormConfig = null;
             nextState.dpSubmittedBatchConfig = null;
+            nextState.dpInlineDeSubmittedConfig = null;
+            nextState.dpInlineFsSubmittedConfig = null;
+            nextState.dpInlineEnSubmittedConfig = null;
           } else if (fromStep === "annotation") {
             nextState.dpSubmittedProcessingConfig = null;
             nextState.dpSubmittedNormConfig = null;
             nextState.dpSubmittedBatchConfig = null;
+            nextState.dpInlineDeSubmittedConfig = null;
+            nextState.dpInlineFsSubmittedConfig = null;
+            nextState.dpInlineEnSubmittedConfig = null;
           } else if (fromStep === "processing") {
             nextState.dpSubmittedNormConfig = null;
             nextState.dpSubmittedBatchConfig = null;
+            nextState.dpInlineDeSubmittedConfig = null;
+            nextState.dpInlineFsSubmittedConfig = null;
+            nextState.dpInlineEnSubmittedConfig = null;
           } else if (fromStep === "normalization" || fromStep === "normalization-counts" || fromStep === "normalization-others") {
             nextState.dpSubmittedBatchConfig = null;
+            nextState.dpInlineDeSubmittedConfig = null;
+            nextState.dpInlineFsSubmittedConfig = null;
+            nextState.dpInlineEnSubmittedConfig = null;
           } else if (fromStep === "batch") {
             nextState.dpSubmittedBatchConfig = null;
+            nextState.dpInlineDeSubmittedConfig = null;
+            nextState.dpInlineFsSubmittedConfig = null;
+            nextState.dpInlineEnSubmittedConfig = null;
           }
         }
 
@@ -756,7 +847,9 @@ export function appReducer(state: AppState, action: AppAction): AppState {
           nextState.dpInlineMetaDone = false;
           nextState.dpInlineEaDone = false;
           nextState.dpInlineEnResultsCache = {};
+          nextState.dpInlineEnSubmittedConfig = null;
           nextState.dpInlineFsDone = false;
+          nextState.dpInlineFsSubmittedConfig = null;
           nextState.dpTrainingResultsCache = null;
           nextState.dpCvResultsCache = null;
           nextState.dpTestingResultsCache = null;
@@ -772,11 +865,13 @@ export function appReducer(state: AppState, action: AppAction): AppState {
           nextState.deMetaSkipped = false;
           nextState.deInlineEaDone = false;
           nextState.deInlineEnResultsCache = {};
+          nextState.deInlineEnSubmittedConfig = null;
           nextState.deSubmittedConfig = null;
           nextDeVisitedSteps = ["upload"];
         } else if (fromStep === "de-analysis" || fromStep === "meta-analysis" || fromStep === "analysis" || fromStep === "meta") {
           nextState.deInlineEaDone = false;
           nextState.deInlineEnResultsCache = {};
+          nextState.deInlineEnSubmittedConfig = null;
           nextState.deSubmittedConfig = null;
           const allowed = ["upload", "analysis"];
           nextDeVisitedSteps = state.deVisitedSteps.filter(sId => allowed.includes(sId));
@@ -801,6 +896,7 @@ export function appReducer(state: AppState, action: AppAction): AppState {
         if (fromStep === "upload") {
           nextState.fsDatasets = state.fsDatasets.map(d => (isViewingAll || d.id === datasetId) ? { ...d, uploadDone: false } : d);
           nextState.standaloneFsDone = false;
+          nextState.fsSharedFeatureCounts = {};
           nextState.fsTrainingResultsCache = null;
           nextState.fsCvResultsCache = null;
           nextState.fsTestingResultsCache = null;
@@ -862,8 +958,11 @@ export function appReducer(state: AppState, action: AppAction): AppState {
       const rem = state.dpDatasets.filter(d => d.id !== action.id);
       if (!rem.length) return state;
       const nc = rem[rem.length - 1].id;
-      const context = rem.length > 1 ? state.dpSelectedContext : nc;
-      return { ...state, dpDatasets: rem, dpCurrentDatasetId: nc, dpSelectedContext: context };
+      const context = rem.length > 1
+        ? (state.dpSelectedContext === action.id ? nc : state.dpSelectedContext)
+        : nc;
+      const step = (rem.length <= 1 && state.dpStep === "all-datasets") ? "upload" : state.dpStep;
+      return { ...state, dpDatasets: rem, dpCurrentDatasetId: nc, dpSelectedContext: context, dpStep: step };
     }
     case "DP_SELECT_DATASET": return { ...state, dpCurrentDatasetId: action.id };
     case "DP_SET_STEP": {
@@ -918,8 +1017,11 @@ export function appReducer(state: AppState, action: AppAction): AppState {
       const rem = state.deDatasets.filter(d => d.id !== action.id);
       if (!rem.length) return state;
       const nc = rem[rem.length - 1].id;
-      const context = rem.length > 1 ? state.deSelectedContext : nc;
-      return { ...state, deDatasets: rem, deCurrentDatasetId: nc, deSelectedContext: context };
+      const context = rem.length > 1
+        ? (state.deSelectedContext === action.id ? nc : state.deSelectedContext)
+        : nc;
+      const step = (rem.length <= 1 && state.deStep === "all-datasets") ? "upload" : state.deStep;
+      return { ...state, deDatasets: rem, deCurrentDatasetId: nc, deSelectedContext: context, deStep: step };
     }
     case "DE_SELECT_DATASET": return { ...state, deCurrentDatasetId: action.id };
     case "DE_SET_STEP": {
@@ -998,6 +1100,7 @@ export function appReducer(state: AppState, action: AppAction): AppState {
       return { ...state, deDatasets: updatedDatasets };
     }
      case "DE_SET_CONFIG": return { ...state, deConfig: { ...state.deConfig, ...action.patch } };
+     case "DP_INLINE_DE_SET_CONFIG": return { ...state, dpInlineDeConfig: { ...state.dpInlineDeConfig, ...action.patch } };
      case "DE_SET_RESULTS": return { ...state, deResults: { ...state.deResults, [action.id]: action.results } };
      case "DP_SET_DE_RESULTS": return { ...state, dpDeResults: { ...state.dpDeResults, [action.id]: action.results } };
      case "DP_SET_DE_META": return { ...state, dpDeMetaMethod: action.method };
@@ -1014,8 +1117,11 @@ export function appReducer(state: AppState, action: AppAction): AppState {
       const rem = state.fsDatasets.filter(d => d.id !== action.id);
       if (!rem.length) return state;
       const nc = rem[rem.length - 1].id;
-      const context = rem.length > 1 ? state.fsSelectedContext : nc;
-      return { ...state, fsDatasets: rem, fsCurrentDatasetId: nc, fsSelectedContext: context };
+      const context = rem.length > 1
+        ? (state.fsSelectedContext === action.id ? nc : state.fsSelectedContext)
+        : nc;
+      const step = (rem.length <= 1 && state.fsStep === "all-datasets") ? "upload" : state.fsStep;
+      return { ...state, fsDatasets: rem, fsCurrentDatasetId: nc, fsSelectedContext: context, fsStep: step };
     }
     case "FS_SELECT_DATASET": return { ...state, fsCurrentDatasetId: action.id };
     case "FS_SET_STEP": {
@@ -1039,8 +1145,10 @@ export function appReducer(state: AppState, action: AppAction): AppState {
       return { ...state, fsDatasets: updatedDatasets };
     }
     case "FS_SET_CONFIG": return { ...state, fsConfig: { ...state.fsConfig, ...action.patch } };
+    case "DP_INLINE_FS_SET_CONFIG": return { ...state, dpInlineFsConfig: { ...state.dpInlineFsConfig, ...action.patch } };
     case "FS_TOGGLE_PANEL": return { ...state, fsPanelOpen: !state.fsPanelOpen };
     case "FS_SET_TRAINING_CACHE": return { ...state, fsTrainingResultsCache: action.results };
+    case "SET_FS_SHARED_COUNTS": return { ...state, fsSharedFeatureCounts: { ...state.fsSharedFeatureCounts, ...action.counts } };
     case "FS_SET_CV_CACHE": return { ...state, fsCvResultsCache: action.results };
     case "FS_SET_TESTING_CACHE": return { ...state, fsTestingResultsCache: action.results };
     case "DP_SET_TRAINING_CACHE": return { ...state, dpTrainingResultsCache: action.results };
@@ -1053,7 +1161,9 @@ export function appReducer(state: AppState, action: AppAction): AppState {
       const rem = state.enDatasets.filter(d => d.id !== action.id);
       if (!rem.length) return state;
       const nc = rem[rem.length - 1].id;
-      const context = rem.length > 1 ? state.enSelectedContext : nc;
+      const context = rem.length > 1
+        ? (state.enSelectedContext === action.id ? nc : state.enSelectedContext)
+        : nc;
       return { ...state, enDatasets: rem, enCurrentDatasetId: nc, enSelectedContext: context };
     }
     case "EN_SELECT_DATASET": return { ...state, enCurrentDatasetId: action.id };
@@ -1078,6 +1188,8 @@ export function appReducer(state: AppState, action: AppAction): AppState {
       return { ...state, enDatasets: updatedDatasets };
     }
     case "EN_SET_CONFIG": return { ...state, enConfig: { ...state.enConfig, ...action.patch } };
+    case "DP_INLINE_EN_SET_CONFIG": return { ...state, dpInlineEnConfig: { ...state.dpInlineEnConfig, ...action.patch } };
+    case "DE_INLINE_EN_SET_CONFIG": return { ...state, deInlineEnConfig: { ...state.deInlineEnConfig, ...action.patch } };
     case "EN_TOGGLE_PANEL": return { ...state, enPanelOpen: !state.enPanelOpen };
 
     default: return state;

@@ -1,14 +1,14 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import { useLocation } from "wouter";
 import { useAppStore } from "../../store/appStore";
-import { AlertTriangle } from "lucide-react";
+import { AlertTriangle, RotateCcw } from "lucide-react";
 import Spinner from "../Spinner";
 
 import ChangeWarnModal from "../shared/ChangeWarnModal";
 import DiscardWarnModal from "../shared/DiscardWarnModal";
 import type { PValueAdjMethod } from "../../dataObject";
 import { isMetaEligible } from "../../dataObject";
-import { runDifferentialExpressionAPI, redoStepAPI, fetchDatasetInfoAPI } from "../../lib/api";
+import { runDifferentialExpressionAPI, redoStepAPI, fetchDatasetInfoAPI, cancelComputeJobAPI } from "../../lib/api";
 import { useToast } from "../../hooks/use-toast";
 
 interface Props { datasetId: string }
@@ -45,6 +45,7 @@ function DEResultCard({
   results: any;
   hasSettingsChanged: boolean | null;
 }) {
+  const { state } = useAppStore();
   const isOutdated = hasSettingsChanged === true;
   const rawList = Array.isArray(results) ? results : (results?.top10 || results?.results || []);
   const stats = results?.stats || {
@@ -134,6 +135,18 @@ export default function DEAnalysisStep({ datasetId }: Props) {
   const { toast } = useToast();
   const cfg = state.deConfig;
   const [loading, setLoading] = useState(false);
+  const abortControllerRef = useRef<AbortController | null>(null);
+  const activeJobIdRef = useRef<string | null>(null);
+
+  const handleCancel = async () => {
+    abortControllerRef.current?.abort();
+    if (activeJobIdRef.current) {
+      await cancelComputeJobAPI(activeJobIdRef.current);
+    }
+    setLoading(false);
+    activeJobIdRef.current = null;
+  };
+
   const [showWarnModal, setShowWarnModal] = useState(false);
   const [showDiscardModal, setShowDiscardModal] = useState(false);
 
@@ -234,9 +247,17 @@ export default function DEAnalysisStep({ datasetId }: Props) {
   }, [state.deDatasets, dispatch]);
 
   const runDE = async () => {
+    abortControllerRef.current = new AbortController();
     setLoading(true);
     try {
-      const resultsMap = await runDifferentialExpressionAPI(targetDatasets, cfg);
+      const resultsMap = await runDifferentialExpressionAPI(
+        targetDatasets,
+        cfg,
+        (info) => {
+          activeJobIdRef.current = info.jobId;
+        },
+        abortControllerRef.current.signal
+      );
       targetDatasets.forEach(targetDs => {
         const resObj = resultsMap[targetDs.id] as any;
         if (!resObj) {
@@ -254,6 +275,9 @@ export default function DEAnalysisStep({ datasetId }: Props) {
       });
       dispatch({ type: "DE_SUBMIT_CONFIG" });
     } catch (err: any) {
+      if (err?.name === "AbortError" || err?.message?.includes("Aborted") || err?.message?.includes("Unknown job id")) {
+        return;
+      }
       console.error("DE analysis error:", err);
       toast({
         title: "Differential Expression Error",
@@ -262,6 +286,7 @@ export default function DEAnalysisStep({ datasetId }: Props) {
       });
     } finally {
       setLoading(false);
+      activeJobIdRef.current = null;
     }
   };
 
@@ -303,7 +328,7 @@ export default function DEAnalysisStep({ datasetId }: Props) {
 
   return (
     <>
-      {loading && <Spinner label="Running differential expression analysis…" sublabel={`Using ${DE_METHODS.find(m => m.id === method)?.label || "DESeq2/limma"} pipeline`} />}
+      {loading && <Spinner label="Running differential expression analysis…" sublabel={`Using ${DE_METHODS.find(m => m.id === method)?.label || "DESeq2/limma"} pipeline`} onCancel={handleCancel} />}
 
       <div className="card">
         <div className="card-title" style={{ marginBottom: 4 }}>Analysis Configuration</div>
@@ -702,8 +727,8 @@ export default function DEAnalysisStep({ datasetId }: Props) {
                 }
                 runDE();
               }
-            }} data-testid="btn-redo-de">
-              🔄 Redo DE Analysis
+            }} data-testid="btn-redo-de" style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
+              <RotateCcw size={14} /> Redo DE Analysis
             </button>
           )}
 

@@ -9,7 +9,8 @@ import { SERVER_URL } from "../../lib/api";
 export interface ExportFile {
   id: string;
   label: string;
-  ext: string;
+  ext?: string;
+  type?: "plot" | "table" | "rdata";
   desc: string;
   getTestIds?: (fmt: string) => string[];
 }
@@ -667,8 +668,15 @@ export default function SharedExportStep({
                 {group.files && group.files.length > 0 && (
                   <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
                     {group.files.map((f) => {
-                      const isPlot = ["pdf", "png", "tiff", "tif", "jpeg", "jpg"].includes(f.ext.toLowerCase());
-                      const isRData = ["rdata"].includes(f.ext.toLowerCase());
+                      const isPlot =
+                        f.type === "plot" ||
+                        (f.ext ? ["pdf", "png", "tiff", "tif", "jpeg", "jpg"].includes(f.ext.toLowerCase()) : false) ||
+                        /plot|volcano|heatmap|curve|boxplot|\bma\b|_ma\||distribution|variance/i.test(f.id) ||
+                        /plot|heatmap|volcano|curve/i.test(f.label);
+                      const isRData =
+                        f.type === "rdata" ||
+                        (f.ext ? ["rdata"].includes(f.ext.toLowerCase()) : false) ||
+                        f.id.includes("rdata");
                       const formats = isPlot
                         ? ["pdf", "png", "tiff"]
                         : isRData
@@ -682,16 +690,6 @@ export default function SharedExportStep({
                             background: "hsl(214 50% 98%)", border: "1px solid hsl(214 20% 89%)", borderRadius: 8, flexWrap: "wrap",
                           }}
                         >
-                          {/* File extension badge/icon */}
-                          <div
-                            style={{ width: 36, height: 36, borderRadius: 6, background: "hsl(214 50% 94%)", border: "1px solid hsl(214 30% 82%)",
-                              display: "flex", alignItems: "center", justifyContent: "center", fontSize: 9, fontWeight: 700, color: "hsl(214 55% 38%)",
-                              textTransform: "uppercase", flexShrink: 0,
-                            }}
-                          >
-                            {f.ext}
-                          </div>
-
                           {/* Info */}
                           <div style={{ flex: 1, minWidth: 200 }}>
                             <div style={{ fontSize: 13, fontWeight: 600, color: "hsl(220 15% 22%)", marginBottom: 2 }}>
@@ -712,7 +710,8 @@ export default function SharedExportStep({
                                 ? f.getTestIds(fmt)
                                 : (() => {
                                     const t = [`btn-download-${f.id}-${fmt}`, `btn-download-${f.id}-${fmt.toUpperCase()}`];
-                                    if (fmt === f.ext.toLowerCase()) {
+                                    const defaultFmt = f.ext ? f.ext.toLowerCase() : (isPlot ? "pdf" : "csv");
+                                    if (fmt === defaultFmt) {
                                       t.push(`btn-download-${f.id}`);
                                     }
                                     return t;

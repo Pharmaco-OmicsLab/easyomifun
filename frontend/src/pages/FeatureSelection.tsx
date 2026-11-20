@@ -1,6 +1,8 @@
+import { useState, useEffect } from "react";
 import { useLocation } from "wouter";
-import { Home, PanelRightClose, PanelRight } from "lucide-react";
+import { Home, PanelRightClose, PanelRight, AlertTriangle } from "lucide-react";
 import { useAppStore } from "../store/appStore";
+import { useToast } from "../hooks/use-toast";
 import PlotFootnote from "../components/shared/PlotFootnote";
 import ReloadButton from "../components/shared/ReloadButton";
 import DatasetPanel from "../components/DatasetPanel";
@@ -13,12 +15,14 @@ import FSExportStep from "../components/featureselection/FSExportStep";
 import AllDatasetsUploadView from "../components/shared/AllDatasetsUploadView";
 import TestingStep from "../components/featureselection/TestingStep";
 import { validateFSSamplesLocal } from "../lib/dataParser";
-import type {FSStep} from "../dataObject";
+import { fetchDatasetInfoAPI } from "../lib/api";
+import { getHierarchyGroup, type FSStep } from "../dataObject";
 
 
 export default function FeatureSelection() {
   const { state, dispatch } = useAppStore();
   const [, navigate] = useLocation();
+  const { toast } = useToast();
 
   const currentDs = state.fsDatasets.find(d => d.id === state.fsCurrentDatasetId) ?? state.fsDatasets[0];
   const activeDatasetId = currentDs?.id ?? "";
@@ -69,6 +73,41 @@ export default function FeatureSelection() {
 
   const completedSteps: string[] = [];
   const fsDatasets = state.fsDatasets;
+
+  const [sharedCountsByHier, setSharedCountsByHier] = useState<Record<string, number>>({});
+  useEffect(() => {
+    if (state.fsStep !== "all-datasets" || fsDatasets.length < 2) return;
+    let cancelled = false;
+    const fetchCounts = async () => {
+      const uploadedDs = fsDatasets.filter(d => d.uploadDone);
+      if (uploadedDs.length < 2) return;
+      try {
+        const res = await fetchDatasetInfoAPI(uploadedDs.map(d => d.id), "fs");
+        if (!cancelled && res?.sharedFeaturesByHierarchy) {
+          setSharedCountsByHier(res.sharedFeaturesByHierarchy);
+          dispatch({ type: "SET_FS_SHARED_COUNTS", counts: res.sharedFeaturesByHierarchy });
+        }
+      } catch (_) { /* ignore */ }
+    };
+    fetchCounts();
+    return () => { cancelled = true; };
+  }, [state.fsStep, fsDatasets]);
+
+  const hierGroups: Record<string, typeof fsDatasets> = {};
+  fsDatasets.filter(d => d.uploadDone).forEach(d => {
+    const h = getHierarchyGroup(d.dataType || "readcounts");
+    if (h !== "others") {
+      if (!hierGroups[h]) hierGroups[h] = [];
+      hierGroups[h].push(d);
+    }
+  });
+  const multiDsHierKeys = Object.keys(hierGroups).filter(h => hierGroups[h].length >= 2);
+  const hasInsufficientSharedFeatures = multiDsHierKeys.some(h => sharedCountsByHier[h] !== undefined && sharedCountsByHier[h] <= 10);
+  const hierLabelMap: Record<string, string> = {
+    general: "General (Type 1 / Type 2)",
+    transcriptomics: "Transcriptomics",
+    proteomics: "Proteomics",
+  };
 
   if (fsDatasets.length > 0 && fsDatasets.every(d => d.uploadDone)) {
     completedSteps.push("upload");
@@ -181,7 +220,11 @@ export default function FeatureSelection() {
                   try {
                     const valRes = validateFSSamplesLocal(state.fsDatasets, state.fsConfig.trainRatio || 0.7);
                     if (!valRes.sufficient) {
-                      alert(valRes.message || "Insufficient sample size to continue to Model Selection.");
+                      toast({
+                        title: "Cross-Validation Requirement",
+                        description: "Please select at least 2 datasets with >10 shared features for Cross Validation.",
+                        variant: "destructive",
+                      });
                       return;
                     }
                   } catch (e) {
@@ -200,11 +243,39 @@ export default function FeatureSelection() {
                 hasStepMismatch={hasStepMismatch}
                 stepId="upload"
                 datasetIds={state.fsDatasets.map(d => d.id)}
+                isContinueDisabled={hasInsufficientSharedFeatures}
                 onConfirmDiscard={() => {
                   dispatch({ type: "RESET_DOWNSTREAM_STEPS", datasetId: "all", fromStep: "model-selection" });
                   dispatch({ type: "FS_SET_STEP", step: "model-selection" });
                 }}
-              />
+              >
+                {multiDsHierKeys.length > 0 && (
+                  <div className="card">
+                    <div className="card-title" style={{ marginBottom: 4 }}>Shared Feature Space</div>
+                    <div className="card-sub">Authoritative intersection of features within each hierarchy group across uploaded datasets.</div>
+                    <hr className="card-divider" />
+                    <div style={{ display: "flex", gap: 12, flexWrap: "wrap" }}>
+                      {multiDsHierKeys.map(h => {
+                        const cnt = sharedCountsByHier[h];
+                        return (
+                          <div key={h} className="stat-chip">
+                            <div className="stat-chip-val" style={{ color: cnt !== undefined && cnt <= 10 ? "hsl(0 70% 45%)" : "var(--primary)" }}>
+                              {cnt !== undefined ? cnt.toLocaleString() : "…"}
+                            </div>
+                            <div className="stat-chip-lbl">Shared Features ({hierLabelMap[h] || h})</div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                    {hasInsufficientSharedFeatures && (
+                      <div className="banner warn" style={{ marginTop: 12, marginBottom: 0, display: "flex", alignItems: "center", gap: 6 }}>
+                        <AlertTriangle size={14} style={{ flexShrink: 0 }} />
+                        <span>Datasets within the same hierarchy must share more than 10 features to proceed to Feature Selection.</span>
+                      </div>
+                    )}
+                  </div>
+                )}
+              </AllDatasetsUploadView>
             )}
             {state.fsStep === "model-selection" && (
               <ModelSelectionStep />

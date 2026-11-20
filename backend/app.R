@@ -32,22 +32,35 @@ if (dir.exists(bundled_lib) && bundled_lib != local_lib) {
 }
 .libPaths(unique(c(paths_to_set, .Library)))
 Sys.setenv(R_LIBS_USER = local_lib)
-Sys.setenv(R_LIBS_SITE = local_lib)
+Sys.setenv(R_LIBS_SITE = if (dir.exists(bundled_lib)) bundled_lib else local_lib)
 Sys.setenv(R_LIBS = paste(.libPaths(), collapse = .Platform$path.sep))
 Sys.setenv(R_PARALLEL_PORT = "random")
 
 # Configure local Python (Miniconda) path for self-contained, isolated Python environment
 env_conda <- Sys.getenv("RETICULATE_MINICONDA_PATH", unset = "")
-conda_path <- if (nzchar(env_conda)) env_conda else {
+conda_candidates <- unique(Filter(nzchar, c(
+  env_conda,
+  file.path(script.dir, "miniconda"),
   if (Sys.info()["sysname"] == "Darwin") {
-    file.path(Sys.getenv("HOME"), "Library", "EasyOmiFun", "miniconda")
+    c(
+      file.path(Sys.getenv("HOME"), "Library", "EasyOmiFun", "miniconda"),
+      file.path(Sys.getenv("HOME"), "Library", "easyomifun", "miniconda")
+    )
+  } else if (.Platform$OS.type == "windows") {
+    c(
+      if (nzchar(Sys.getenv("APPDATA"))) file.path(Sys.getenv("APPDATA"), "EasyOmiFun", "miniconda") else "",
+      if (nzchar(Sys.getenv("APPDATA"))) file.path(Sys.getenv("APPDATA"), "easyomifun", "miniconda") else "",
+      if (nzchar(Sys.getenv("USERPROFILE"))) file.path(Sys.getenv("USERPROFILE"), ".easyomifun", "miniconda") else "",
+      "C:/EasyOmiFun/miniconda"
+    )
   } else {
-    file.path(script.dir, "miniconda")
+    character(0)
   }
-}
-conda_path <- tryCatch(normalizePath(conda_path, winslash = "/", mustWork = FALSE), error = function(e) conda_path)
-if (dir.exists(conda_path)) {
-  Sys.setenv(RETICULATE_MINICONDA_PATH = conda_path)
+)))
+
+for (raw_conda in conda_candidates) {
+  conda_path <- tryCatch(normalizePath(raw_conda, winslash = "/", mustWork = FALSE), error = function(e) raw_conda)
+  if (!dir.exists(conda_path)) next
   py_candidates <- if (.Platform$OS.type == "windows") {
     c(file.path(conda_path, "python.exe"), file.path(conda_path, "Scripts", "python.exe"))
   } else {
@@ -58,13 +71,18 @@ if (dir.exists(conda_path)) {
       file.path(conda_path, "bin", "python3.12"),
       file.path(conda_path, "bin", "python3.10"))
   }
+  found_py <- ""
   for (cand in py_candidates) {
     if (file.exists(cand)) {
-      py_path <- tryCatch(normalizePath(cand, winslash = "/", mustWork = FALSE), error = function(e) cand)
-      Sys.setenv(STABL_PYTHON = py_path)
-      Sys.setenv(RETICULATE_PYTHON = py_path)
+      found_py <- tryCatch(normalizePath(cand, winslash = "/", mustWork = FALSE), error = function(e) cand)
       break
     }
+  }
+  if (nzchar(found_py)) {
+    Sys.setenv(RETICULATE_MINICONDA_PATH = conda_path)
+    Sys.setenv(STABL_PYTHON = found_py)
+    Sys.setenv(RETICULATE_PYTHON = found_py)
+    break
   }
 }
 
@@ -98,7 +116,7 @@ set.seed(42)
 dir.create("tmp/jobs", showWarnings = FALSE, recursive = TRUE)
 
 .export_queue <- new.env(parent = emptyenv())
-N_PARALLEL_EXPORT <- 2L
+N_PARALLEL_EXPORT <- 8L
 
 enqueue_export_job <- function(job_id, payload) {
   assign(job_id, list(
@@ -118,7 +136,32 @@ process_export_queue <- function() {
       for (id in ids) {
         job <- get(id, envir = .export_queue)
         if (as.numeric(difftime(now, job$started, units = "mins")) > 10) {
+          if (!is.null(job$process)) tryCatch(job$process$kill(), error = function(e) NULL)
+          if (!is.null(job$out_path) && file.exists(job$out_path)) unlink(job$out_path)
           rm(list = id, envir = .export_queue)
+          next
+        }
+        if (job$status == "running" && !is.null(job$process)) {
+          if (!isTRUE(tryCatch(job$process$is_alive(), error = function(e) FALSE))) {
+            out_res <- if (!is.null(job$out_path) && file.exists(job$out_path)) {
+              tryCatch(readRDS(job$out_path), error = function(e) list(.error = conditionMessage(e)))
+            } else {
+              list(.error = "Export worker produced no output")
+            }
+            if (!is.null(job$out_path) && file.exists(job$out_path)) unlink(job$out_path)
+            job$process <- NULL
+            if (!is.null(out_res$.error)) {
+              job$status <- "error"
+              job$message <- out_res$.error
+            } else if (is.null(out_res) || is.null(out_res$file_path) || !file.exists(out_res$file_path)) {
+              job$status <- "error"
+              job$message <- sprintf("The %s file is not available yet. Run the analysis step first.", job$payload$type)
+            } else {
+              job$status <- "done"
+              job$result <- out_res
+            }
+            assign(id, job, envir = .export_queue)
+          }
         }
       }
 
@@ -136,22 +179,46 @@ process_export_queue <- function() {
           job_id <- queued[[1]]
           job <- get(job_id, envir = .export_queue)
           job$status <- "running"
-          assign(job_id, job, envir = .export_queue)
+          p <- job$payload
 
-          tryCatch({
-            p <- job$payload
-            res <- resolve_export_file(p$type, p$dsId, p$model, p$ext, p$userId)
-            if (is.null(res) || is.null(res$file_path) || !file.exists(res$file_path)) {
+          if (requireNamespace("callr", quietly = TRUE)) {
+            jobs_dir_q <- if (!is.null(p$userId) && nzchar(p$userId)) sprintf("tmp/user_sessions/%s/jobs", p$userId) else "tmp/jobs"
+            dir.create(jobs_dir_q, showWarnings = FALSE, recursive = TRUE)
+            out_path_q <- file.path(jobs_dir_q, paste0(job_id, "_out.rds"))
+            backend_dir_q <- getwd()
+            proc_q <- callr::r_bg(
+              func = function(p, out_path, backend_dir) {
+                setwd(backend_dir)
+                source("shared_utils.R")
+                source("processing.R")
+                source("report_finalize.R")
+                res <- tryCatch(
+                  resolve_export_file(p$type, p$dsId, p$model, p$ext, p$userId),
+                  error = function(e) list(.error = conditionMessage(e))
+                )
+                saveRDS(res, out_path)
+              },
+              args = list(p, out_path_q, backend_dir_q),
+              env = get_worker_env(1L),
+              supervise = TRUE
+            )
+            job$process <- proc_q
+            job$out_path <- out_path_q
+          } else {
+            tryCatch({
+              res <- resolve_export_file(p$type, p$dsId, p$model, p$ext, p$userId)
+              if (is.null(res) || is.null(res$file_path) || !file.exists(res$file_path)) {
+                job$status  <- "error"
+                job$message <- sprintf("The %s file is not available yet. Run the analysis step first.", p$type)
+              } else {
+                job$status <- "done"
+                job$result <- res
+              }
+            }, error = function(e) {
               job$status  <- "error"
-              job$message <- sprintf("The %s file is not available yet. Run the analysis step first.", p$type)
-            } else {
-              job$status <- "done"
-              job$result <- res
-            }
-          }, error = function(e) {
-            job$status  <- "error"
-            job$message <- conditionMessage(e)
-          })
+              job$message <- conditionMessage(e)
+            })
+          }
           assign(job_id, job, envir = .export_queue)
         }
       }
@@ -179,6 +246,21 @@ fs_jobs_running <- function() {
     j <- get(id, envir = .fs_jobs)
     !is.null(j$process) && isTRUE(tryCatch(j$process$is_alive(), error = function(e) FALSE))
   }, logical(1)))
+}
+
+# Check if any job is currently running for an individual user
+is_user_job_running <- function(user_id) {
+  if (is.null(user_id) || !nzchar(user_id)) return(FALSE)
+  for (jid in ls(.fs_jobs)) {
+    job <- tryCatch(get(jid, envir = .fs_jobs), error = function(e) NULL)
+    if (is.null(job)) next
+    if (identical(job$user_id, user_id)) {
+      if (!is.null(job$process) && isTRUE(tryCatch(job$process$is_alive(), error = function(e) FALSE))) {
+        return(TRUE)
+      }
+    }
+  }
+  return(FALSE)
 }
 
 # Remove a job from the registry and delete its on-disk in/out/log files.
@@ -281,68 +363,6 @@ terminate_jobs_for_dataset <- function(dataset_id = NULL, user_id = NULL) {
     }
   }
 }
-
-# Perform physical disk cleanup and report section removal for a dataset
-perform_dataset_file_cleanup <- function(dataset_id, scope = "all", user_id = NULL) {
-  if (!dir.exists("tmp")) return(invisible(0L))
-  if (is.null(user_id) || !nzchar(user_id)) user_id <- get_user_id(dataset_id)
-  
-  if (!is.null(user_id) && nzchar(user_id)) {
-    for (m in c("dp", "de", "fs", "ea", "en", "enrichment")) {
-      for (st in c("upload", "annotation", "processing", "normalization", "batch", "de", "meta", "fs", "ea")) {
-        tryCatch(remove_sections_from_report(user_id, st, dataset_id, m), error = function(e) NULL)
-      }
-    }
-  }
-
-  base_id   <- get_base_id(dataset_id)
-  target_id <- if (!is.null(base_id) && nzchar(base_id)) base_id else sub("_(dp|de|fs|ea|en|enrichment).*", "", dataset_id)
-  prefix    <- target_id
-  all_files <- list.files("tmp", full.names = TRUE, recursive = TRUE)
-  matched_files <- all_files[grepl(prefix, basename(all_files))]
-  
-  to_delete <- c()
-  if (scope == "all") {
-    to_delete <- matched_files
-  } else if (scope == "expression") {
-    to_delete <- matched_files[!grepl("(_clinical\\.csv|_clin_metadata\\.rds)$", basename(matched_files))]
-  } else if (scope == "clinical") {
-    keep_patterns <- c(
-      "_expression\\.csv$",
-      "_original_parsed\\.rds$",
-      "_expr_metadata\\.rds$",
-      "_expression_original_backup\\.csv$",
-      "_main_stack_original_backup\\.rds$",
-      "_counts_stack_original_backup\\.rds$"
-    )
-    keep <- FALSE
-    for (pat in keep_patterns) {
-      keep <- keep | grepl(pat, basename(matched_files))
-    }
-    to_delete <- matched_files[!keep]
-    
-    backup_expr_csv <- get_session_path(target_id, "%s_expression_original_backup.csv")
-    if (file.exists(backup_expr_csv)) {
-      file.copy(backup_expr_csv, get_session_path(target_id, "%s_expression.csv"), overwrite = TRUE)
-    }
-    backup_main_rds <- get_session_path(target_id, "%s_main_stack_original_backup.rds")
-    if (file.exists(backup_main_rds)) {
-      file.copy(backup_main_rds, get_session_path(target_id, "%s_main_stack.rds"), overwrite = TRUE)
-    }
-    backup_counts_rds <- get_session_path(target_id, "%s_counts_stack_original_backup.rds")
-    if (file.exists(backup_counts_rds)) {
-      file.copy(backup_counts_rds, get_session_path(target_id, "%s_counts_stack.rds"), overwrite = TRUE)
-    }
-  } else {
-    to_delete <- all_files[grepl(sprintf("^%s_%s", target_id, scope), basename(all_files))]
-  }
-  
-  if (length(to_delete) > 0) {
-    unlink(to_delete, force = TRUE)
-  }
-  invisible(length(to_delete))
-}
-
 # Helper function to format JSON safely
 json_response <- function(data, status_code = 200) {
   return(httpResponse(
@@ -429,7 +449,7 @@ submit_async_compute_job <- function(kind, payload) {
         user_id <- get_user_id(ds_id)
       }
     }
-  } else if (identical(kind, "pca")) {
+  } else if (kind %in% c("pca", "pre_processing_qc")) {
     ds_list <- if (!is.null(payload$datasets)) payload$datasets else payload
     if (length(ds_list) > 0) {
       first_item <- ds_list[[1]]
@@ -590,13 +610,14 @@ submit_async_compute_job <- function(kind, payload) {
     saveRDS(list(datasets_list = datasets_list), in_path)
     registry_entry$datasets_list <- datasets_list
   } else if (identical(kind, "annotation")) {
-    first_obj <- payload[[1]]
+    payload_datasets <- if (!is.null(payload$datasets)) payload$datasets else payload
+    first_obj <- payload_datasets[[1]]
     strategy <- if (!is.null(first_obj$strategy)) first_obj$strategy else "keep-first"
     source <- "ensembl"
     organisms <- if (!is.null(first_obj$organism)) first_obj$organism else "Human (Homo sapiens)"
     biotypes <- if (!is.null(first_obj$biotype)) first_obj$biotype else "Protein-coding"
     
-    datasets <- lapply(payload, function(d) {
+    datasets <- lapply(payload_datasets, function(d) {
       list(
         datasetId = d$datasetId,
         name = d$name,
@@ -615,10 +636,12 @@ submit_async_compute_job <- function(kind, payload) {
     registry_entry$organisms <- organisms
     registry_entry$biotypes <- biotypes
   } else if (identical(kind, "processing")) {
-    saveRDS(list(payload = payload), in_path)
-    registry_entry$payload <- payload
+    payload_datasets <- if (!is.null(payload$datasets)) payload$datasets else payload
+    saveRDS(list(payload = payload_datasets), in_path)
+    registry_entry$payload <- payload_datasets
   } else if (identical(kind, "normalization")) {
-    first_obj <- payload[[1]]
+    payload_datasets <- if (!is.null(payload$datasets)) payload$datasets else payload
+    first_obj <- payload_datasets[[1]]
     method_val <- if (!is.null(first_obj$method)) first_obj$method else "tmm"
     transform_type <- if (!is.null(first_obj$transformationType)) first_obj$transformationType else {
       log_val <- if (!is.null(first_obj$logTransform)) isTRUE(first_obj$logTransform) else TRUE
@@ -626,7 +649,7 @@ submit_async_compute_job <- function(kind, payload) {
     }
     prior_count <- if (!is.null(first_obj$priorCount)) as.numeric(first_obj$priorCount) else 0.5
     
-    datasets <- lapply(payload, function(d) {
+    datasets <- lapply(payload_datasets, function(d) {
       list(
         id = d$datasetId,
         name = d$name,
@@ -646,11 +669,12 @@ submit_async_compute_job <- function(kind, payload) {
     registry_entry$transform_type <- transform_type
     registry_entry$prior_count <- prior_count
   } else if (identical(kind, "batch")) {
-    first_obj <- payload[[1]]
+    payload_datasets <- if (!is.null(payload$datasets)) payload$datasets else payload
+    first_obj <- payload_datasets[[1]]
     method_val <- if (!is.null(first_obj$method)) first_obj$method else "combat_seq"
     method_others <- if (!is.null(first_obj$methodOthers)) first_obj$methodOthers else "combat"
     
-    datasets <- lapply(payload, function(d) {
+    datasets <- lapply(payload_datasets, function(d) {
       ds_id <- d$datasetId %||% d$id
       sync_dataset_metadata(d, module = "dp")
       
@@ -686,7 +710,7 @@ submit_async_compute_job <- function(kind, payload) {
     registry_entry$datasets <- datasets
     registry_entry$method_val <- method_val
     registry_entry$method_others <- method_others
-  } else if (identical(kind, "pca")) {
+  } else if (kind %in% c("pca", "pre_processing_qc")) {
     datasets <- if (!is.null(payload$datasets)) payload$datasets else payload
     saveRDS(list(datasets = datasets), in_path)
     registry_entry$datasets <- datasets
@@ -976,21 +1000,56 @@ submit_async_compute_job <- function(kind, payload) {
             finalize_upload_datasets(raw_res)
           } else if (identical(kind, "annotation")) {
             raw_res <- annotate_genes(input$strategy, input$source, input$organisms, input$biotypes, input$datasets)
+            if (is.list(raw_res)) {
+              err_idx <- which(vapply(raw_res, function(x) inherits(x, "try-error"), logical(1)))
+              if (length(err_idx) > 0) {
+                ds_id_label <- input$datasets[[err_idx[1]]]$datasetId %||% input$datasets[[err_idx[1]]]$name %||% err_idx[1]
+                stop(sprintf("Annotation failed for dataset %s: %s", ds_id_label, conditionMessage(attr(raw_res[[err_idx[1]]], "condition")) %||% as.character(raw_res[[err_idx[1]]])))
+              }
+            }
             finalize_annotation(raw_res, input$datasets, input$strategy, input$organisms, input$biotypes)
           } else if (identical(kind, "processing")) {
             raw_res <- process_datasets(input$payload)
+            if (is.list(raw_res)) {
+              err_idx <- which(vapply(raw_res, function(x) inherits(x, "try-error"), logical(1)))
+              if (length(err_idx) > 0) {
+                ds_id_label <- input$payload[[err_idx[1]]]$datasetId %||% input$payload[[err_idx[1]]]$name %||% err_idx[1]
+                stop(sprintf("Processing failed for dataset %s: %s", ds_id_label, conditionMessage(attr(raw_res[[err_idx[1]]], "condition")) %||% as.character(raw_res[[err_idx[1]]])))
+              }
+            }
             finalize_processing(raw_res, input$payload)
           } else if (identical(kind, "normalization")) {
             raw_res <- normalize_datasets(input$datasets, input$method_val, input$transform_type, input$prior_count)
+            if (is.list(raw_res)) {
+              err_idx <- which(vapply(raw_res, function(x) inherits(x, "try-error"), logical(1)))
+              if (length(err_idx) > 0) {
+                ds_id_label <- input$datasets[[err_idx[1]]]$id %||% input$datasets[[err_idx[1]]]$datasetId %||% input$datasets[[err_idx[1]]]$name %||% err_idx[1]
+                stop(sprintf("Normalization failed for dataset %s: %s", ds_id_label, conditionMessage(attr(raw_res[[err_idx[1]]], "condition")) %||% as.character(raw_res[[err_idx[1]]])))
+              }
+            }
             finalize_normalization(raw_res, input$datasets, input$method_val, input$transform_type, input$prior_count)
           } else if (identical(kind, "batch")) {
             raw_res <- correct_batch_effects(input$method_val, input$method_others, input$datasets)
+            if (is.list(raw_res)) {
+              err_idx <- which(vapply(raw_res, function(x) inherits(x, "try-error"), logical(1)))
+              if (length(err_idx) > 0) {
+                stop(sprintf("Batch correction failed: %s", conditionMessage(attr(raw_res[[err_idx[1]]], "condition")) %||% as.character(raw_res[[err_idx[1]]])))
+              }
+            }
             finalize_batch_correction(raw_res, input$datasets, input$method_val, input$method_others)
           } else if (identical(kind, "pca")) {
             raw_res <- compute_pca(input$datasets)
+            if (inherits(raw_res, "try-error")) {
+              stop(sprintf("PCA computation failed: %s", conditionMessage(attr(raw_res, "condition")) %||% as.character(raw_res)))
+            }
             finalize_pca(raw_res)
+          } else if (identical(kind, "pre_processing_qc")) {
+            run_pre_processing_qc(input$datasets)
           } else if (identical(kind, "ea")) {
             raw_res <- run_ea_compute(input$config)
+            if (inherits(raw_res, "try-error")) {
+              stop(sprintf("Enrichment analysis failed: %s", conditionMessage(attr(raw_res, "condition")) %||% as.character(raw_res)))
+            }
             finalize_ea(raw_res, input$config)
           } else if (identical(kind, "skip")) {
             run_skip_step(input$step, input$datasetIds)
@@ -1061,21 +1120,56 @@ submit_async_compute_job <- function(kind, payload) {
         finalize_upload_datasets(raw_res)
       } else if (identical(kind, "annotation")) {
         raw_res <- annotate_genes(strategy, source, organisms, biotypes, datasets)
+        if (is.list(raw_res)) {
+          err_idx <- which(vapply(raw_res, function(x) inherits(x, "try-error"), logical(1)))
+          if (length(err_idx) > 0) {
+            ds_id_label <- datasets[[err_idx[1]]]$datasetId %||% datasets[[err_idx[1]]]$name %||% err_idx[1]
+            stop(sprintf("Annotation failed for dataset %s: %s", ds_id_label, conditionMessage(attr(raw_res[[err_idx[1]]], "condition")) %||% as.character(raw_res[[err_idx[1]]])))
+          }
+        }
         finalize_annotation(raw_res, datasets, strategy, organisms, biotypes)
       } else if (identical(kind, "processing")) {
         raw_res <- process_datasets(payload)
+        if (is.list(raw_res)) {
+          err_idx <- which(vapply(raw_res, function(x) inherits(x, "try-error"), logical(1)))
+          if (length(err_idx) > 0) {
+            ds_id_label <- payload[[err_idx[1]]]$datasetId %||% payload[[err_idx[1]]]$name %||% err_idx[1]
+            stop(sprintf("Processing failed for dataset %s: %s", ds_id_label, conditionMessage(attr(raw_res[[err_idx[1]]], "condition")) %||% as.character(raw_res[[err_idx[1]]])))
+          }
+        }
         finalize_processing(raw_res, payload)
       } else if (identical(kind, "normalization")) {
         raw_res <- normalize_datasets(datasets, method_val, transform_type, prior_count)
+        if (is.list(raw_res)) {
+          err_idx <- which(vapply(raw_res, function(x) inherits(x, "try-error"), logical(1)))
+          if (length(err_idx) > 0) {
+            ds_id_label <- datasets[[err_idx[1]]]$id %||% datasets[[err_idx[1]]]$datasetId %||% datasets[[err_idx[1]]]$name %||% err_idx[1]
+            stop(sprintf("Normalization failed for dataset %s: %s", ds_id_label, conditionMessage(attr(raw_res[[err_idx[1]]], "condition")) %||% as.character(raw_res[[err_idx[1]]])))
+          }
+        }
         finalize_normalization(raw_res, datasets, method_val, transform_type, prior_count)
       } else if (identical(kind, "batch")) {
         raw_res <- correct_batch_effects(method_val, method_others, datasets)
+        if (is.list(raw_res)) {
+          err_idx <- which(vapply(raw_res, function(x) inherits(x, "try-error"), logical(1)))
+          if (length(err_idx) > 0) {
+            stop(sprintf("Batch correction failed: %s", conditionMessage(attr(raw_res[[err_idx[1]]], "condition")) %||% as.character(raw_res[[err_idx[1]]])))
+          }
+        }
         finalize_batch_correction(raw_res, datasets, method_val, method_others)
       } else if (identical(kind, "pca")) {
         raw_res <- compute_pca(datasets)
+        if (inherits(raw_res, "try-error")) {
+          stop(sprintf("PCA computation failed: %s", conditionMessage(attr(raw_res, "condition")) %||% as.character(raw_res)))
+        }
         finalize_pca(raw_res)
+      } else if (identical(kind, "pre_processing_qc")) {
+        run_pre_processing_qc(datasets)
       } else if (identical(kind, "ea")) {
         raw_res <- run_ea_compute(config)
+        if (inherits(raw_res, "try-error")) {
+          stop(sprintf("Enrichment analysis failed: %s", conditionMessage(attr(raw_res, "condition")) %||% as.character(raw_res)))
+        }
         finalize_ea(raw_res, config)
       } else if (identical(kind, "skip")) {
         run_skip_step(payload$step, payload$datasetIds)
@@ -1825,6 +1919,9 @@ api_router <- function(req) {
       job_id_ej <- q_ej$id
       if (!is.null(job_id_ej)) {
         if (exists(job_id_ej, envir = .export_queue, inherits = FALSE)) {
+          job_q <- get(job_id_ej, envir = .export_queue)
+          if (!is.null(job_q$process)) tryCatch(job_q$process$kill(), error = function(e) NULL)
+          if (!is.null(job_q$out_path) && file.exists(job_q$out_path)) unlink(job_q$out_path)
           rm(list = job_id_ej, envir = .export_queue)
         }
         if (exists(job_id_ej, envir = .fs_jobs, inherits = FALSE)) {
@@ -1846,27 +1943,33 @@ api_router <- function(req) {
     if (path %in% c("/dataset-info", "/dataset-summary", "/api/dataset-info", "/api/dataset-summary")) {
       query_list <- parseQueryString(req$QUERY_STRING)
       ds_param <- if (!is.null(body_data$datasetIds)) body_data$datasetIds else (if (!is.null(body_data$datasets)) body_data$datasets else (query_list$datasetIds %||% query_list$ids %||% ""))
-      module_req <- if (!is.null(body_data$module)) body_data$module else (query_list$module %||% "dp")
+      module_req <- (if (!is.null(body_data$module)) body_data$module else (query_list$module %||% "dp"))[1]
 
       req_ids <- character(0)
       if (is.list(ds_param)) {
-        req_ids <- sapply(ds_param, function(x) if (is.list(x)) (x$datasetId %||% x$id %||% "") else as.character(x))
-      } else if (is.character(ds_param) && nzchar(ds_param)) {
-        req_ids <- trimws(strsplit(ds_param, ",")[[1]])
+        req_ids <- unlist(lapply(ds_param, function(x) {
+          if (is.list(x)) (x$datasetId %||% x$id %||% "") else as.character(x)
+        }), use.names = FALSE)
+      } else if (is.character(ds_param)) {
+        req_ids <- ds_param
       }
-      req_ids <- req_ids[nzchar(req_ids)]
+      req_ids <- unlist(strsplit(as.character(req_ids), ","), use.names = FALSE)
+      req_ids <- trimws(req_ids)
+      req_ids <- req_ids[!is.na(req_ids) & nzchar(req_ids)]
 
       res_datasets <- list()
       all_feature_sets <- list()
+      features_by_hier <- list()
 
       for (d_id in req_ids) {
         parsed_ds <- get_backend_datasets(d_id)
         base_id   <- parsed_ds$base_id
 
         # Load expression matrix (try processed first, then original)
-        parsed_expr <- tryCatch(get_backend_dataset(d_id, original = FALSE), error = function(e) NULL)
+        step_val <- if (identical(module_req, "fs")) "fs" else NULL
+        parsed_expr <- tryCatch(get_backend_dataset(d_id, original = FALSE, step = step_val), error = function(e) NULL)
         if (is.null(parsed_expr) || is.null(parsed_expr$expr)) {
-          parsed_expr <- tryCatch(get_backend_dataset(d_id, original = TRUE), error = function(e) NULL)
+          parsed_expr <- tryCatch(get_backend_dataset(d_id, original = TRUE, step = step_val), error = function(e) NULL)
         }
 
         # Load metadata
@@ -1892,16 +1995,28 @@ api_router <- function(req) {
         sample_names <- character(0)
         gene_ids <- character(0)
         col_names <- character(0)
+        dt_val <- (meta_expr$dataType %||% parsed_expr$dataType %||% "readcounts")[1]
+        hier_val <- get_hierarchy_group(dt_val)
 
         if (!is.null(parsed_expr) && !is.null(parsed_expr$expr)) {
           mat <- parsed_expr$expr
-          n_feats <- as.integer(nrow(mat))
-          n_samps <- as.integer(ncol(mat))
-          sample_names <- colnames(mat) %||% character(0)
-          gene_ids <- rownames(mat) %||% character(0)
+          gene_ids <- tryCatch(get_dataset_features(parsed_expr, d_id), error = function(e) rownames(mat) %||% character(0))
+          if (length(gene_ids) > 0 && identical(gene_ids, colnames(mat)) && !identical(gene_ids, rownames(mat))) {
+            n_feats <- as.integer(ncol(mat))
+            n_samps <- as.integer(nrow(mat))
+            sample_names <- rownames(mat) %||% character(0)
+          } else {
+            n_feats <- as.integer(nrow(mat))
+            n_samps <- as.integer(ncol(mat))
+            sample_names <- colnames(mat) %||% character(0)
+          }
           col_names <- c((parsed_expr$geneIdCol %||% "Feature")[1], sample_names)
           if (length(gene_ids) > 0) {
             all_feature_sets[[d_id]] <- gene_ids
+            if (!identical(hier_val, "others")) {
+              if (is.null(features_by_hier[[hier_val]])) features_by_hier[[hier_val]] <- list()
+              features_by_hier[[hier_val]][[d_id]] <- gene_ids
+            }
           }
         }
 
@@ -1938,7 +2053,7 @@ api_router <- function(req) {
           clinicalNoExprSamples = c_no_expr,
           groups                = group_vals,
           clinicalColumns       = clin_columns,
-          dataType              = (meta_expr$dataType %||% parsed_expr$dataType %||% "readcounts")[1],
+          dataType              = dt_val,
           isNormalized          = isTRUE(any(c(meta_expr$isNormalized, parsed_expr$isNormalized)))
         )
       }
@@ -1952,11 +2067,19 @@ api_router <- function(req) {
         shared_feats_count <- length(all_feature_sets[[1]])
       }
 
+      shared_by_hier_counts <- list()
+      for (h in names(features_by_hier)) {
+        if (length(features_by_hier[[h]]) >= 2) {
+          shared_by_hier_counts[[h]] <- as.integer(length(Reduce(intersect, features_by_hier[[h]])))
+        }
+      }
+
       return(json_response(list(
-        status              = "success",
-        datasets            = res_datasets,
-        sharedFeaturesCount = shared_feats_count,
-        sharedFeatures      = if (!is.null(shared_feats) && length(shared_feats) <= 1000) shared_feats else NULL
+        status                    = "success",
+        datasets                  = res_datasets,
+        sharedFeaturesCount       = shared_feats_count,
+        sharedFeaturesByHierarchy = shared_by_hier_counts,
+        sharedFeatures            = if (!is.null(shared_feats) && length(shared_feats) <= 1000) shared_feats else NULL
       )))
     }
 
@@ -1974,7 +2097,20 @@ api_router <- function(req) {
       terminate_jobs_for_dataset(dataset_id, user_id)
 
       # 2. Asynchronously perform file cleanup and report removal
-      if (requireNamespace("later", quietly = TRUE)) {
+      if (requireNamespace("callr", quietly = TRUE)) {
+        backend_dir <- getwd()
+        callr::r_bg(
+          func = function(backend_dir, dataset_id, scope, user_id) {
+            setwd(backend_dir)
+            source("shared_utils.R")
+            tryCatch(perform_dataset_file_cleanup(dataset_id, scope, user_id), error = function(e) {
+              cat(sprintf("[WARNING] perform_dataset_file_cleanup error: %s\n", conditionMessage(e)))
+            })
+          },
+          args = list(backend_dir, dataset_id, scope, user_id),
+          supervise = TRUE
+        )
+      } else if (requireNamespace("later", quietly = TRUE)) {
         later::later(function() {
           tryCatch(perform_dataset_file_cleanup(dataset_id, scope, user_id), error = function(e) {
             cat(sprintf("[WARNING] perform_dataset_file_cleanup error: %s\n", conditionMessage(e)))
@@ -2025,10 +2161,13 @@ api_router <- function(req) {
     }
 
     # ----------------------------------------------------
-    # Route 6: POST /api/processing
+    # Route 6: POST /api/processing & POST /api/pre-processing-qc
     # ----------------------------------------------------
     if (method == "POST" && path == "/processing") {
       return(submit_async_compute_job("processing", body_data))
+    }
+    if (method == "POST" && path %in% c("/pre-processing-qc", "/api/pre-processing-qc")) {
+      return(submit_async_compute_job("pre_processing_qc", body_data))
     }
 
     # ----------------------------------------------------
@@ -2448,6 +2587,40 @@ api_router <- function(req) {
     }
 
     # ----------------------------------------------------
+    # Route: DELETE /api/upload-chunk
+    # Cancels chunked upload and cleans up temporary chunk directory
+    # ----------------------------------------------------
+    if (method == "DELETE" && path == "/upload-chunk") {
+      query_list <- parseQueryString(req$QUERY_STRING)
+      upload_id <- if (!is.null(query_list$uploadId)) query_list$uploadId else body_data$uploadId
+      user_id <- if (!is.null(query_list$userId)) query_list$userId else body_data$userId
+
+      if (is.null(upload_id) || !nzchar(upload_id)) {
+        return(json_response(list(status = "error", message = "Missing uploadId parameter"), status_code = 400))
+      }
+
+      upload_dir <- if (!is.null(user_id) && nzchar(user_id)) {
+        file.path("tmp", "user_sessions", user_id, "uploads", upload_id)
+      } else {
+        file.path("tmp", "uploads", upload_id)
+      }
+
+      if (dir.exists(upload_dir)) {
+        if (requireNamespace("callr", quietly = TRUE)) {
+          callr::r_bg(
+            func = function(d) unlink(d, recursive = TRUE, force = TRUE),
+            args = list(upload_dir),
+            supervise = TRUE
+          )
+        } else {
+          unlink(upload_dir, recursive = TRUE, force = TRUE)
+        }
+      }
+
+      return(json_response(list(status = "success", message = "Upload cancelled and temporary files cleaned up")))
+    }
+
+    # ----------------------------------------------------
     # Route 16: POST /api/upload-datasets  (Standardised multi-dataset upload)
     # ----------------------------------------------------
     if (method == "POST" && path == "/upload-datasets") {
@@ -2636,6 +2809,8 @@ api_router <- function(req) {
           fs_negativeClass    = neg_class,
           fs_trainRatio           = if (!is.null(d$trainRatio)) d$trainRatio else train_ratio,
           fs_datasetPurpose       = if (!is.null(d$datasetPurpose)) d$datasetPurpose else "train-and-test",
+          fs_validationStrategy   = d$fs_validationStrategy %||% d$validationStrategy %||% "train-test-split",
+          validationStrategy      = d$validationStrategy %||% d$fs_validationStrategy %||% "train-test-split",
           fs_isInternalValidation = isTRUE(d$isInternalValidation)
         )
       })
@@ -2814,6 +2989,13 @@ api_router <- function(req) {
     }
 
     # ----------------------------------------------------
+    # Route: GET /api/app-mode
+    # ----------------------------------------------------
+    if (method == "GET" && path == "/app-mode") {
+      return(json_response(list(mode = get_app_mode())))
+    }
+
+    # ----------------------------------------------------
     # Route: GET /api/microarray-platforms
     # ----------------------------------------------------
     if (method == "GET" && path == "/microarray-platforms") {
@@ -2838,7 +3020,20 @@ api_router <- function(req) {
         terminate_jobs_for_dataset(ds_id_full, user_id)
       }
       
-      if (requireNamespace("later", quietly = TRUE)) {
+      if (requireNamespace("callr", quietly = TRUE)) {
+        backend_dir <- getwd()
+        callr::r_bg(
+          func = function(backend_dir, dataset_ids, step) {
+            setwd(backend_dir)
+            source("shared_utils.R")
+            for (ds_id_full in dataset_ids) {
+              tryCatch(delete_downstream_files(ds_id_full, step, is_redo = FALSE), error = function(e) NULL)
+            }
+          },
+          args = list(backend_dir, dataset_ids, step),
+          supervise = TRUE
+        )
+      } else if (requireNamespace("later", quietly = TRUE)) {
         later::later(function() {
           for (ds_id_full in dataset_ids) {
             tryCatch(delete_downstream_files(ds_id_full, step, is_redo = FALSE), error = function(e) NULL)
@@ -2853,52 +3048,46 @@ api_router <- function(req) {
     }
 
     # ----------------------------------------------------
-    # Route 22: POST /api/cleanup
+    # Route 22: POST/GET /api/cleanup
     # ----------------------------------------------------
-    if (method == "POST" && path == "/cleanup") {
+    if ((method == "POST" || method == "GET") && path == "/cleanup") {
       query_list <- parseQueryString(req$QUERY_STRING)
-      user_id    <- query_list$userId
-      cat(sprintf("[API] Cleanup requested. Cleaning files for user_id='%s'...\n", user_id))
+      user_id    <- if (!is.null(query_list$userId) && nzchar(query_list$userId)) query_list$userId else body_data$userId
+      cat(sprintf("[API] Cleanup requested. Cleaning files for user_id='%s'...\n", user_id %||% "unknown"))
       
-      if (!is.null(user_id) && nzchar(user_id)) {
+      if (!is.null(user_id) && nzchar(user_id) && user_id != "user" && user_id != "all") {
         # 1. Immediately terminate any active background jobs for this user
         terminate_jobs_for_dataset(NULL, user_id = user_id)
         
         # 2. Asynchronously delete user session directory and temp files
-        if (requireNamespace("later", quietly = TRUE)) {
-          later::later(function() {
-            if (dir.exists("tmp")) {
-              tryCatch({
-                user_sess_dir <- file.path("tmp/user_sessions", user_id)
-                if (dir.exists(user_sess_dir)) {
-                  unlink(user_sess_dir, recursive = TRUE)
-                }
-                all_files <- list.files("tmp", full.names = TRUE)
-                user_files <- all_files[grepl(user_id, basename(all_files)) & !dir.exists(all_files)]
-                if (length(user_files) > 0) {
-                  file.remove(user_files)
-                }
-                cat(sprintf("[API] Successfully cleaned files for user_id='%s'.\n", user_id))
-              }, error = function(e) {
-                cat("[WARNING] Failed to clean files for user:", e$message, "\n")
-              })
+        clean_user_files <- function(uid) {
+          tryCatch({
+            user_sess_dir <- file.path("tmp/user_sessions", uid)
+            if (dir.exists(user_sess_dir)) {
+              unlink(user_sess_dir, recursive = TRUE, force = TRUE)
             }
-          }, 0)
-        } else {
-          if (dir.exists("tmp")) {
-            tryCatch({
-              user_sess_dir <- file.path("tmp/user_sessions", user_id)
-              if (dir.exists(user_sess_dir)) unlink(user_sess_dir, recursive = TRUE)
+            if (dir.exists("tmp")) {
               all_files <- list.files("tmp", full.names = TRUE)
-              user_files <- all_files[grepl(user_id, basename(all_files)) & !dir.exists(all_files)]
-              if (length(user_files) > 0) file.remove(user_files)
-            }, error = function(e) NULL)
-          }
+              user_files <- all_files[grepl(uid, basename(all_files), fixed = TRUE) & !dir.exists(all_files)]
+              if (length(user_files) > 0) {
+                unlink(user_files, force = TRUE)
+              }
+            }
+            cat(sprintf("[API] Successfully cleaned files for user_id='%s'.\n", uid))
+          }, error = function(e) {
+            cat(sprintf("[WARNING] Failed to clean files for user_id='%s': %s\n", uid, conditionMessage(e)))
+          })
+          gc(verbose = FALSE)
+        }
+
+        if (requireNamespace("later", quietly = TRUE)) {
+          later::later(function() clean_user_files(user_id), 0.05)
+        } else {
+          clean_user_files(user_id)
         }
       } else {
         cat("[WARNING] Cleanup requested without a valid userId. No files deleted to prevent wiping all users' data.\n")
       }
-      gc(verbose = FALSE)
       return(json_response(list(success = TRUE)))
     }
 
@@ -3060,26 +3249,38 @@ ui <- fluidPage(
   )
 )
 
-# Background Garbage Collector to clean up stale user session directories (older than 4 hours)
-start_garbage_collector <- function(interval_seconds = 3600, max_age_hours = 4) {
+# Background Garbage Collector to clean up idle user sessions (15+ mins idle, no active jobs)
+# Only active when deployed as server mode (default); in desktop mode cleanup happens on shutdown
+start_garbage_collector <- function(interval_seconds = 60, max_idle_mins = 15) {
+  if (identical(get_app_mode(), "desktop")) {
+    return(invisible(NULL))
+  }
   gc_task <- function() {
     tryCatch({
       session_base_dir <- "tmp/user_sessions"
       if (dir.exists(session_base_dir)) {
         user_dirs <- list.dirs(session_base_dir, recursive = FALSE)
         for (u_dir in user_dirs) {
+          u_id <- basename(u_dir)
+          # Never touch a user session if they have a running compute job
+          if (is_user_job_running(u_id)) {
+            next
+          }
+
           files <- list.files(u_dir, full.names = TRUE, recursive = TRUE)
           if (length(files) == 0) {
             unlink(u_dir, recursive = TRUE)
-            cat(sprintf("[GC] Cleaned up empty session directory: %s\n", basename(u_dir)))
+            cat(sprintf("[GC] Cleaned up empty session directory: %s\n", u_id))
             next
           }
           
           mtimes <- file.info(files)$mtime
-          age_hours <- difftime(Sys.time(), mtimes, units = "hours")
-          if (all(age_hours > max_age_hours)) {
+          age_mins <- as.numeric(difftime(Sys.time(), mtimes, units = "mins"))
+          if (all(age_mins > max_idle_mins)) {
+            # Terminate any lingering background job records
+            terminate_jobs_for_dataset(NULL, user_id = u_id)
             unlink(u_dir, recursive = TRUE)
-            cat(sprintf("[GC] Cleaned up stale session directory: %s\n", basename(u_dir)))
+            cat(sprintf("[GC] Cleaned up idle session directory (%d mins idle): %s\n", round(min(age_mins)), u_id))
           }
         }
       }

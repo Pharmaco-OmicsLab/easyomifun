@@ -1,8 +1,8 @@
 import { useState, useEffect, useMemo } from "react";
 import { useLocation } from "wouter";
-import { ChevronDown, ChevronRight, Layers, AlertTriangle, CheckCircle } from "lucide-react";
+import { ChevronDown, ChevronRight, Layers, AlertTriangle, CheckCircle, Check, RotateCcw, Info } from "lucide-react";
 import { useAppStore } from "../../store/appStore";
-import { type MLModel, getHierarchyGroup, canPoolDatasets } from "../../dataObject";
+import { type MLModel, getHierarchyGroup, formatDataTypeLabel, canPoolDatasets } from "../../dataObject";
 import Spinner from "../Spinner";
 import ChangeWarnModal from "../shared/ChangeWarnModal";
 import DiscardWarnModal from "../shared/DiscardWarnModal";
@@ -126,23 +126,23 @@ function buildFullModelParams(
   return result;
 }
 
-// Helper to extract feature ids from dataset
+// Helper to extract feature ids from dataset (Features are Rows)
 const getFsDatasetFeatureIds = (d: any): Set<string> => {
-  if (d.dataMode === "metadata_features") {
-    const sampleIdCol = d.clinicalSampleIdCol || d.geneIdCol || "SampleID";
-    const infoCols = d.geneInfoCols || [];
-    const featureCols = (d.columns || []).filter((c: string) => c !== sampleIdCol && !infoCols.includes(c));
-    return new Set(featureCols);
-  }
   if (!d.parsedData || d.parsedData.length === 0) return new Set();
-  const geneIdIdx = d.columns ? d.columns.indexOf(d.geneIdCol) : -1;
-  if (geneIdIdx === -1) return new Set(d.parsedData.map((row: any) => String(row[0])));
-  return new Set(d.parsedData.map((row: any) => String(row[geneIdIdx])));
+  const featIdx = (d.fs_featureIndexValue || 1) - 1;
+  const geneIdCol = d.geneIdCol || (d.columns && d.columns[featIdx >= 0 ? featIdx : 0]) || "Feature";
+  const geneIdIdx = d.columns?.indexOf(geneIdCol);
+  const targetIdx = geneIdIdx !== undefined && geneIdIdx !== -1 ? geneIdIdx : (featIdx >= 0 && featIdx < (d.columns?.length || 0) ? featIdx : 0);
+  return new Set(d.parsedData.map((row: any) => String(row[targetIdx])).filter(Boolean));
 };
 
 // Helper to compute intersection of features in a list of datasets
-const getSharedFeatureCountForGroup = (groupDatasets: any[]): number => {
+const getSharedFeatureCountForGroup = (groupDatasets: any[], backendCounts?: Record<string, number>): number => {
   if (groupDatasets.length <= 1) return 0;
+  if (backendCounts) {
+    const h = getHierarchyGroup(groupDatasets[0]?.dataType || "type1");
+    if (backendCounts[h] !== undefined) return backendCounts[h];
+  }
   if (groupDatasets.some(d => !d.parsedData || d.parsedData.length === 0)) return 0;
   let intersection = getFsDatasetFeatureIds(groupDatasets[0]);
   for (let i = 1; i < groupDatasets.length; i++) {
@@ -173,11 +173,15 @@ export default function ModelSelectionStep() {
     }
   });
 
+  // Authoritative shared feature counts from the backend (full expression matrix, not 100-row preview)
+  const [backendSharedCounts, setBackendSharedCounts] = useState<{ general?: number; transcriptomics?: number; proteomics?: number }>({});
+
   // Pooling selection card is visible only when we have same-type datasets with >= 10 shared features
-  // NOTE: backendSharedCounts is populated below via useEffect; this will reactively update
   const hasPoolableTypesAndSufficientFeatures = Object.values(typeGroups).some(group => {
     if (group.length < 2) return false;
-    const count = getSharedFeatureCountForGroup(group);
+    const h = getHierarchyGroup(group[0]?.dataType || "type1");
+    const backendCount = h === "general" ? backendSharedCounts.general : (h === "transcriptomics" ? backendSharedCounts.transcriptomics : (h === "proteomics" ? backendSharedCounts.proteomics : undefined));
+    const count = backendCount ?? getSharedFeatureCountForGroup(group);
     return count >= 10;
   });
 
@@ -299,7 +303,7 @@ export default function ModelSelectionStep() {
     );
     const testingDsWithCv = state.fsDatasets.filter(d => 
       d.fs_datasetPurpose === "test" && 
-      (d.fs_validationStrategy === "cv-only" || d.fs_validationStrategy === "cv-and-test")
+      (d.fs_validationStrategy === "cv-only" || d.fs_validationStrategy === "cv-and-test" || fsConfig.cvEnabled)
     );
 
     if (isCombinedPool) {
@@ -355,10 +359,6 @@ export default function ModelSelectionStep() {
       ? fsConfig.selectedModels.filter(m => m !== id)
       : [...fsConfig.selectedModels, id];
     dispatch({ type: "FS_SET_CONFIG", patch: { selectedModels: next } });
-    if (!fsConfig.selectedModels.includes(id)) {
-      // Auto-expand when selecting
-      setExpandedModels(prev => new Set([...prev, id]));
-    }
   };
 
   const setParam = (modelId: MLModel, key: string, value: string | number) => {
@@ -574,6 +574,9 @@ export default function ModelSelectionStep() {
   dataTypes.forEach(t => { typeCounts[t] = (typeCounts[t] || 0) + 1; });
   
   // Find group datasets of same hierarchy
+  const generalDatasets = state.fsDatasets.filter(
+    d => getHierarchyGroup(d.dataType || "readcounts") === "general"
+  );
   const transcriptomicsDatasets = state.fsDatasets.filter(
     d => getHierarchyGroup(d.dataType || "readcounts") === "transcriptomics"
   );
@@ -581,16 +584,15 @@ export default function ModelSelectionStep() {
     d => getHierarchyGroup(d.dataType || "readcounts") === "proteomics"
   );
 
+  const sharedGeneralCount = getSharedFeatureCountForGroup(generalDatasets);
   const sharedTranscriptomicsCount = getSharedFeatureCountForGroup(transcriptomicsDatasets);
   const sharedProteomicsCount = getSharedFeatureCountForGroup(proteomicsDatasets);
-
-  // Authoritative shared feature counts from the backend (full expression matrix, not 100-row preview)
-  const [backendSharedCounts, setBackendSharedCounts] = useState<{ transcriptomics?: number; proteomics?: number }>({});
 
   useEffect(() => {
     let cancelled = false;
     const fetchCounts = async () => {
-      const groups: Array<{ key: "transcriptomics" | "proteomics"; ds: typeof state.fsDatasets }> = [
+      const groups: Array<{ key: "general" | "transcriptomics" | "proteomics"; ds: typeof state.fsDatasets }> = [
+        { key: "general",         ds: generalDatasets },
         { key: "transcriptomics", ds: transcriptomicsDatasets },
         { key: "proteomics",      ds: proteomicsDatasets },
       ];
@@ -600,6 +602,7 @@ export default function ModelSelectionStep() {
           const res = await fetchDatasetInfoAPI(ds.map(d => d.id), "fs");
           if (!cancelled && res?.sharedFeaturesCount !== undefined) {
             setBackendSharedCounts(prev => ({ ...prev, [key]: res.sharedFeaturesCount }));
+            dispatch({ type: "SET_FS_SHARED_COUNTS", counts: { [key]: res.sharedFeaturesCount } });
           }
         } catch (_) { /* keep parsedData fallback */ }
       }
@@ -609,6 +612,7 @@ export default function ModelSelectionStep() {
   }, [state.fsDatasets]);
 
   // Use backend count when available, else fall back to parsedData intersection (100-row preview only)
+  const sharedGeneralCountFinal = backendSharedCounts.general ?? sharedGeneralCount;
   const sharedTranscriptomicsCountFinal = backendSharedCounts.transcriptomics ?? sharedTranscriptomicsCount;
   const sharedProteomicsCountFinal = backendSharedCounts.proteomics ?? sharedProteomicsCount;
 
@@ -689,12 +693,18 @@ export default function ModelSelectionStep() {
   );
 
   let allocationError: string | null = null;
-  if (trainingDatasets.length === 0) {
+  if (
+    (generalDatasets.length >= 2 && backendSharedCounts.general !== undefined && sharedGeneralCountFinal <= 10) ||
+    (transcriptomicsDatasets.length >= 2 && backendSharedCounts.transcriptomics !== undefined && sharedTranscriptomicsCountFinal <= 10) ||
+    (proteomicsDatasets.length >= 2 && backendSharedCounts.proteomics !== undefined && sharedProteomicsCountFinal <= 10)
+  ) {
+    allocationError = "Datasets within the same hierarchy must share more than 10 features to proceed.";
+  } else if (trainingDatasets.length === 0) {
     allocationError = "You must assign at least 1 dataset for Training.";
   } else if (testingDatasets.length > 0) {
     for (const testDs of testingDatasets) {
-      const testHierarchy = getHierarchyGroup(testDs.dataType || "readcounts");
-      const hasMatchingTrain = trainingDatasets.some(trainDs => getHierarchyGroup(trainDs.dataType || "readcounts") === testHierarchy);
+      const testHierarchy = getHierarchyGroup(testDs.dataType || "type1");
+      const hasMatchingTrain = trainingDatasets.some(trainDs => getHierarchyGroup(trainDs.dataType || "type1") === testHierarchy);
       if (!hasMatchingTrain) {
         allocationError = `External testing dataset "${testDs.name}" (${testHierarchy}) requires at least 1 training dataset from the same hierarchy group.`;
         break;
@@ -941,9 +951,19 @@ export default function ModelSelectionStep() {
         {/* Dynamic Multi-Dataset Mode Banner (When >= 2 Datasets) */}
         {!isSingleDataset && (
           <div style={{ display: "flex", gap: 12, marginBottom: 16, flexWrap: "wrap" }}>
+            {generalDatasets.length >= 2 && (
+              <div className="stat-chip" style={{ display: "flex", flexDirection: "column", background: "white", border: "1px solid var(--border)", borderRadius: 8, padding: "8px 12px", minWidth: 140 }}>
+                <span className="stat-chip-val" style={{ fontSize: 18, fontWeight: 700, color: sharedGeneralCountFinal > 10 ? "hsl(150 60% 32%)" : "hsl(0 72% 50%)" }}>
+                  {sharedGeneralCountFinal.toLocaleString()}
+                </span>
+                <span className="stat-chip-lbl" style={{ fontSize: 10, color: "var(--muted-foreground)", fontWeight: 600, marginTop: 2 }}>
+                  Shared Features (General — Type 1 / Type 2)
+                </span>
+              </div>
+            )}
             {transcriptomicsDatasets.length >= 2 && (
               <div className="stat-chip" style={{ display: "flex", flexDirection: "column", background: "white", border: "1px solid var(--border)", borderRadius: 8, padding: "8px 12px", minWidth: 140 }}>
-                <span className="stat-chip-val" style={{ fontSize: 18, fontWeight: 700, color: sharedTranscriptomicsCountFinal >= 10 ? "hsl(150 60% 32%)" : "hsl(0 72% 50%)" }}>
+                <span className="stat-chip-val" style={{ fontSize: 18, fontWeight: 700, color: sharedTranscriptomicsCountFinal > 10 ? "hsl(150 60% 32%)" : "hsl(0 72% 50%)" }}>
                   {sharedTranscriptomicsCountFinal.toLocaleString()}
                 </span>
                 <span className="stat-chip-lbl" style={{ fontSize: 10, color: "var(--muted-foreground)", fontWeight: 600, marginTop: 2 }}>
@@ -953,7 +973,7 @@ export default function ModelSelectionStep() {
             )}
             {proteomicsDatasets.length >= 2 && (
               <div className="stat-chip" style={{ display: "flex", flexDirection: "column", background: "white", border: "1px solid var(--border)", borderRadius: 8, padding: "8px 12px", minWidth: 140 }}>
-                <span className="stat-chip-val" style={{ fontSize: 18, fontWeight: 700, color: sharedProteomicsCountFinal >= 10 ? "hsl(150 60% 32%)" : "hsl(0 72% 50%)" }}>
+                <span className="stat-chip-val" style={{ fontSize: 18, fontWeight: 700, color: sharedProteomicsCountFinal > 10 ? "hsl(150 60% 32%)" : "hsl(0 72% 50%)" }}>
                   {sharedProteomicsCountFinal.toLocaleString()}
                 </span>
                 <span className="stat-chip-lbl" style={{ fontSize: 10, color: "var(--muted-foreground)", fontWeight: 600, marginTop: 2 }}>
@@ -973,8 +993,9 @@ export default function ModelSelectionStep() {
             <div style={{ fontSize: 11, color: "var(--muted-foreground)", marginBottom: 8 }}>
               Multiple datasets of the same data type detected.
             </div>
-            <div className="banner info" style={{ marginTop: 0, fontSize: 12 }}>
-              ℹ️ <strong>Automatic Pooling:</strong> Datasets of the same type and hierarchy will be pooled and batch-corrected using ComBat/limma before feature selection.
+            <div className="banner info" style={{ marginTop: 0, fontSize: 12, display: "flex", alignItems: "center", gap: 6 }}>
+              <Info size={14} style={{ flexShrink: 0 }} />
+              <span><strong>Automatic Pooling:</strong> Datasets of the same type and hierarchy will be pooled and batch-corrected using ComBat/limma before feature selection.</span>
             </div>
           </div>
         )}
@@ -1001,11 +1022,11 @@ export default function ModelSelectionStep() {
                   ))}
                   <span style={{
                     fontSize: 10, fontWeight: 700, padding: "2px 8px", borderRadius: 4,
-                    background: combinedHierarchy === "transcriptomics" ? "hsl(214 50% 93%)" : (combinedHierarchy === "proteomics" ? "hsl(140 40% 93%)" : "hsl(30 50% 93%)"),
-                    color: combinedHierarchy === "transcriptomics" ? "hsl(214 58% 30%)" : (combinedHierarchy === "proteomics" ? "hsl(140 50% 25%)" : "hsl(30 60% 30%)"),
+                    background: (combinedHierarchy === "transcriptomics" || combinedHierarchy === "general") ? "hsl(214 50% 93%)" : (combinedHierarchy === "proteomics" ? "hsl(140 40% 93%)" : "hsl(30 50% 93%)"),
+                    color: (combinedHierarchy === "transcriptomics" || combinedHierarchy === "general") ? "hsl(214 58% 30%)" : (combinedHierarchy === "proteomics" ? "hsl(140 50% 25%)" : "hsl(30 60% 30%)"),
                     border: "1px solid var(--border)"
                   }}>
-                    {combinedHierarchy.toUpperCase()} · {state.fsDatasets[0]?.dataType || "readcounts"}
+                    {combinedHierarchy.toUpperCase()} · {formatDataTypeLabel(state.fsDatasets[0]?.dataType || "type1")}
                   </span>
                 </div>
               </div>
@@ -1118,7 +1139,7 @@ export default function ModelSelectionStep() {
           ) : (
             // Different data types or Individual mode: Render per-dataset selection cards
             state.fsDatasets.map((d, index) => {
-              const hierarchy = getHierarchyGroup(d.dataType || "readcounts");
+              const hierarchy = getHierarchyGroup(d.dataType || "type1");
               const currentPurpose = d.fs_datasetPurpose || "train-and-test";
               const currentRatio = d.fs_trainRatio ?? 0.7;
               const isSmall = d.nSamples < 100;
@@ -1134,11 +1155,11 @@ export default function ModelSelectionStep() {
                     </div>
                     <span style={{
                       fontSize: 10, fontWeight: 700, padding: "2px 8px", borderRadius: 4,
-                      background: hierarchy === "transcriptomics" ? "hsl(214 50% 93%)" : (hierarchy === "proteomics" ? "hsl(140 40% 93%)" : "hsl(30 50% 93%)"),
-                      color: hierarchy === "transcriptomics" ? "hsl(214 58% 30%)" : (hierarchy === "proteomics" ? "hsl(140 50% 25%)" : "hsl(30 60% 30%)"),
+                      background: (hierarchy === "transcriptomics" || hierarchy === "general") ? "hsl(214 50% 93%)" : (hierarchy === "proteomics" ? "hsl(140 40% 93%)" : "hsl(30 50% 93%)"),
+                      color: (hierarchy === "transcriptomics" || hierarchy === "general") ? "hsl(214 58% 30%)" : (hierarchy === "proteomics" ? "hsl(140 50% 25%)" : "hsl(30 60% 30%)"),
                       border: "1px solid var(--border)"
                     }}>
-                      {hierarchy.toUpperCase()} · {d.dataType || "readcounts"}
+                      {hierarchy.toUpperCase()} · {formatDataTypeLabel(d.dataType || "type1")}
                     </span>
                   </div>
 
@@ -1563,12 +1584,15 @@ export default function ModelSelectionStep() {
         </div>
 
         {fsConfig.selectedModels.length === 0 && (
-          <div className="banner warn" style={{ marginTop: 12 }}>⚠ Select at least one model to proceed.</div>
+          <div className="banner warn" style={{ marginTop: 12, display: "flex", alignItems: "center", gap: 6 }}>
+            <AlertTriangle size={14} style={{ flexShrink: 0 }} />
+            <span>Select at least one model to proceed.</span>
+          </div>
         )}
         {fsConfig.selectedModels.length > 0 && (
-          <div className="banner info" style={{ marginTop: 12 }}>
-            ✓ <strong>{fsConfig.selectedModels.length} model(s) selected</strong>: {fsConfig.selectedModels.join(", ")}.
-            {fsConfig.cvEnabled && " Cross-validation will tune their hyperparameters."}
+          <div className="banner info" style={{ marginTop: 12, display: "flex", alignItems: "center", gap: 6 }}>
+            <Check size={14} style={{ flexShrink: 0 }} />
+            <span><strong>{fsConfig.selectedModels.length} model(s) selected</strong>: {fsConfig.selectedModels.join(", ")}.{fsConfig.cvEnabled && " Cross-validation will tune their hyperparameters."}</span>
           </div>
         )}
       </div>
@@ -1583,7 +1607,10 @@ export default function ModelSelectionStep() {
             return (
               <div key={d.id} style={{ display: "flex", flexDirection: "column", gap: 14 }}>
                 {dsWarnings.length > 0 && dsWarnings.map((w, i) => (
-                  <div key={i} className="banner warn" style={{ marginTop: 0 }}>⚠ {w}</div>
+                  <div key={i} className="banner warn" style={{ marginTop: 0, display: "flex", alignItems: "center", gap: 6 }}>
+                    <AlertTriangle size={14} style={{ flexShrink: 0 }} />
+                    <span>{w}</span>
+                  </div>
                 ))}
                 {dsRes.features && dsRes.features.length > 0 && (
                   <div className="card">
@@ -1695,7 +1722,7 @@ export default function ModelSelectionStep() {
                           </div>
                         ) : (
                           <div style={{ height: 210, display: "flex", alignItems: "center", justifyContent: "center", border: "1px dashed var(--border)", borderRadius: 6, background: "var(--background)" }}>
-                            <div style={{ padding: 40, color: "var(--muted-foreground)", fontSize: 13, textAlign: "center" }}>Errors occured. Couldn't generate ROC Curves...</div>
+                            <div style={{ padding: 40, color: "var(--muted-foreground)", fontSize: 13, textAlign: "center" }}>Could not generate ROC curves. Please verify that at least two classes are present in the selected cohort.</div>
                           </div>
                         )}
                       </div>
@@ -1804,6 +1831,72 @@ export default function ModelSelectionStep() {
                     </div>
                   </div>
                 )}
+              </div>
+            );
+          })}
+          {(isRefitted || isOnlyBorutaStabl) && !hasSelectionMethodChanged && !hasTrainingSettingsChanged && testingDatasets.map(t => {
+            const dsRes = getDatasetResults(t.id);
+            if (!dsRes || !dsRes.performance_metrics) return null;
+            return (
+              <div key={t.id} className="card">
+                <div className="card-title" style={{ marginBottom: 4, fontSize: 13 }}>
+                  Model Training Performance (Validation Refit — {t.name} · {formatDataTypeLabel(t.dataType || "type1")})
+                </div>
+                <div className="card-sub">
+                  Models B refitted on {t.name} training partition using the feature signature selected on the training data type.
+                </div>
+                <hr className="card-divider" />
+                <div style={{ display: "grid", gridTemplateColumns: "1fr", gap: 20 }}>
+                  {dsRes.roc_plot && (
+                    <div style={{ display: "flex", flexDirection: "column", gap: 8, border: "1px solid var(--border)", borderRadius: 8, padding: 12, background: "var(--muted)" }}>
+                      <div style={{ fontSize: 12, fontWeight: 600, color: "var(--foreground)" }}>ROC Curves</div>
+                      <div style={{ display: "flex", justifyContent: "center" }}>
+                        <img src={`data:image/png;base64,${dsRes.roc_plot}`} style={{ width: 700, height: 400, objectFit: "contain", borderRadius: 8 }} alt="ROC Curves" />
+                      </div>
+                    </div>
+                  )}
+                  <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+                    {[...fsConfig.selectedModels].sort((a, b) => {
+                      const order = ["stabl", "boruta", "gbm", "randomforest", "logistic", "svm"];
+                      return order.indexOf(a) - order.indexOf(b);
+                    }).map(m => {
+                      const metrics = dsRes.performance_metrics?.[m] || { auc: 0.5, acc: 0.5, ppv: 0.5, npv: 0.5 };
+                      const modelName = MODEL_LABELS[m] || m;
+                      return (
+                        <div key={m} style={{ padding: "8px 12px", border: "1px solid var(--border)", borderRadius: 8, background: "white" }}>
+                          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 8 }}>
+                            <div style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, fontWeight: 600 }}>
+                              <div style={{ width: 6, height: 6, background: MODEL_COLORS[m], borderRadius: "50%" }} />
+                              {modelName}
+                            </div>
+                          </div>
+                          <div className="chips-row">
+                            <div className="stat-chip">
+                              <div className="stat-chip-val" style={{ color: "var(--primary)" }}>{formatMetric(metrics?.auc, 0.5, 3)}</div>
+                              <div className="stat-chip-lbl">AUC</div>
+                            </div>
+                            <div className="stat-chip" style={{ minWidth: 160 }}>
+                              <div className="stat-chip-val">{formatCi(metrics?.ci, metrics?.ci_lower, metrics?.ci_upper)}</div>
+                              <div className="stat-chip-lbl">95% CI</div>
+                            </div>
+                            <div className="stat-chip">
+                              <div className="stat-chip-val">{formatMetric(metrics?.acc, 0.5, 3)}</div>
+                              <div className="stat-chip-lbl">Balanced Accuracy</div>
+                            </div>
+                            <div className="stat-chip">
+                              <div className="stat-chip-val">{formatMetric(metrics?.ppv, 0.5, 3)}</div>
+                              <div className="stat-chip-lbl">PPV</div>
+                            </div>
+                            <div className="stat-chip">
+                              <div className="stat-chip-val">{formatMetric(metrics?.npv, 0.5, 3)}</div>
+                              <div className="stat-chip-lbl">NPV</div>
+                            </div>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
               </div>
             );
           })}
@@ -2032,11 +2125,11 @@ export default function ModelSelectionStep() {
         {(state.fsTrainingResultsCache || fsResults) && hasTrainingSettingsChanged && (
           <button
             className="btn btn-default"
-            style={{ borderColor: "var(--warning-border)", color: "var(--warning-text)", background: "var(--warning-bg)" }}
+            style={{ borderColor: "var(--warning-border)", color: "var(--warning-text)", background: "var(--warning-bg)", display: "inline-flex", alignItems: "center", gap: 6 }}
             onClick={handleRedo}
             data-testid="btn-redo-model-selection"
           >
-            🔄 Redo Model Training
+            <RotateCcw size={14} /> Redo Model Training
           </button>
         )}
 
@@ -2044,12 +2137,12 @@ export default function ModelSelectionStep() {
         {!hasTrainingSettingsChanged && fsResults && hasAnyRankModel && hasSelectionMethodChanged && (
           <button
             className="btn btn-default"
-            style={{ borderColor: "var(--primary)", color: "var(--primary)" }}
+            style={{ borderColor: "var(--primary)", color: "var(--primary)", display: "inline-flex", alignItems: "center", gap: 6 }}
             disabled={isRefitting || loadingTraining}
             onClick={handleRefit}
             data-testid="btn-redo-selecting-features"
           >
-            {isRefitting ? "Refitting Features…" : "🔄 Redo Selecting Features"}
+            {isRefitting ? "Refitting Features…" : <><RotateCcw size={14} /> Redo Selecting Features</>}
           </button>
         )}
 

@@ -22,16 +22,33 @@ export async function uploadFileInChunks(
   file: File,
   datasetId: string,
   fileType: "expression" | "clinical" = "expression",
-  onProgress?: (pct: number) => void
+  onProgress?: (pct: number) => void,
+  signal?: AbortSignal
 ): Promise<string> {
   const uploadId = `upload_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
   const totalSize = file.size;
   const totalChunks = Math.max(1, Math.ceil(totalSize / CHUNK_SIZE));
   const userId = sessionStorage.getItem("easyomifun_user_id") || "";
 
+  const abortCleanup = () => {
+    fetch(`${SERVER_URL}/api/upload-chunk?uploadId=${uploadId}&userId=${encodeURIComponent(userId)}`, {
+      method: "DELETE"
+    }).catch(() => {});
+  };
+
+  if (signal?.aborted) {
+    abortCleanup();
+    throw new DOMException("Upload aborted by user", "AbortError");
+  }
+
   let uploadedBytes = 0;
 
   for (let chunkIndex = 0; chunkIndex < totalChunks; chunkIndex++) {
+    if (signal?.aborted) {
+      abortCleanup();
+      throw new DOMException("Upload aborted by user", "AbortError");
+    }
+
     const start = chunkIndex * CHUNK_SIZE;
     const end = Math.min(start + CHUNK_SIZE, totalSize);
     const chunkBlob = file.slice(start, end);
@@ -52,12 +69,17 @@ export async function uploadFileInChunks(
     let lastError: any = null;
 
     while (attempt < MAX_RETRIES && !success) {
+      if (signal?.aborted) {
+        abortCleanup();
+        throw new DOMException("Upload aborted by user", "AbortError");
+      }
       attempt++;
       try {
         const res = await fetch(`${SERVER_URL}/api/upload-chunk`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(payload),
+          signal,
         });
 
         if (!res.ok) {
@@ -76,6 +98,10 @@ export async function uploadFileInChunks(
 
         success = true;
       } catch (err: any) {
+        if (signal?.aborted || err.name === "AbortError") {
+          abortCleanup();
+          throw new DOMException("Upload aborted by user", "AbortError");
+        }
         lastError = err;
         console.warn(
           `[CHUNK-UPLOAD] Chunk ${chunkIndex + 1}/${totalChunks} attempt ${attempt} failed:`,

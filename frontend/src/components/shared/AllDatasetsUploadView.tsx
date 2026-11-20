@@ -1,7 +1,8 @@
-import { useState } from "react";
-import { CheckCircle, AlertCircle, Upload } from "lucide-react";
+import { useState, type ReactNode } from "react";
+import { CheckCircle, AlertCircle, Upload, FileText, FileSpreadsheet, AlertTriangle } from "lucide-react";
 import DiscardWarnModal from "./DiscardWarnModal";
 import { getExpressionSampleColumns } from "../../lib/dataParser";
+import { formatDataTypeLabel } from "../../dataObject";
 
 export interface UploadSummaryDataset {
   id: string;
@@ -47,6 +48,7 @@ interface Props {
   datasetIds?: string[];
   onSkip?: () => void;
   isContinueDisabled?: boolean;
+  children?: ReactNode;
 }
 
 export default function AllDatasetsUploadView({
@@ -65,6 +67,7 @@ export default function AllDatasetsUploadView({
   datasetIds,
   onSkip,
   isContinueDisabled = false,
+  children,
 }: Props) {
   const [showDiscardModal, setShowDiscardModal] = useState(false);
 
@@ -158,7 +161,7 @@ export default function AllDatasetsUploadView({
                       </div>
                       <div style={{ display: "flex", justifyContent: "space-between", borderBottom: "1px dashed #e1e8ff", paddingBottom: 4 }}>
                         <span style={{ color: "hsl(220 9% 50%)" }}>Type of Data:</span>
-                        <strong style={{ color: "var(--foreground)", textTransform: "capitalize" }}>{ds.dataType || "—"}</strong>
+                        <strong style={{ color: "var(--foreground)" }}>{ds.dataType ? formatDataTypeLabel(ds.dataType) : "—"}</strong>
                       </div>
                       <div style={{ display: "flex", justifyContent: "space-between", borderBottom: "1px dashed #e1e8ff", paddingBottom: 4 }}>
                         <span style={{ color: "hsl(220 9% 50%)" }}>Normalized:</span>
@@ -194,8 +197,8 @@ export default function AllDatasetsUploadView({
                           <div className="all-ds-stat-lbl">Samples</div>
                         </div>
                         <div className="all-ds-stat">
-                          <div className="all-ds-stat-val" style={{ fontSize: 12, textTransform: "capitalize" }}>
-                            {ds.dataType || "—"}
+                          <div className="all-ds-stat-val" style={{ fontSize: 12 }}>
+                            {ds.dataType ? formatDataTypeLabel(ds.dataType) : "—"}
                           </div>
                           <div className="all-ds-stat-lbl">Data Type</div>
                         </div>
@@ -206,10 +209,14 @@ export default function AllDatasetsUploadView({
                           <div className="all-ds-stat-lbl">Normalized</div>
                         </div>
                       </div>
-                      <div style={{ marginTop: 10, fontSize: 11, color: "hsl(220 9% 52%)" }}>
-                        📄 {ds.expressionFileName}
+                      <div style={{ marginTop: 10, fontSize: 11, color: "hsl(220 9% 52%)", display: "flex", alignItems: "center", flexWrap: "wrap", gap: 6 }}>
+                        <span style={{ display: "inline-flex", alignItems: "center", gap: 4 }}>
+                          <FileText size={12} /> {ds.expressionFileName}
+                        </span>
                         {ds.clinicalFileName && (
-                           <span style={{ marginLeft: 8 }}>· 🧬 {ds.clinicalFileName}</span>
+                           <span style={{ display: "inline-flex", alignItems: "center", gap: 4 }}>
+                             · <FileSpreadsheet size={12} /> {ds.clinicalFileName}
+                           </span>
                         )}
                       </div>
                     </>
@@ -240,17 +247,21 @@ export default function AllDatasetsUploadView({
           </div>
 
           {!allDone && (
-            <div className="banner warn" style={{ marginTop: 12, marginBottom: 0 }}>
-              ⚠️ <strong>{datasets.filter(d => !d.expressionFileName).length} dataset(s)</strong> still need expression data uploaded before continuing.
+            <div className="banner warn" style={{ marginTop: 12, marginBottom: 0, display: "flex", alignItems: "center", gap: 6 }}>
+              <AlertTriangle size={14} style={{ flexShrink: 0 }} />
+              <span><strong>{datasets.filter(d => !d.expressionFileName).length} dataset(s)</strong> still need expression data uploaded before continuing.</span>
             </div>
           )}
           {allDone && (
-            <div className="banner success" style={{ marginTop: 12, marginBottom: 0 }}>
-              ✅ All datasets have expression data. You can continue to the next step.
+            <div className="banner success" style={{ marginTop: 12, marginBottom: 0, display: "flex", alignItems: "center", gap: 6 }}>
+              <CheckCircle size={14} style={{ flexShrink: 0 }} />
+              <span>All datasets have expression data. You can continue to the next step.</span>
             </div>
           )}
         </div>
       )}
+
+      {children}
 
         <div className="action-row" style={{ display: "flex", gap: 8, justifyContent: "flex-end", alignItems: "center" }}>
           {onBack && (

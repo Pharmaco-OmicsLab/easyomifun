@@ -5,18 +5,14 @@ import { getHierarchyGroup } from "../../dataObject";
 import { useToast } from "../../hooks/use-toast";
 import { downloadReportAPI } from "../../lib/api";
 
-// Helper to extract feature ids from dataset
+// Helper to extract feature ids from dataset (Features are Rows)
 const getFsDatasetFeatureIds = (d: any): Set<string> => {
-  if (d.dataMode === "metadata_features") {
-    const sampleIdCol = d.clinicalSampleIdCol || d.geneIdCol || "SampleID";
-    const infoCols = d.geneInfoCols || [];
-    const featureCols = (d.columns || []).filter((c: string) => c !== sampleIdCol && !infoCols.includes(c));
-    return new Set(featureCols);
-  }
   if (!d.parsedData || d.parsedData.length === 0) return new Set();
-  const geneIdIdx = d.columns ? d.columns.indexOf(d.geneIdCol) : -1;
-  if (geneIdIdx === -1) return new Set(d.parsedData.map((row: any) => String(row[0])));
-  return new Set(d.parsedData.map((row: any) => String(row[geneIdIdx])));
+  const featIdx = (d.fs_featureIndexValue || 1) - 1;
+  const geneIdCol = d.geneIdCol || (d.columns && d.columns[featIdx >= 0 ? featIdx : 0]) || "Feature";
+  const geneIdIdx = d.columns?.indexOf(geneIdCol);
+  const targetIdx = geneIdIdx !== undefined && geneIdIdx !== -1 ? geneIdIdx : (featIdx >= 0 && featIdx < (d.columns?.length || 0) ? featIdx : 0);
+  return new Set(d.parsedData.map((row: any) => String(row[targetIdx])).filter(Boolean));
 };
 
 // Helper to compute intersection size
@@ -31,8 +27,12 @@ const computeOverlapCount = (setA: Set<string>, setB: Set<string>): number => {
 };
 
 // Helper to compute intersection of features in a list of datasets
-const getSharedFeatureCountForGroup = (groupDatasets: any[]): number => {
+const getSharedFeatureCountForGroup = (groupDatasets: any[], backendCounts?: Record<string, number>): number => {
   if (groupDatasets.length <= 1) return 0;
+  if (backendCounts) {
+    const h = getHierarchyGroup(groupDatasets[0]?.dataType || "type1");
+    if (backendCounts[h] !== undefined) return backendCounts[h];
+  }
   if (groupDatasets.some(d => !d.parsedData || d.parsedData.length === 0)) return 0;
   let intersection = getFsDatasetFeatureIds(groupDatasets[0]);
   for (let i = 1; i < groupDatasets.length; i++) {
@@ -107,7 +107,7 @@ export default function FSExportStep() {
   // Pooling selection card is visible only when we have same-type datasets with >= 10 shared features
   const hasPoolableTypesAndSufficientFeatures = Object.values(typeGroups).some(group => {
     if (!Array.isArray(group) || group.length < 2) return false;
-    const count = getSharedFeatureCountForGroup(group);
+    const count = getSharedFeatureCountForGroup(group, state.fsSharedFeatureCounts);
     return count >= 10;
   });
 
@@ -276,52 +276,53 @@ export default function FSExportStep() {
         ],
       });
 
-      // Card 2: Evaluation (Self) — CV or Internal Test on Training Dataset
+      // Card 2: Evaluation (Self) — CV and/or Internal Test on Training Dataset
       if (cvEnabled) {
         groups.push({
-          name: `All-Models Performance — Evaluation (Self) — ${processedTrain.name}`,
-          badge: "Evaluation (Self)",
+          name: `All-Models Performance — Evaluation (Self CV) — ${processedTrain.name}`,
+          badge: "Evaluation (Self CV)",
           badgeColor: "hsl(214 60% 35%)",
           datasetId: processedTrain.id,
           datasetLabel: processedTrain.name,
           files: [
             {
               id: `cv_results|${processedTrain.id}`,
-              label: `All-Models Performance — Evaluation (Self) — ${processedTrain.name}`,
+              label: `All-Models Performance — Evaluation (Self CV) — ${processedTrain.name}`,
               ext: "csv",
               desc: `Cross-validation scores per model on ${processedTrain.name}`,
             },
             {
               id: `roc_cv|${processedTrain.id}`,
-              label: `All-Models ROC — Evaluation (Self) — ${processedTrain.name}`,
+              label: `All-Models ROC — Evaluation (Self CV) — ${processedTrain.name}`,
               ext: "pdf",
               desc: `Combined ROC from cross-validation for all models on ${processedTrain.name}`,
             },
           ],
         });
-      } else if (hasInternal) {
+      }
+      if (hasInternal) {
         groups.push({
-          name: `All-Models Performance — Evaluation (Self) — ${processedTrain.name}`,
-          badge: "Evaluation (Self)",
+          name: `All-Models Performance — Evaluation (Self Test) — ${processedTrain.name}`,
+          badge: "Evaluation (Self Test)",
           badgeColor: "hsl(150 55% 35%)",
           datasetId: processedTrain.id,
           datasetLabel: processedTrain.name,
           files: [
             {
               id: `testing_results|${processedTrain.id}`,
-              label: `All-Models Performance — Evaluation (Self) — ${processedTrain.name}`,
+              label: `All-Models Performance — Evaluation (Self Test) — ${processedTrain.name}`,
               ext: "csv",
               desc: `AUC, Accuracy, PPV, NPV on internal test split for all models on ${processedTrain.name}`,
             },
             {
               id: `roc_test_all|${processedTrain.id}`,
-              label: `All-Models ROC — Evaluation (Self) — ${processedTrain.name}`,
+              label: `All-Models ROC — Evaluation (Self Test) — ${processedTrain.name}`,
               ext: "pdf",
               desc: `Combined ROC curves plot on internal test split of ${processedTrain.name}`,
             },
             {
               id: `confusion_matrix|${processedTrain.id}`,
-              label: `Confusion Matrix — Evaluation (Self) — ${processedTrain.name}`,
+              label: `Confusion Matrix — Evaluation (Self Test) — ${processedTrain.name}`,
               ext: "csv",
               desc: `Aggregated confusion matrix for all models on held-out internal test split of ${processedTrain.name}`,
             },
@@ -329,7 +330,7 @@ export default function FSExportStep() {
         });
       }
 
-      // Card 3 & Card 4 for each external test dataset
+      // Card 3 & Card 4 for each external test dataset (Models B)
       matchedTestDs.forEach((t) => {
         // Card 3: Refit Training (Test)
         groups.push({
@@ -354,34 +355,61 @@ export default function FSExportStep() {
           ],
         });
 
-        // Card 4: Evaluation (Test)
-        groups.push({
-          name: `All-Models Performance — Evaluation (Test) — ${t.name}`,
-          badge: "Evaluation (Test)",
-          badgeColor: "hsl(25 70% 40%)",
-          datasetId: t.id,
-          datasetLabel: t.name,
-          files: [
-            {
-              id: `testing_results|${t.id}`,
-              label: `All-Models Performance — Evaluation (Test) — ${t.name}`,
-              ext: "csv",
-              desc: `AUC, Balanced Accuracy, PPV, NPV on ${t.name} (features from ${processedTrain.name})`,
-            },
-            {
-              id: `roc_test_all|${t.id}`,
-              label: `All-Models ROC — Evaluation (Test) — ${t.name}`,
-              ext: "pdf",
-              desc: `Combined ROC on ${t.name} (features from ${processedTrain.name})`,
-            },
-            {
-              id: `confusion_matrix|${t.id}`,
-              label: `Confusion Matrix — Evaluation (Test) — ${t.name}`,
-              ext: "csv",
-              desc: `Aggregated confusion matrix for all models on ${t.name}`,
-            },
-          ],
-        });
+        // Card 4a: Evaluation (Test CV)
+        if (cvEnabled || t.fs_validationStrategy === "cv-only") {
+          groups.push({
+            name: `All-Models Performance — Evaluation (Test CV) — ${t.name}`,
+            badge: "Evaluation (Test CV)",
+            badgeColor: "hsl(214 60% 35%)",
+            datasetId: t.id,
+            datasetLabel: t.name,
+            files: [
+              {
+                id: `cv_results|${t.id}`,
+                label: `All-Models Performance — Evaluation (Test CV) — ${t.name}`,
+                ext: "csv",
+                desc: `Cross-validation scores per model on ${t.name} (features from ${processedTrain.name})`,
+              },
+              {
+                id: `roc_cv|${t.id}`,
+                label: `All-Models ROC — Evaluation (Test CV) — ${t.name}`,
+                ext: "pdf",
+                desc: `Combined ROC from cross-validation for all models on ${t.name}`,
+              },
+            ],
+          });
+        }
+
+        // Card 4b: Evaluation (Test Split)
+        if (t.fs_validationStrategy !== "cv-only") {
+          groups.push({
+            name: `All-Models Performance — Evaluation (Test) — ${t.name}`,
+            badge: "Evaluation (Test)",
+            badgeColor: "hsl(25 70% 40%)",
+            datasetId: t.id,
+            datasetLabel: t.name,
+            files: [
+              {
+                id: `testing_results|${t.id}`,
+                label: `All-Models Performance — Evaluation (Test) — ${t.name}`,
+                ext: "csv",
+                desc: `AUC, Balanced Accuracy, PPV, NPV on ${t.name} (features from ${processedTrain.name})`,
+              },
+              {
+                id: `roc_test_all|${t.id}`,
+                label: `All-Models ROC — Evaluation (Test) — ${t.name}`,
+                ext: "pdf",
+                desc: `Combined ROC on ${t.name} (features from ${processedTrain.name})`,
+              },
+              {
+                id: `confusion_matrix|${t.id}`,
+                label: `Confusion Matrix — Evaluation (Test) — ${t.name}`,
+                ext: "csv",
+                desc: `Aggregated confusion matrix for all models on ${t.name}`,
+              },
+            ],
+          });
+        }
       });
 
     } else {

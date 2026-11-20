@@ -62,14 +62,18 @@ export default function DPExportStep({ datasetId }: Props) {
     }
   };
 
+  const dpInlineFsCfg = state.dpInlineFsSubmittedConfig || state.dpInlineFsConfig;
+  const dpInlineDeCfg = state.dpInlineDeSubmittedConfig || state.dpInlineDeConfig;
+  const dpInlineEnCfg = state.dpInlineEnSubmittedConfig || state.dpInlineEnConfig;
+
   // ── Determine FS pooling mode ──────────────────────────────────────────────
   const isAllSameType = allDpDs.length > 1 &&
     new Set(allDpDs.map(d => d?.dataType || "readcounts")).size === 1 &&
     (allDpDs[0]?.dataType || "readcounts") !== "others";
   const isCombinedPool = allDpDs.length === 1 ||
-    (isAllSameType && (state.fsConfig.multiDatasetMode ?? "combine") === "combine");
+    (isAllSameType && (dpInlineFsCfg.multiDatasetMode ?? "combine") === "combine");
 
-  const cvEnabled = state.fsConfig.cvEnabled;
+  const cvEnabled = dpInlineFsCfg.cvEnabled;
 
   const groups: ExportGroup[] = [];
 
@@ -83,16 +87,54 @@ export default function DPExportStep({ datasetId }: Props) {
     const organism = state.dpAnnotationConfig.selectOrganism || "Human (Homo sapiens)";
 
     // 2. Processing (Filter + Missing Method)
-    const methodsList = (state.dpProcessingConfig.filterMethod || "").split(",").map(m => m.trim()).filter(Boolean);
+    const isRawRc = d.dataType === "readcounts" && !d.isNormalized;
+    const filterMethod = isRawRc
+      ? (state.dpProcessingConfig.rcFilterMethod || state.dpProcessingConfig.filterMethod || "")
+      : d.dataType === "readcounts"
+      ? (state.dpProcessingConfig.normRcFilterMethod || state.dpProcessingConfig.filterMethod || "")
+      : d.dataType === "microarray"
+      ? (state.dpProcessingConfig.maFilterMethod || state.dpProcessingConfig.filterMethod || "")
+      : d.dataType === "proteomics"
+      ? (state.dpProcessingConfig.protFilterMethod || state.dpProcessingConfig.filterMethod || "")
+      : (state.dpProcessingConfig.othFilterMethod || state.dpProcessingConfig.filterMethod || "");
+
+    const methodsList = (filterMethod || "").split(",").map(m => m.trim()).filter(Boolean);
     const filterParts: string[] = [];
     if (methodsList.includes("cpm")) {
       filterParts.push(`above the ${state.dpProcessingConfig.cpmThreshold} CPM value in at least ${state.dpProcessingConfig.minSamples} number of samples`);
     }
-    if (methodsList.includes("min_count")) {
-      filterParts.push(`above the ${state.dpProcessingConfig.countThreshold} sum counts across all samples`);
+    if (methodsList.includes("abundance")) {
+      if (isRawRc) {
+        filterParts.push(`readcounts < ${state.dpProcessingConfig.rcReadcountThreshold ?? 10} in at least ${state.dpProcessingConfig.rcSamplePercent ?? 50}% of samples filtered out`);
+      } else {
+        const method = d.dataType === "readcounts"
+          ? (state.dpProcessingConfig.normRcAbundanceMethod ?? "mean")
+          : d.dataType === "microarray"
+          ? (state.dpProcessingConfig.maAbundanceMethod ?? "mean")
+          : d.dataType === "proteomics"
+          ? (state.dpProcessingConfig.protAbundanceMethod ?? "mean")
+          : (state.dpProcessingConfig.othAbundanceMethod ?? "mean");
+        const cutoff = d.dataType === "readcounts"
+          ? (state.dpProcessingConfig.normRcAbundanceThreshold ?? 10)
+          : d.dataType === "microarray"
+          ? (state.dpProcessingConfig.maAbundanceThreshold ?? 10)
+          : d.dataType === "proteomics"
+          ? (state.dpProcessingConfig.protAbundanceThreshold ?? 10)
+          : (state.dpProcessingConfig.othAbundanceThreshold ?? 10);
+        filterParts.push(`lowest ${cutoff}% ${method} abundance filtered out`);
+      }
     }
     if (methodsList.includes("variance")) {
-      filterParts.push(`above the ${state.dpProcessingConfig.varianceThreshold}% variance across all samples`);
+      const varThresh = isRawRc
+        ? (state.dpProcessingConfig.rcVariance ?? state.dpProcessingConfig.varianceThreshold ?? 10)
+        : d.dataType === "readcounts"
+        ? (state.dpProcessingConfig.normRcVariance ?? state.dpProcessingConfig.varianceThreshold ?? 10)
+        : d.dataType === "microarray"
+        ? (state.dpProcessingConfig.maVariance ?? state.dpProcessingConfig.varianceThreshold ?? 10)
+        : d.dataType === "proteomics"
+        ? (state.dpProcessingConfig.protVariance ?? state.dpProcessingConfig.varianceThreshold ?? 10)
+        : (state.dpProcessingConfig.othVariance ?? state.dpProcessingConfig.varianceThreshold ?? 10);
+      filterParts.push(`above the ${varThresh}% variance across all samples`);
     }
     const filterLabel = filterParts.length > 0 ? filterParts.join(" and ") : "No Filtering";
     const missingLabel = state.dpProcessingConfig.missingMethod === "knn" ? "kNN" : state.dpProcessingConfig.missingMethod;
@@ -124,7 +166,7 @@ export default function DPExportStep({ datasetId }: Props) {
 
     // 5. DE Method
     const getDeMethodLabel = () => {
-      const deMethod = state.deConfig.method || "deseq2";
+      const deMethod = dpInlineDeCfg.method || "deseq2";
       switch (deMethod) {
         case "deseq2": return "with DESeq2 R package";
         case "edger": return "with edgeR R package";
@@ -140,13 +182,11 @@ export default function DPExportStep({ datasetId }: Props) {
       {
         id: `final_matrix|${d.id}`,
         label: `Final Expression Matrix${dsSuffix}`,
-        ext: "CSV",
         desc: `The final, fully processed expression matrix ready for downstream analysis${dsSuffix}`,
       },
       {
         id: `final_clinical|${d.id}`,
         label: `Final Clinical Data${dsSuffix}`,
-        ext: "CSV",
         desc: `The final clinical metadata aligned and matching the expression matrix${dsSuffix}`,
       },
       ...(!d.batchDone
@@ -154,7 +194,6 @@ export default function DPExportStep({ datasetId }: Props) {
             {
               id: `pca_plots|${d.id}`,
               label: `PCA Plots${dsSuffix}`,
-              ext: "PDF",
               desc: `Principal component analysis plots of the expression data${dsSuffix}`,
             },
           ]
@@ -164,13 +203,11 @@ export default function DPExportStep({ datasetId }: Props) {
             {
               id: `annotated_matrix|${d.id}`,
               label: `Annotated Expression Data${dsSuffix}`,
-              ext: "CSV",
               desc: `Expression data that was mapped with ${organism} as reference${dsSuffix}`,
             },
             {
               id: `annotation_results|${d.id}`,
               label: `Annotation Results${dsSuffix}`,
-              ext: "CSV",
               desc: `Detailed annotation results${dsSuffix}`,
             },
           ]
@@ -180,10 +217,19 @@ export default function DPExportStep({ datasetId }: Props) {
             {
               id: `processed_matrix|${d.id}`,
               label: `Processed Expression Data${dsSuffix}`,
-              ext: "CSV",
               desc: filterLabel === "No Filtering"
                 ? `Processed Data with No Filtering${d.hasNA ? ` and handling missing value by ${missingLabel}` : ""}${dsSuffix}`
                 : `Processed Data with filtering: ${filterLabel}${d.hasNA ? ` and handling missing value by ${missingLabel}` : ""}${dsSuffix}`,
+            },
+            {
+              id: `qc_mean_variance|${d.id}`,
+              label: `Mean-Variance QC Plot${dsSuffix}`,
+              desc: `Scatter plot of feature mean expression vs variance across samples${dsSuffix}`,
+            },
+            {
+              id: `qc_distribution|${d.id}`,
+              label: `Sample Distribution QC Plot${dsSuffix}`,
+              desc: `Density curves showing expression distribution per sample${dsSuffix}`,
             },
           ]
         : []),
@@ -192,19 +238,16 @@ export default function DPExportStep({ datasetId }: Props) {
             {
               id: `boxplot_before|${d.id}`,
               label: `Normalization Box Plot (Before)${dsSuffix}`,
-              ext: "PDF",
               desc: `Box plot showing sample distribution before normalization${dsSuffix}`,
             },
             {
               id: `boxplot_after|${d.id}`,
               label: `Normalization Box Plot (After)${dsSuffix}`,
-              ext: "PDF",
               desc: `Box plot showing sample distribution after normalization${dsSuffix}`,
             },
             {
               id: `normalized_matrix|${d.id}`,
               label: `Normalized Expression Data${dsSuffix}`,
-              ext: "CSV",
               desc: `Normalized Data using ${getNormMethodLabel(d.normalizationMethod || state.dpNormConfig.method)}${dsSuffix}`,
             },
           ]
@@ -212,7 +255,6 @@ export default function DPExportStep({ datasetId }: Props) {
             {
               id: `boxplot_before|${d.id}`,
               label: `Sample Box Plots${dsSuffix}`,
-              ext: "PDF",
               desc: `Box plot showing per-sample expression distribution${dsSuffix}`,
             },
           ]),
@@ -221,19 +263,16 @@ export default function DPExportStep({ datasetId }: Props) {
             {
               id: `batch_corrected_matrix|${d.id}`,
               label: `Batch-Corrected Expression Data${dsSuffix}`,
-              ext: "CSV",
               desc: `Batch-corrected Data using ${batchMethodLabel}${dsSuffix}`,
             },
             {
               id: `pca_plots_before_batch|${d.id}`,
               label: `PCA Plots (Before Batch Correction)${dsSuffix}`,
-              ext: "PDF",
               desc: `PCA plot showing sample distribution before batch correction${dsSuffix}`,
             },
             {
               id: `pca_plots_after_batch|${d.id}`,
               label: `PCA Plots (After Batch Correction)${dsSuffix}`,
-              ext: "PDF",
               desc: `PCA plot showing sample distribution after batch correction${dsSuffix}`,
             },
           ]
@@ -254,31 +293,26 @@ export default function DPExportStep({ datasetId }: Props) {
         {
           id: `de_all_results|${d.id}`,
           label: `All Features Table${dsSuffix}`,
-          ext: "CSV",
-          desc: `Complete DE results matrix including all genes performed by using ${deMethodLabel} method (adjusted p-value cutoff: ${state.deConfig.pValueThreshold}, adjustment method: ${state.deConfig.adjustMethod}, log₂FC threshold: |${state.deConfig.logFcThreshold}|)${dsSuffix}`,
+          desc: `Complete DE results matrix including all genes performed by using ${deMethodLabel} method (adjusted p-value cutoff: ${dpInlineDeCfg.pValueThreshold}, adjustment method: ${dpInlineDeCfg.adjustMethod}, log₂FC threshold: |${dpInlineDeCfg.logFcThreshold}|)${dsSuffix}`,
         },
         {
           id: `de_sig_results|${d.id}`,
           label: `Significant Features Table${dsSuffix}`,
-          ext: "CSV",
-          desc: `Significant gene sets filtered by thresholds using ${deMethodLabel} method (adjusted p-value cutoff: ${state.deConfig.pValueThreshold}, adjustment method: ${state.deConfig.adjustMethod}, log₂FC threshold: |${state.deConfig.logFcThreshold}|)${dsSuffix}`,
+          desc: `Significant gene sets filtered by thresholds using ${deMethodLabel} method (adjusted p-value cutoff: ${dpInlineDeCfg.pValueThreshold}, adjustment method: ${dpInlineDeCfg.adjustMethod}, log₂FC threshold: |${dpInlineDeCfg.logFcThreshold}|)${dsSuffix}`,
         },
         {
           id: `de_volcano|${d.id}`,
           label: `Volcano Plot${dsSuffix}`,
-          ext: "PDF",
           desc: `Volcano plot visualization highlighting log₂ Fold Change vs Statistical Significance (-log₁₀ p-value) for ${d.name}`,
         },
         {
           id: `de_ma|${d.id}`,
           label: `MA Plot${dsSuffix}`,
-          ext: "PDF",
           desc: `MA plot mapping Average Log Expression vs Log Fold Change for ${d.name}`,
         },
         {
           id: `de_heatmap_top10|${d.id}`,
           label: `Top 10 Significant Genes Heatmap${dsSuffix}`,
-          ext: "PDF",
           desc: `Clustered heatmap of the top 10 most significant differentially expressed genes${dsSuffix}, showing expression patterns across all samples`,
         },
       ];
@@ -296,7 +330,7 @@ export default function DPExportStep({ datasetId }: Props) {
 
   // ── Inline FS Export Groups ────────────────────────────────────────────────
   if (state.dpInlineFsDone) {
-    const selectedModels = Array.isArray(state.fsConfig.selectedModels) ? state.fsConfig.selectedModels : [];
+    const selectedModels = Array.isArray(dpInlineFsCfg.selectedModels) ? dpInlineFsCfg.selectedModels : [];
 
     const trainingDs = allDpDs.filter(
       d => d && (d.fs_datasetPurpose === "train" || d.fs_datasetPurpose === "train-and-test" ||
@@ -305,7 +339,7 @@ export default function DPExportStep({ datasetId }: Props) {
     const testingDs = allDpDs.filter(d => d && d.fs_datasetPurpose === "test");
 
     const processedTrainDss = (() => {
-      const mode = state.fsConfig.multiDatasetMode ?? "combine";
+      const mode = dpInlineFsCfg.multiDatasetMode ?? "combine";
       if (mode !== "combine" || trainingDs.length <= 1) {
         return trainingDs.map(d => ({
           id: d.id,
@@ -377,13 +411,11 @@ export default function DPExportStep({ datasetId }: Props) {
             {
               id: `pooled_expression_matrix|${processedTrain.id}`,
               label: `Pooled Expression Matrix (Batch-Corrected) — ${processedTrain.dataType.toUpperCase()}`,
-              ext: "CSV",
               desc: `ComBat/limma batch-corrected expression matrix from pooling all same-type ${processedTrain.dataType.toUpperCase()} datasets`,
             },
             {
               id: `pooled_clinical_data|${processedTrain.id}`,
               label: `Pooled Clinical Data — ${processedTrain.dataType.toUpperCase()}`,
-              ext: "CSV",
               desc: `Clinical metadata (SampleID + Group) for the pooled batch-corrected ${processedTrain.dataType.toUpperCase()} dataset`,
             },
           ],
@@ -405,7 +437,6 @@ export default function DPExportStep({ datasetId }: Props) {
             {
               id: `selected_features|${processedTrain.id}|${model}`,
               label: `Selected Features (${modelLabel}) — ${processedTrain.name}`,
-              ext: "CSV",
               desc: `Selected features with importance scores for ${modelLabel} on ${processedTrain.name}`,
             },
             ...(model !== "boruta" && model !== "stabl"
@@ -413,7 +444,6 @@ export default function DPExportStep({ datasetId }: Props) {
                   {
                     id: `feature_importance|${processedTrain.id}|${model}`,
                     label: `Feature Importance Scores (${modelLabel}) — ${processedTrain.name}`,
-                    ext: "CSV",
                     desc: `All features ranked by importance for ${modelLabel} on ${processedTrain.name}`,
                   },
                 ]
@@ -435,13 +465,11 @@ export default function DPExportStep({ datasetId }: Props) {
             {
               id: `all_models_performance_train|${processedTrain.id}`,
               label: `All-Models Performance — Training (Self) — ${processedTrain.name}`,
-              ext: "CSV",
               desc: `Combined performance metrics for all models on training split of ${processedTrain.name}`,
             },
             {
               id: `roc_all_models_train|${processedTrain.id}`,
               label: `All-Models ROC — Training (Self) — ${processedTrain.name}`,
-              ext: "PDF",
               desc: `Combined ROC plot for all models on training split of ${processedTrain.name}`,
             },
           ],
@@ -459,13 +487,11 @@ export default function DPExportStep({ datasetId }: Props) {
               {
                 id: `cv_results|${processedTrain.id}`,
                 label: `All-Models Performance — Evaluation (Self) — ${processedTrain.name}`,
-                ext: "CSV",
                 desc: `Cross-validation scores per model on ${processedTrain.name}`,
               },
               {
                 id: `roc_cv|${processedTrain.id}`,
                 label: `All-Models ROC — Evaluation (Self) — ${processedTrain.name}`,
-                ext: "PDF",
                 desc: `Combined ROC from cross-validation for all models on ${processedTrain.name}`,
               },
             ],
@@ -481,19 +507,16 @@ export default function DPExportStep({ datasetId }: Props) {
               {
                 id: `testing_results|${processedTrain.id}`,
                 label: `All-Models Performance — Evaluation (Self) — ${processedTrain.name}`,
-                ext: "CSV",
                 desc: `AUC, Accuracy, PPV, NPV on internal test split for all models on ${processedTrain.name}`,
               },
               {
                 id: `roc_test_all|${processedTrain.id}`,
                 label: `All-Models ROC — Evaluation (Self) — ${processedTrain.name}`,
-                ext: "PDF",
                 desc: `Combined ROC curves plot on internal test split of ${processedTrain.name}`,
               },
               {
                 id: `confusion_matrix|${processedTrain.id}`,
                 label: `Confusion Matrix — Evaluation (Self) — ${processedTrain.name}`,
-                ext: "CSV",
                 desc: `Aggregated confusion matrix for all models on held-out internal test split of ${processedTrain.name}`,
               },
             ],
@@ -513,13 +536,11 @@ export default function DPExportStep({ datasetId }: Props) {
               {
                 id: `all_models_performance_train|${t.id}`,
                 label: `All-Models Performance — Refit Training (Test) — ${t.name}`,
-                ext: "CSV",
                 desc: `Refit model performance on ${t.name} using selected features from ${processedTrain.name}`,
               },
               {
                 id: `roc_all_models_train|${t.id}`,
                 label: `All-Models ROC — Refit Training (Test) — ${t.name}`,
-                ext: "PDF",
                 desc: `Combined ROC curves plot for refit models on ${t.name}`,
               },
             ],
@@ -536,19 +557,16 @@ export default function DPExportStep({ datasetId }: Props) {
               {
                 id: `testing_results|${t.id}`,
                 label: `All-Models Performance — Evaluation (Test) — ${t.name}`,
-                ext: "CSV",
                 desc: `AUC, Balanced Accuracy, PPV, NPV on ${t.name} (features from ${processedTrain.name})`,
               },
               {
                 id: `roc_test_all|${t.id}`,
                 label: `All-Models ROC — Evaluation (Test) — ${t.name}`,
-                ext: "PDF",
                 desc: `Combined ROC on ${t.name} (features from ${processedTrain.name})`,
               },
               {
                 id: `confusion_matrix|${t.id}`,
                 label: `Confusion Matrix — Evaluation (Test) — ${t.name}`,
-                ext: "CSV",
                 desc: `Aggregated confusion matrix for all models on ${t.name}`,
               },
             ],
@@ -567,13 +585,11 @@ export default function DPExportStep({ datasetId }: Props) {
             {
               id: `all_models_performance_train|${processedTrain.id}`,
               label: `All-Models Performance — Training — ${processedTrain.name}`,
-              ext: "CSV",
               desc: `Combined performance metrics for all models on training split of ${processedTrain.name}`,
             },
             {
               id: `roc_all_models_train|${processedTrain.id}`,
               label: `All-Models ROC — Training — ${processedTrain.name}`,
-              ext: "PDF",
               desc: `Combined ROC plot for all models on training split of ${processedTrain.name}`,
             },
           ],
@@ -590,13 +606,11 @@ export default function DPExportStep({ datasetId }: Props) {
               {
                 id: `cv_results|${processedTrain.id}`,
                 label: `All-Models Performance — Evaluation (CV) — ${processedTrain.name}`,
-                ext: "CSV",
                 desc: `Cross-validation scores per model on ${processedTrain.name}`,
               },
               {
                 id: `roc_cv|${processedTrain.id}`,
                 label: `All-Models ROC — Evaluation (CV) — ${processedTrain.name}`,
-                ext: "PDF",
                 desc: `Combined ROC from cross-validation for all models on ${processedTrain.name}`,
               },
             ],
@@ -614,19 +628,16 @@ export default function DPExportStep({ datasetId }: Props) {
               {
                 id: `testing_results|${processedTrain.id}`,
                 label: `All-Models Performance — Evaluation (Test) — ${processedTrain.name}`,
-                ext: "CSV",
                 desc: `AUC, Balanced Accuracy, PPV, NPV on internal test split for all models on ${processedTrain.name}`,
               },
               {
                 id: `roc_test_all|${processedTrain.id}`,
                 label: `All-Models ROC — Evaluation (Test) — ${processedTrain.name}`,
-                ext: "PDF",
                 desc: `Combined ROC curves plot on internal test split of ${processedTrain.name}`,
               },
               {
                 id: `confusion_matrix|${processedTrain.id}`,
                 label: `Confusion Matrix — Evaluation (Test) — ${processedTrain.name}`,
-                ext: "CSV",
                 desc: `Aggregated confusion matrix for all models on held-out internal test split of ${processedTrain.name}`,
               },
             ],
@@ -643,7 +654,6 @@ export default function DPExportStep({ datasetId }: Props) {
       {
         id: `meta_results|${metaDsId}`,
         label: "Meta-analysis Results Table",
-        ext: "CSV",
         desc: "Aggregated differential expression statistics across all cohorts",
       },
       ...(state.dpDeMetaMethod === "effect_size"
@@ -651,19 +661,16 @@ export default function DPExportStep({ datasetId }: Props) {
             {
               id: `forest_plots|${metaDsId}`,
               label: "Forest Plots",
-              ext: "PDF",
               desc: "Forest plots showing effect sizes and confidence intervals across cohorts",
             },
             {
               id: `de_volcano|${metaDsId}`,
               label: "Meta-analysis Volcano Plot",
-              ext: "PDF",
               desc: "Volcano plot mapping combined effect size (Cohen's d) against statistical significance (-log₁₀ FDR)",
             },
             {
               id: `heterogeneity_report|${metaDsId}`,
               label: "Heterogeneity Report",
-              ext: "CSV",
               desc: "Cochran's Q test statistics and I² heterogeneity metrics results (Cochran's Q statistic evaluating null hypothesis of homogeneity, I² statistic quantifying percentage of total variation across studies due to heterogeneity rather than chance)",
             },
           ]
@@ -688,12 +695,12 @@ export default function DPExportStep({ datasetId }: Props) {
       if (!inlineCache) return;
 
       const submittedCfg = inlineCache.submittedCfg;
-      const activeMethods = Array.isArray(submittedCfg?.methods) ? submittedCfg.methods : (Array.isArray(state.enConfig.methods) ? state.enConfig.methods : []);
+      const activeMethods = Array.isArray(submittedCfg?.methods) ? submittedCfg.methods : (Array.isArray(dpInlineEnCfg.methods) ? dpInlineEnCfg.methods : []);
       const isGsea = activeMethods.includes("gsea");
       const isOra = activeMethods.includes("ora");
 
       if (isGsea) {
-        const dbs = Array.isArray(submittedCfg?.gseaDatabase) ? submittedCfg.gseaDatabase : (Array.isArray(state.enConfig.gseaDatabase) ? state.enConfig.gseaDatabase : []);
+        const dbs = Array.isArray(submittedCfg?.gseaDatabase) ? submittedCfg.gseaDatabase : (Array.isArray(dpInlineEnCfg.gseaDatabase) ? dpInlineEnCfg.gseaDatabase : []);
         dbs.forEach(db => {
           const dbLabel = db.toUpperCase();
           const hasSigGsea = Array.isArray(inlineCache?.gseaResults) && inlineCache.gseaResults.filter((r: any) => r && r.database === db).length > 0;
@@ -701,7 +708,6 @@ export default function DPExportStep({ datasetId }: Props) {
             {
               id: `gsea_results|${dsId}|${db}`,
               label: `${dbLabel} GSEA Results Table${dsSuffix}`,
-              ext: "CSV",
               desc: `Significant gene sets with NES, p-value, and FDR q-value computed using ${dbLabel} database${dsSuffix}.`,
             },
           ];
@@ -711,37 +717,31 @@ export default function DPExportStep({ datasetId }: Props) {
               {
                 id: `gsea_dotplot|${dsId}|${db}`,
                 label: `${dbLabel} GSEA Dot Plot${dsSuffix}`,
-                ext: "PDF",
                 desc: `Bubble visualization highlighting top enriched GSEA terms by NES using ${dbLabel}${dsSuffix}.`,
               },
               {
                 id: `gsea_ridgeplot|${dsId}|${db}`,
                 label: `${dbLabel} GSEA Ridge Plot${dsSuffix}`,
-                ext: "PDF",
                 desc: `Ridge plot showing expression distributions of core enrichment genes for top terms using ${dbLabel}${dsSuffix}.`,
               },
               {
                 id: `gsea_esplot_up|${dsId}|${db}`,
                 label: `${dbLabel} GSEA Enrichment Score Plot (Top Up-regulated)${dsSuffix}`,
-                ext: "PDF",
                 desc: `Running enrichment score profile for the top up-regulated pathway using ${dbLabel}${dsSuffix}.`,
               },
               {
                 id: `gsea_esplot_down|${dsId}|${db}`,
                 label: `${dbLabel} GSEA Enrichment Score Plot (Top Down-regulated)${dsSuffix}`,
-                ext: "PDF",
                 desc: `Running enrichment score profile for the top down-regulated pathway using ${dbLabel}${dsSuffix}.`,
               },
               {
                 id: `gsea_ranked_list|${dsId}|${db}`,
                 label: `${dbLabel} GSEA Ranked Gene List${dsSuffix}`,
-                ext: "CSV",
                 desc: `Full ranked gene list with calculated cross-study meta-metrics using ${dbLabel}${dsSuffix}.`,
               },
               {
                 id: `gsea_leading_edge|${dsId}|${db}`,
                 label: `${dbLabel} GSEA Leading Edge Genes${dsSuffix}`,
-                ext: "CSV",
                 desc: `Core-enrichment leading edge genes extracted for significant terms using ${dbLabel}${dsSuffix}.`,
               }
             );
@@ -759,7 +759,7 @@ export default function DPExportStep({ datasetId }: Props) {
       }
 
       if (isOra) {
-        const dbs = Array.isArray(submittedCfg?.oraDatabase) ? submittedCfg.oraDatabase : (Array.isArray(state.enConfig.oraDatabase) ? state.enConfig.oraDatabase : []);
+        const dbs = Array.isArray(submittedCfg?.oraDatabase) ? submittedCfg.oraDatabase : (Array.isArray(dpInlineEnCfg.oraDatabase) ? dpInlineEnCfg.oraDatabase : []);
         dbs.forEach(db => {
           const dbLabel = db.toUpperCase();
           const oraList = Array.isArray(inlineCache?.oraResults) ? inlineCache.oraResults.filter((r: any) => r && r.database === db) : [];
@@ -771,7 +771,6 @@ export default function DPExportStep({ datasetId }: Props) {
             {
               id: `ora_results|${dsId}|${db}`,
               label: `${dbLabel} ORA Results Table${dsSuffix}`,
-              ext: "CSV",
               desc: `Gene sets with fold enrichment and hyper-geometric p-values using ${dbLabel} database${dsSuffix}.`,
               getTestIds: (fmt: string) => [`btn-download-ora_results-${db}-${fmt}`, `btn-download-ora_results-${db}-${fmt.toUpperCase()}`]
             },
@@ -781,7 +780,6 @@ export default function DPExportStep({ datasetId }: Props) {
             dbFiles.push({
               id: `ora_dotplot_up|${dsId}|${db}`,
               label: `${dbLabel} ORA Dot Plot - Up${dsSuffix}`,
-              ext: "PDF",
               desc: `Bubble visualization highlighting top enriched terms for up-regulated genes using ${dbLabel}${dsSuffix}.`,
               getTestIds: (fmt: string) => [`btn-download-ora_dotplot_up-${db}-${fmt}`, `btn-download-ora_dotplot_up-${db}-${fmt.toUpperCase()}`]
             });
@@ -791,7 +789,6 @@ export default function DPExportStep({ datasetId }: Props) {
             dbFiles.push({
               id: `ora_dotplot_down|${dsId}|${db}`,
               label: `${dbLabel} ORA Dot Plot - Down${dsSuffix}`,
-              ext: "PDF",
               desc: `Bubble visualization highlighting top enriched terms for down-regulated genes using ${dbLabel}${dsSuffix}.`,
               getTestIds: (fmt: string) => [`btn-download-ora_dotplot_down-${db}-${fmt}`, `btn-download-ora_dotplot_down-${db}-${fmt.toUpperCase()}`]
             });
@@ -801,7 +798,6 @@ export default function DPExportStep({ datasetId }: Props) {
             dbFiles.push({
               id: `ora_dotplot|${dsId}|${db}`,
               label: `${dbLabel} ORA Dot Plot${dsSuffix}`,
-              ext: "PDF",
               desc: `Bubble visualization highlighting top enriched terms by ratio using ${dbLabel}${dsSuffix}.`,
               getTestIds: (fmt: string) => [`btn-download-ora_dotplot-${db}-${fmt}`, `btn-download-ora_dotplot-${db}-${fmt.toUpperCase()}`]
             });
@@ -841,7 +837,7 @@ export default function DPExportStep({ datasetId }: Props) {
   }
   if (state.dpInlineFsDone) {
     stats.push({ label: "FS Mode", value: allDpDs.length === 1 ? "Single" : (isCombinedPool ? "Pooled" : "Individual") });
-    stats.push({ label: "Models", value: String(state.fsConfig.selectedModels?.length || 0) });
+    stats.push({ label: "Models", value: String(dpInlineFsCfg.selectedModels?.length || 0) });
   }
 
   return (

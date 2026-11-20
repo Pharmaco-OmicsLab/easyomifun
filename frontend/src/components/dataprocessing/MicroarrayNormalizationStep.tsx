@@ -1,12 +1,14 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
+import { CheckCircle2, AlertTriangle, RotateCcw } from "lucide-react";
 import { useAppStore } from "../../store/appStore";
 import { computeDPSteps } from "../../dataObject";
 import Spinner from "../Spinner";
 import SkipModal from "../shared/SkipModal";
 import ChangeWarnModal from "../shared/ChangeWarnModal";
 import DiscardWarnModal from "../shared/DiscardWarnModal";
+import InteractivePCAPlot from "../shared/InteractivePCAPlot";
 import type { NormMethod } from "../../dataObject";
-import { normalizeDatasetAPI, redoStepAPI } from "../../lib/api";
+import { normalizeDatasetAPI, redoStepAPI, cancelComputeJobAPI } from "../../lib/api";
 import { useToast } from "../../hooks/use-toast";
 
 
@@ -28,8 +30,9 @@ function NormalizationResultCard({ targetDs, submittedCfg }: { targetDs: any; su
         </div>
       </div>
       
-      <div className="banner success" style={{ marginBottom: 12 }}>
-        ✅ Normalization complete using <strong>{NORM_METHODS.find(m => m.value === submittedCfg?.method)?.label || "TMM"}</strong>{submittedCfg?.logTransform ? ` with ${submittedCfg?.transformationType === "log10" ? "log₁₀" : "log₂"} transformation` : ""}.
+      <div className="banner success" style={{ marginBottom: 12, display: "flex", alignItems: "center", gap: 6 }}>
+        <CheckCircle2 size={15} style={{ flexShrink: 0 }} />
+        <span>Normalization complete using <strong>{NORM_METHODS.find(m => m.value === submittedCfg?.method)?.label || "TMM"}</strong>{submittedCfg?.logTransform ? ` with ${submittedCfg?.transformationType === "log10" ? "log₁₀" : "log₂"} transformation` : ""}.</span>
       </div>
       
       <div className="chips-row">
@@ -131,7 +134,20 @@ export default function MicroarrayNormalizationStep({ datasetId, mode = "dp" }: 
     return { next, prev };
   };
 
+  const abortControllerRef = useRef<AbortController | null>(null);
+  const activeJobIdRef = useRef<string | null>(null);
+
+  const handleCancel = async () => {
+    abortControllerRef.current?.abort();
+    if (activeJobIdRef.current) {
+      await cancelComputeJobAPI(activeJobIdRef.current);
+    }
+    setLoading(false);
+    activeJobIdRef.current = null;
+  };
+
   const runNorm = async () => {
+    abortControllerRef.current = new AbortController();
     setLoading(true);
     try {
       const isBuiltIn = maMethod === "vsn";
@@ -141,31 +157,44 @@ export default function MicroarrayNormalizationStep({ datasetId, mode = "dp" }: 
         transformationType: (!isBuiltIn && transformEnabled) ? transformType : "none",
         priorCount: isBuiltIn ? 0 : maPrior
       };
-      const results = await normalizeDatasetAPI(normTargets, activeConfig as any);
+      const results = await normalizeDatasetAPI(
+        normTargets,
+        activeConfig as any,
+        (info) => { activeJobIdRef.current = info.jobId; },
+        abortControllerRef.current.signal
+      );
 
       dispatch({ type: "DP_SET_NORM", patch: activeConfig });
       dispatch({ type: "DP_SUBMIT_NORM" });
-      results.forEach(res => {
-        const targetDs = normTargets.find(d => d.id === res.datasetId);
-        dispatch({
-          type: mode === "dp" ? "DP_UPDATE_DATASET" : "DE_UPDATE_DATASET",
-          id: res.datasetId,
-          patch: {
-            normalizationDone: true,
-            normalizationMethod: maMethod,
-            normalizationLogTransform: !isBuiltIn && transformEnabled,
-            normalizationTransformationType: (!isBuiltIn && transformEnabled) ? transformType : "none",
-            parsedData: res.parsedData || undefined,
-            columns: res.columns || undefined,
-            sampleIds: res.sampleIds || undefined,
-            boxplotBefore: res.boxplotBefore || undefined,
-            boxplotAfter: res.boxplotAfter || undefined,
-            nFeatures: res.nFeatures || res.retainedFeatures || (res.parsedData && res.parsedData.length > 0 ? res.parsedData.length : (targetDs?.nFeatures || 0)),
-            nSamples: res.nSamples !== undefined ? res.nSamples : (targetDs?.nSamples || 0),
-          }
+      if (Array.isArray(results)) {
+        results.forEach(res => {
+          if (!res || typeof res !== "object" || !res.datasetId) return;
+          const targetDs = normTargets.find(d => d.id === res.datasetId);
+          dispatch({
+            type: mode === "dp" ? "DP_UPDATE_DATASET" : "DE_UPDATE_DATASET",
+            id: res.datasetId,
+            patch: {
+              normalizationDone: true,
+              normalizationMethod: maMethod,
+              normalizationLogTransform: !isBuiltIn && transformEnabled,
+              normalizationTransformationType: (!isBuiltIn && transformEnabled) ? transformType : "none",
+              parsedData: res.parsedData || undefined,
+              columns: res.columns || undefined,
+              sampleIds: res.sampleIds || undefined,
+              boxplotBefore: res.boxplotBefore || undefined,
+              boxplotAfter: res.boxplotAfter || undefined,
+              normalPca: res.normalPca || undefined,
+              qc: res.qc || targetDs?.qc || undefined,
+              nFeatures: res.nFeatures || res.retainedFeatures || (res.parsedData && res.parsedData.length > 0 ? res.parsedData.length : (targetDs?.nFeatures || 0)),
+              nSamples: res.nSamples !== undefined ? res.nSamples : (targetDs?.nSamples || 0),
+            }
+          });
         });
-      });
+      }
     } catch (err: any) {
+      if (err?.name === "AbortError" || err?.message?.includes("Aborted") || err?.message?.includes("Unknown job id")) {
+        return;
+      }
       console.error("Normalization error:", err);
       toast({
         title: "Normalization Error",
@@ -174,6 +203,7 @@ export default function MicroarrayNormalizationStep({ datasetId, mode = "dp" }: 
       });
     } finally {
       setLoading(false);
+      activeJobIdRef.current = null;
     }
   };
 
@@ -218,13 +248,19 @@ export default function MicroarrayNormalizationStep({ datasetId, mode = "dp" }: 
           }}
         />
       )}
-      {loading && <Spinner label="Applying normalization…" sublabel={`Method: ${NORM_METHODS.find(m => m.value === maMethod)?.label || "Loading"}`} />}
+      {loading && (
+        <Spinner
+          label="Applying normalization…"
+          sublabel={`Method: ${NORM_METHODS.find(m => m.value === maMethod)?.label || "Loading"}`}
+          onCancel={handleCancel}
+        />
+      )}
 
       <div className="card">
         <div className="card-title" style={{ marginBottom: 4 }}>{cardTitle}</div>
         <div className="card-sub">
           Preprocessing normalization and transformation for microarray data.
-          {allTarget.some(d => d.isNormalized) && <span style={{ marginLeft: 8, color: "hsl(38 70% 40%)", fontWeight: 500 }}>⚠ Some datasets are pre-normalized.</span>}
+          {allTarget.some(d => d.isNormalized) && <span style={{ marginLeft: 8, color: "hsl(38 70% 40%)", fontWeight: 500, display: "inline-flex", alignItems: "center", gap: 4 }}><AlertTriangle size={12} /> Some datasets are pre-normalized.</span>}
         </div>
         <hr className="card-divider" style={{ marginBottom: 16 }} />
 
@@ -397,30 +433,47 @@ export default function MicroarrayNormalizationStep({ datasetId, mode = "dp" }: 
 
           {(() => {
             const activeDs = normTargets.find(d => d.id === (activeTabId || normTargets[0]?.id));
-            if (!activeDs || (!activeDs.boxplotBefore && !activeDs.boxplotAfter)) {
-              return <div style={{ fontSize: 13, color: "var(--muted-foreground)" }}>No Box Plots available for this dataset.</div>;
+            if (!activeDs || (!activeDs.boxplotBefore && !activeDs.boxplotAfter && !activeDs.normalPca)) {
+              return <div style={{ fontSize: 13, color: "var(--muted-foreground)" }}>No Box Plots or PCA available for this dataset.</div>;
             }
             return (
-              <div style={{ display: "flex", gap: 16, flexWrap: "wrap", justifyContent: "center" }}>
-                {activeDs.boxplotBefore && (
-                  <div style={{ flex: "1 1 300px", minWidth: 280, textAlign: "center" }}>
-                    <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 2, color: "var(--foreground)" }}>Before Normalization</div>
-                    <div style={{ fontSize: 11, color: "var(--muted-foreground)", marginBottom: 6 }}>{activeDs.name}</div>
-                    <img 
-                      src={`data:image/png;base64,${activeDs.boxplotBefore}`} 
-                      alt="Before Normalization Boxplot" 
-                      style={{ width: "100%", maxWidth: 500, height: "auto", border: "1px solid var(--border)", borderRadius: 6 }} 
-                    />
+              <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
+                {(activeDs.boxplotBefore || activeDs.boxplotAfter) && (
+                  <div style={{ display: "flex", gap: 16, flexWrap: "wrap", justifyContent: "center" }}>
+                    {activeDs.boxplotBefore && (
+                      <div style={{ flex: "1 1 300px", minWidth: 280, textAlign: "center" }}>
+                        <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 2, color: "var(--foreground)" }}>Before Normalization</div>
+                        <div style={{ fontSize: 11, color: "var(--muted-foreground)", marginBottom: 6 }}>{activeDs.name}</div>
+                        <img 
+                          src={`data:image/png;base64,${activeDs.boxplotBefore}`} 
+                          alt="Before Normalization Boxplot" 
+                          style={{ width: "100%", maxWidth: 500, height: "auto", border: "1px solid var(--border)", borderRadius: 6 }} 
+                        />
+                      </div>
+                    )}
+                    {activeDs.boxplotAfter && (
+                      <div style={{ flex: "1 1 300px", minWidth: 280, textAlign: "center" }}>
+                        <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 2, color: "var(--foreground)" }}>After Normalization</div>
+                        <div style={{ fontSize: 11, color: "var(--muted-foreground)", marginBottom: 6 }}>{activeDs.name}</div>
+                        <img 
+                          src={`data:image/png;base64,${activeDs.boxplotAfter}`} 
+                          alt="After Normalization Boxplot" 
+                          style={{ width: "100%", maxWidth: 500, height: "auto", border: "1px solid var(--border)", borderRadius: 6 }} 
+                        />
+                      </div>
+                    )}
                   </div>
                 )}
-                {activeDs.boxplotAfter && (
-                  <div style={{ flex: "1 1 300px", minWidth: 280, textAlign: "center" }}>
-                    <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 2, color: "var(--foreground)" }}>After Normalization</div>
-                    <div style={{ fontSize: 11, color: "var(--muted-foreground)", marginBottom: 6 }}>{activeDs.name}</div>
-                    <img 
-                      src={`data:image/png;base64,${activeDs.boxplotAfter}`} 
-                      alt="After Normalization Boxplot" 
-                      style={{ width: "100%", maxWidth: 500, height: "auto", border: "1px solid var(--border)", borderRadius: 6 }} 
+
+                {activeDs.normalPca && (
+                  <div style={{ borderTop: "1px solid var(--border)", paddingTop: 16 }}>
+                    <InteractivePCAPlot
+                      pcaData={activeDs.normalPca}
+                      title={`${activeDs.name} — Normal PCA (Normalized Data)`}
+                      colorByField="group"
+                      exportKey="pca_plots"
+                      datasetId={activeDs.id}
+                      datasetName={activeDs.name}
                     />
                   </div>
                 )}
@@ -433,7 +486,7 @@ export default function MicroarrayNormalizationStep({ datasetId, mode = "dp" }: 
       <div className="action-row">
         <div style={{ display: "flex", gap: 8 }}>
           <button className="btn btn-default" onClick={() => dispatch({ type: mode === "dp" ? "DP_SET_STEP" : "DE_SET_STEP", step: getNextAndPrevSteps().prev } as never)}>← Back</button>
-          <button className="btn btn-default" onClick={() => setShowSkipModal(true)} data-testid="btn-skip-normalization" style={{ color: "var(--muted-foreground)" }}>Skip</button>
+          <button className="btn btn-default" onClick={() => setShowSkipModal(true)} data-testid="btn-skip-normalization">Skip</button>
         </div>
         <div style={{ display: "flex", gap: 8 }}>
           {hasSettingsChanged && (
@@ -450,8 +503,8 @@ export default function MicroarrayNormalizationStep({ datasetId, mode = "dp" }: 
                   runNorm();
                 }
               }}
-              data-testid="btn-redo-norm">
-              🔄 Redo Normalization
+              data-testid="btn-redo-norm" style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
+              <RotateCcw size={14} /> Redo Normalization
             </button>
           )}
           {!done ? (

@@ -189,11 +189,17 @@ get_bioc_parallel_param <- function(eff_cores = NULL) {
   }
   
   if (.Platform$OS.type == "windows") {
+    # In desktop mode or if snow is absent, use in-process SerialParam to avoid socket/worker issues
+    if (identical(get_app_mode(), "desktop") || !requireNamespace("snow", quietly = TRUE)) {
+      return(BiocParallel::SerialParam())
+    }
     cur_lp <- .libPaths()
-    if (length(cur_lp) > 0 && nzchar(cur_lp[1])) {
-      Sys.setenv(R_LIBS_USER = cur_lp[1])
-      Sys.setenv(R_LIBS = cur_lp[1])
-      Sys.setenv(R_LIBS_SITE = cur_lp[1])
+    cur_lp_valid <- cur_lp[nzchar(cur_lp)]
+    if (length(cur_lp_valid) > 0) {
+      lp_str <- paste(unique(cur_lp_valid), collapse = .Platform$path.sep)
+      Sys.setenv(R_LIBS_USER = cur_lp_valid[1])
+      Sys.setenv(R_LIBS = lp_str)
+      Sys.setenv(R_LIBS_SITE = lp_str)
     }
     # BiocParallel SnowParam checks Sys.getenv("PORT") before choosing random ports.
     # Unsetting PORT and setting R_PARALLEL_PORT="random" prevents socket collisions with Plumber/Shiny (port 8080).
@@ -203,6 +209,37 @@ get_bioc_parallel_param <- function(eff_cores = NULL) {
   } else {
     return(BiocParallel::MulticoreParam(workers = eff_c, progressbar = FALSE))
   }
+}
+
+# ── Unified Missing Value Imputation (KNN with Median Fallback) ────────────────
+impute_missing_knn <- function(mat, k = 10L) {
+  if (!any(is.na(mat))) return(mat)
+  cat(sprintf("[KNN-IMPUTE] Matrix contains %d missing values. Imputing with KNN...\n", sum(is.na(mat))))
+  tryCatch({
+    k_val <- min(as.integer(k), max(1L, ncol(mat) - 1L))
+    na_rows <- which(rowSums(is.na(mat)) > 0)
+    if (length(na_rows) == 0) return(mat)
+    
+    comp_rows <- which(rowSums(is.na(mat)) == 0)
+    if (length(na_rows) < nrow(mat) && length(comp_rows) > 0) {
+      max_donors <- min(length(comp_rows), 3000L)
+      donor_idx <- if (length(comp_rows) > max_donors) sample(comp_rows, max_donors) else comp_rows
+      sub_idx <- c(na_rows, donor_idx)
+      sub_mat <- mat[sub_idx, , drop = FALSE]
+      imp_sub <- impute::impute.knn(sub_mat, k = min(k_val, length(donor_idx)), maxp = max(1500L, length(sub_idx)))$data
+      mat[na_rows, ] <- imp_sub[seq_along(na_rows), , drop = FALSE]
+      mat
+    } else {
+      impute::impute.knn(mat, k = k_val, maxp = max(1500L, nrow(mat)))$data
+    }
+  }, error = function(e) {
+    cat("[WARNING] KNN imputation failed, using median fallback:", e$message, "\n")
+    for (i in which(rowSums(is.na(mat)) > 0)) {
+      m <- median(mat[i, ], na.rm = TRUE)
+      mat[i, is.na(mat[i, ])] <- if (is.finite(m)) m else 0
+    }
+    mat
+  })
 }
 
 # ── Unified Cross-Platform Parallel Lapply ─────────────────────────────────────
@@ -221,9 +258,23 @@ run_parallel_lapply <- function(X, FUN, ..., var_list = NULL, pkg_list = NULL, c
     res <- tryCatch({
       parallel::mclapply(X, FUN, ..., mc.cores = eff_cores)
     }, error = function(e) {
-      cat(sprintf("[Parallel] mclapply error: %s. Falling back to serial lapply.\n", conditionMessage(e)))
-      lapply(X, FUN, ...)
+      cat(sprintf("[Parallel] mclapply invocation error: %s. Falling back to serial lapply.\n", conditionMessage(e)))
+      NULL
     })
+    
+    # Check if mclapply returned NULL, an atomic vector, or any worker item is a try-error
+    has_worker_error <- is.null(res) || !is.list(res) || any(vapply(res, function(x) inherits(x, "try-error"), logical(1)))
+    
+    if (has_worker_error) {
+      if (!is.null(res) && is.list(res)) {
+        err_items <- which(vapply(res, function(x) inherits(x, "try-error"), logical(1)))
+        err_msgs <- sapply(err_items, function(idx) as.character(res[[idx]]))
+        cat(sprintf("[Parallel] mclapply worker(s) encountered error: %s. Falling back to serial lapply.\n", paste(err_msgs, collapse = "; ")))
+      } else {
+        cat("[Parallel] mclapply failed to produce valid list. Falling back to serial lapply.\n")
+      }
+      res <- lapply(X, FUN, ...)
+    }
     return(res)
   }
   
@@ -243,10 +294,12 @@ run_parallel_lapply <- function(X, FUN, ..., var_list = NULL, pkg_list = NULL, c
               num_workers, length(X), win_cap, requireNamespace("snow", quietly = TRUE)))
   
   cur_lp <- .libPaths()
-  if (length(cur_lp) > 0 && nzchar(cur_lp[1])) {
-    Sys.setenv(R_LIBS_USER = cur_lp[1])
-    Sys.setenv(R_LIBS = cur_lp[1])
-    Sys.setenv(R_LIBS_SITE = cur_lp[1])
+  cur_lp_valid <- cur_lp[nzchar(cur_lp)]
+  if (length(cur_lp_valid) > 0) {
+    lp_str <- paste(unique(cur_lp_valid), collapse = .Platform$path.sep)
+    Sys.setenv(R_LIBS_USER = cur_lp_valid[1])
+    Sys.setenv(R_LIBS = lp_str)
+    Sys.setenv(R_LIBS_SITE = lp_str)
   }
   Sys.unsetenv("PORT")
   Sys.setenv(R_PARALLEL_PORT = "random")
@@ -283,10 +336,12 @@ run_parallel_lapply <- function(X, FUN, ..., var_list = NULL, pkg_list = NULL, c
     parallel::clusterCall(cl, function(lp, wd) {
       .libPaths(lp)
       setwd(wd)
-      if (length(lp) > 0 && nzchar(lp[1])) {
-        Sys.setenv(R_LIBS_USER = lp[1])
-        Sys.setenv(R_LIBS = lp[1])
-        Sys.setenv(R_LIBS_SITE = lp[1])
+      lp_valid <- lp[nzchar(lp)]
+      if (length(lp_valid) > 0) {
+        lp_str <- paste(unique(lp_valid), collapse = .Platform$path.sep)
+        Sys.setenv(R_LIBS_USER = lp_valid[1])
+        Sys.setenv(R_LIBS = lp_str)
+        Sys.setenv(R_LIBS_SITE = lp_str)
       }
       Sys.unsetenv("PORT")
       Sys.setenv(R_PARALLEL_PORT = "random")
@@ -1083,7 +1138,9 @@ save_list_to_csv <- function(data_list, file_path, headers = NULL) {
         # Recursively unlist but keep names
         flat <- unlist(lapply(names(item), function(nm) {
           val <- item[[nm]]
-          if (is.list(val) || length(val) > 1) {
+          if (is.null(val) || length(val) == 0) {
+            setNames(NA_character_, nm)
+          } else if (is.list(val) || length(val) > 1) {
             setNames(paste(unlist(val), collapse=";"), nm)
           } else {
             setNames(as.character(val), nm)
@@ -1096,7 +1153,7 @@ save_list_to_csv <- function(data_list, file_path, headers = NULL) {
       # Named simple list -> single row
       flat <- lapply(names(data_list), function(nm) {
         val <- data_list[[nm]]
-        if (is.null(val)) return(setNames(list(NA_character_), nm))
+        if (is.null(val) || length(val) == 0) return(setNames(list(NA_character_), nm))
         if (length(val) > 1) setNames(list(paste(val, collapse=";")), nm)
         else setNames(list(as.character(val[1])), nm)
       })
@@ -1421,7 +1478,7 @@ delete_downstream_files <- function(ds_id_full, target_step, is_redo = FALSE) {
   # Feature Selection files
   if (any(c("fs", "inline-fs", "inline_fs", "feature-selection", "feature_selection", "model-selection", "model_selection") %in% invalidated_steps)) {
     patterns_to_remove <- c(patterns_to_remove,
-      paste0("^", ds_id, "_(fs_training_results|fs_train_split|fs_test_split|fs_parameters|fs_meta|fs_train_expr|fs_train_clin|fs_test_expr|fs_test_clin|fs_full_importances|fs_top_features)"),
+      paste0("^", ds_id, "_(fs_training_results|fs_train_split|fs_test_split|fs_parameters|fs_meta|fs_train_expr|fs_train_clin|fs_test_expr|fs_test_clin|fs_full_importances|fs_top_features|fs_final_model)"),
       paste0("^(feature_importance|selected_features|stabl_path|fdr_path|roc_train).*_", ds_id),
       paste0("^", ds_id, "_(feature_importance|selected_features|stabl_path|fdr_path|roc_train)"),
       paste0("^", ds_id, "_fs_discovery_cache_meta_[^.]+\\.rds$")
@@ -1500,6 +1557,67 @@ delete_downstream_files <- function(ds_id_full, target_step, is_redo = FALSE) {
   
   ensure_sequential_matrices(ds_id)
   return(TRUE)
+}
+
+# Perform physical disk cleanup and report section removal for a dataset
+perform_dataset_file_cleanup <- function(dataset_id, scope = "all", user_id = NULL) {
+  if (!dir.exists("tmp")) return(invisible(0L))
+  if (is.null(user_id) || !nzchar(user_id)) user_id <- get_user_id(dataset_id)
+  
+  if (!is.null(user_id) && nzchar(user_id)) {
+    for (m in c("dp", "de", "fs", "ea", "en", "enrichment")) {
+      for (st in c("upload", "annotation", "processing", "normalization", "batch", "de", "meta", "fs", "ea")) {
+        tryCatch(remove_sections_from_report(user_id, st, dataset_id, m), error = function(e) NULL)
+      }
+    }
+  }
+
+  base_id   <- get_base_id(dataset_id)
+  target_id <- if (!is.null(base_id) && nzchar(base_id)) base_id else sub("_(dp|de|fs|ea|en|enrichment).*", "", dataset_id)
+  prefix    <- target_id
+  all_files <- list.files("tmp", full.names = TRUE, recursive = TRUE)
+  matched_files <- all_files[grepl(prefix, basename(all_files))]
+  
+  to_delete <- c()
+  if (scope == "all") {
+    to_delete <- matched_files
+  } else if (scope == "expression") {
+    to_delete <- matched_files[!grepl("(_clinical\\.csv|_clin_metadata\\.rds)$", basename(matched_files))]
+  } else if (scope == "clinical") {
+    keep_patterns <- c(
+      "_expression\\.csv$",
+      "_original_parsed\\.rds$",
+      "_expr_metadata\\.rds$",
+      "_expression_original_backup\\.csv$",
+      "_main_stack_original_backup\\.rds$",
+      "_counts_stack_original_backup\\.rds$"
+    )
+    keep <- FALSE
+    for (pat in keep_patterns) {
+      keep <- keep | grepl(pat, basename(matched_files))
+    }
+    to_delete <- matched_files[!keep]
+    
+    backup_expr_csv <- get_session_path(target_id, "%s_expression_original_backup.csv")
+    if (file.exists(backup_expr_csv)) {
+      file.copy(backup_expr_csv, get_session_path(target_id, "%s_expression.csv"), overwrite = TRUE)
+    }
+    backup_main_rds <- get_session_path(target_id, "%s_main_stack_original_backup.rds")
+    if (file.exists(backup_main_rds)) {
+      file.copy(backup_main_rds, get_session_path(target_id, "%s_main_stack.rds"), overwrite = TRUE)
+    }
+    backup_counts_rds <- get_session_path(target_id, "%s_counts_stack_original_backup.rds")
+    if (file.exists(backup_counts_rds)) {
+      file.copy(backup_counts_rds, get_session_path(target_id, "%s_counts_stack.rds"), overwrite = TRUE)
+    }
+  } else {
+    to_delete <- all_files[grepl(sprintf("^%s_%s", target_id, scope), basename(all_files))]
+  }
+  
+  if (length(to_delete) > 0) {
+    unlink(to_delete, force = TRUE)
+  }
+  invisible(length(to_delete))
 }
 
 append_step_to_report <- function(user_id, section_title, content_md, module = NULL) {

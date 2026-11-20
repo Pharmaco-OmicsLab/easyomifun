@@ -1,20 +1,15 @@
-import { useState, useEffect, useMemo } from "react";
+import { useState, useEffect, useMemo, useRef } from "react";
 import { useLocation } from "wouter";
-import { FileText, X, AlertTriangle, CheckCircle, Download } from "lucide-react";
+import { FileText, X, AlertTriangle, CheckCircle, Download, FolderOpen, BarChart3, Dna } from "lucide-react";
 import { useAppStore } from "../../store/appStore";
 import { useMicroarrayPlatforms } from "../../hooks/useMicroarrayPlatforms";
 import Spinner from "../Spinner";
 import type { DataType, Platform } from "../../dataObject";
-import { parseExpressionFile, parseClinicalFile, detectGeneIdType, alignSamplesLocal, unparseCSV, getDesktopFilePath, getExpressionSampleColumns, isAnnotationOrInfoColumn } from "../../lib/dataParser";
+import { parseExpressionFile, parseClinicalFile, detectGeneIdType, detectIsNormalized, alignSamplesLocal, unparseCSV, getDesktopFilePath, getExpressionSampleColumns, isAnnotationOrInfoColumn } from "../../lib/dataParser";
 import { uploadFileInChunks } from "../../lib/chunkUploader";
-import { fetchSampleDataAPI, uploadRawDatasetDataAPI, clearDatasetAPI } from "../../lib/api";
+import { fetchSampleDataAPI, uploadRawDatasetDataAPI, clearDatasetAPI, cancelComputeJobAPI } from "../../lib/api";
 import WarnSampleModal from "../shared/WarnSampleModal";
 import DiscardWarnModal from "../shared/DiscardWarnModal";
-
-function detectIsNormalized(rows: string[][]): boolean {
-  if (!rows || rows.length === 0) return false;
-  return rows.some(row => row.slice(4).some(cell => cell.trim().includes(".")));
-}
 
 function detectHasNA(rows: (string | number)[][]): boolean {
   if (!rows || rows.length === 0) return false;
@@ -85,59 +80,47 @@ const filterDatasetForUpload = (dataset: any, choice: "all" | "overlap") => {
   let filteredExpressionRows = dataset.parsedData || [];
   let nSamples = dataset.nSamples || 0;
 
-  const isFsHeaders = dataset.fs_featuresOrientation === "headers";
+  const geneIdCol = dataset.geneIdCol || (dataset.columns && dataset.columns[0]) || "";
+  const geneInfoCols = dataset.geneInfoCols || [];
+  
+  const fsFeatureIdx = dataset.fs_featureIndexValue !== undefined ? (dataset.fs_featureIndexValue - 1) : -1;
+  
+  const exprSampleCols = (dataset.sampleIds && dataset.sampleIds.length > 0)
+    ? dataset.sampleIds
+    : getExpressionSampleColumns(dataset.columns || [], geneIdCol, geneInfoCols);
+  
+  const commonSamples = exprSampleCols.filter((s: string) => validClinicalSamples.includes(s));
 
-  if (isFsHeaders) {
-    const sampleIdColIdx = (dataset.fs_featureIndexValue || 1) - 1;
-    filteredExpressionRows = (dataset.parsedData || []).filter((row: any[]) => {
-      const rowSampleId = row[sampleIdColIdx];
-      return rowSampleId && validClinicalSamples.includes(rowSampleId);
-    });
-    const commonSamples = filteredExpressionRows.map((row: any[]) => row[sampleIdColIdx]);
-    nSamples = commonSamples.length;
-  } else {
-    const geneIdCol = dataset.geneIdCol || (dataset.columns && dataset.columns[0]) || "";
-    const geneInfoCols = dataset.geneInfoCols || [];
-    
-    const fsFeatureIdx = dataset.fs_featureIndexValue !== undefined ? (dataset.fs_featureIndexValue - 1) : -1;
-    
-    const exprSampleCols = (dataset.sampleIds && dataset.sampleIds.length > 0)
-      ? dataset.sampleIds
-      : getExpressionSampleColumns(dataset.columns || [], geneIdCol, geneInfoCols);
-    
-    const commonSamples = exprSampleCols.filter((s: string) => validClinicalSamples.includes(s));
+  keepCols = (dataset.columns || []).filter((c: string, idx: number) => {
+    if (idx === fsFeatureIdx) return true;
+    if (isAnnotationOrInfoColumn(c, geneIdCol, geneInfoCols)) return true;
+    return commonSamples.includes(c);
+  });
 
-    keepCols = (dataset.columns || []).filter((c: string, idx: number) => {
-      if (idx === fsFeatureIdx) return true;
-      if (isAnnotationOrInfoColumn(c, geneIdCol, geneInfoCols)) return true;
-      return commonSamples.includes(c);
-    });
-
-    const keepIndices = keepCols.map((c: string) => (dataset.columns || []).indexOf(c));
-    
-    if (dataset.uploadDone) {
-      filteredExpressionRows = (dataset.parsedData || []).map((row: any[], rIdx: number) => {
-        if (!row) return row;
-        if (rIdx < 10) {
-          return keepIndices.map(idx => row[idx]);
-        }
-        // Keep it minimized
-        const newRow: any[] = [];
-        const geneIdIdx = dataset.columns ? dataset.columns.indexOf(geneIdCol) : -1;
-        const targetIdx = geneIdIdx !== -1 ? geneIdIdx : 0;
-        const keepGeneIdIdx = keepCols.indexOf(geneIdCol);
-        const newTargetIdx = keepGeneIdIdx !== -1 ? keepGeneIdIdx : 0;
-        newRow[newTargetIdx] = row[targetIdx] !== undefined ? row[targetIdx] : row[0];
-        return newRow;
-      });
-    } else {
-      filteredExpressionRows = (dataset.parsedData || []).map((row: any[]) => {
+  const keepIndices = keepCols.map((c: string) => (dataset.columns || []).indexOf(c));
+  
+  if (dataset.uploadDone) {
+    filteredExpressionRows = (dataset.parsedData || []).map((row: any[], rIdx: number) => {
+      if (!row) return row;
+      if (rIdx < 10) {
         return keepIndices.map(idx => row[idx]);
-      });
-    }
-    
-    nSamples = commonSamples.length;
+      }
+      // Keep it minimized
+      const newRow: any[] = [];
+      const geneIdIdx = dataset.columns ? dataset.columns.indexOf(geneIdCol) : -1;
+      const targetIdx = geneIdIdx !== -1 ? geneIdIdx : 0;
+      const keepGeneIdIdx = keepCols.indexOf(geneIdCol);
+      const newTargetIdx = keepGeneIdIdx !== -1 ? keepGeneIdIdx : 0;
+      newRow[newTargetIdx] = row[targetIdx] !== undefined ? row[targetIdx] : row[0];
+      return newRow;
+    });
+  } else {
+    filteredExpressionRows = (dataset.parsedData || []).map((row: any[]) => {
+      return keepIndices.map(idx => row[idx]);
+    });
   }
+  
+  nSamples = commonSamples.length;
 
   const finalClinicalRows = filteredClinicalRows.filter((row: any[]) => {
     return validClinicalSamples.includes(row[sampleIdx]);
@@ -146,7 +129,9 @@ const filterDatasetForUpload = (dataset: any, choice: "all" | "overlap") => {
   return {
     ...dataset,
     columns: keepCols,
-    sampleIds: isFsHeaders ? dataset.sampleIds : ((dataset.sampleIds && dataset.sampleIds.length > 0) ? dataset.sampleIds.filter((s: string) => validClinicalSamples.includes(s)) : keepCols.filter((c: string) => !isAnnotationOrInfoColumn(c, dataset.geneIdCol, dataset.geneInfoCols))),
+    sampleIds: ((dataset.sampleIds && dataset.sampleIds.length > 0)
+      ? dataset.sampleIds.filter((s: string) => validClinicalSamples.includes(s))
+      : keepCols.filter((c: string) => !isAnnotationOrInfoColumn(c, dataset.geneIdCol, dataset.geneInfoCols))),
     parsedData: filteredExpressionRows,
     clinicalParsedData: finalClinicalRows,
     nSamples: nSamples,
@@ -168,8 +153,25 @@ export default function DataUploadStep({ datasetId, showGeneIdType = true }: Pro
   const [clinicalDrag, setClinicalDrag] = useState(false);
   const [showWarnModal, setShowWarnModal] = useState(false);
   const [showDiscardModal, setShowDiscardModal] = useState(false);
+  const [hasAutoDetectedPvalCols, setHasAutoDetectedPvalCols] = useState(false);
+  const [detPvalEnabled, setDetPvalEnabled] = useState(!!ds?.detectionPvalPrefix);
+  const [detPvalPrefix, setDetPvalPrefix] = useState(ds?.detectionPvalPrefix || "");
+  const [detPvalCols, setDetPvalCols] = useState<string[]>(ds?.detectionPvalCols || []);
 
-  if (!ds) return null;
+  const abortControllerRef = useRef<AbortController | null>(null);
+  const activeJobIdRef = useRef<string | null>(null);
+
+  const handleCancel = () => {
+    if (activeJobIdRef.current) {
+      cancelComputeJobAPI(activeJobIdRef.current);
+      activeJobIdRef.current = null;
+    }
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort();
+      abortControllerRef.current = null;
+    }
+    setLoading(false);
+  };
 
   const { platforms } = useMicroarrayPlatforms();
 
@@ -181,14 +183,15 @@ export default function DataUploadStep({ datasetId, showGeneIdType = true }: Pro
   };
 
   const microarrayGeneIdOptions = useMemo(() => {
-    if (ds.dataType !== "microarray" || !ds.platform) return [];
+    if (!ds || ds.dataType !== "microarray" || !ds.platform) return [];
     const entries = ds.platform === "affymetrix"
       ? platforms.affymetrix
       : platforms.illumina;
     return entries.map(e => ({ value: e.platform, label: `${e.platform} (Probe ID)` }));
-  }, [ds.dataType, ds.platform, platforms]);
+  }, [ds?.dataType, ds?.platform, platforms]);
 
   const geneIdTypeOptions = useMemo(() => {
+    if (!ds) return [];
     if (ds.dataType === "microarray") {
       return [
         { value: "ensembl", label: "Ensembl ID" },
@@ -215,7 +218,7 @@ export default function DataUploadStep({ datasetId, showGeneIdType = true }: Pro
         { value: "genename", label: "Gene Name" },
       ];
     }
-  }, [ds.dataType, microarrayGeneIdOptions]);
+  }, [ds?.dataType, microarrayGeneIdOptions]);
 
   const multipleDs = state.dpDatasets.length > 1;
 
@@ -262,7 +265,8 @@ export default function DataUploadStep({ datasetId, showGeneIdType = true }: Pro
           clinicalGroupCol: currentDs.clinicalGroupCol || "",
           clinicalBatchCol: currentDs.clinicalBatchCol || "",
           clinicalOtherCovariates: currentDs.clinicalOtherCovariates || [],
-          nFeatures: currentDs.nFeatures
+          nFeatures: currentDs.nFeatures,
+          detectionPvalCols: currentDs.detectionPvalCols || [],
         });
         setMatchingSamples(res.commonSamples || []);
         setMissingClinSamples(res.missingClinicalSamples || []);
@@ -297,30 +301,42 @@ export default function DataUploadStep({ datasetId, showGeneIdType = true }: Pro
     ds?.clinicalGroupCol,
     ds?.clinicalBatchCol,
     JSON.stringify(ds?.clinicalColumns || []),
-    JSON.stringify(ds?.clinicalParsedData || []),
+    ds?.clinicalParsedData?.length,
     JSON.stringify(ds?.columns || []),
-    JSON.stringify(ds?.parsedData || [])
+    ds?.parsedData?.length,
+    JSON.stringify(ds?.detectionPvalCols || [])
   ]);
 
   useEffect(() => {
+    if (!ds) return;
     if (ds.dataType === "microarray" && ds.platform === "affymetrix" && ds.isNormalized !== true) {
       updateDs({ isNormalized: true });
     }
-  }, [ds.dataType, ds.platform, ds.isNormalized]);
+  }, [ds?.dataType, ds?.platform, ds?.isNormalized]);
 
-  const handleClear = async (scope: "expression" | "clinical") => {
-    try {
-      await clearDatasetAPI(ds.id, scope);
-    } catch (e) {
-      console.warn("clearDatasetAPI failed (non-fatal):", e);
-    }
+  useEffect(() => {
+    const hasPval = !!ds?.detectionPvalPrefix || (ds?.detectionPvalCols && ds.detectionPvalCols.length > 0) || false;
+    setDetPvalEnabled(hasPval);
+    setDetPvalPrefix(ds?.detectionPvalPrefix || "");
+    setDetPvalCols(ds?.detectionPvalCols || []);
+  }, [ds?.id, ds?.detectionPvalPrefix, JSON.stringify(ds?.detectionPvalCols || [])]);
+
+  if (!ds) return null;
+
+  const handleClear = (scope: "expression" | "clinical") => {
+    clearDatasetAPI(ds.id, scope).catch((e) => console.warn("clearDatasetAPI failed (non-fatal):", e));
     dispatch({
       type: "RESET_DOWNSTREAM_STEPS",
       datasetId: ds.id,
       fromStep: "upload"
     } as any);
     if (scope === "expression") {
+      setHasAutoDetectedPvalCols(false);
+      setDetPvalEnabled(false);
+      setDetPvalPrefix("");
+      setDetPvalCols([]);
       updateDs({
+        celFolderPath: undefined, sampleIds: [],
         expressionFile: null, expressionFileName: "", expressionFilePath: undefined, expressionUploadId: undefined, expressionRawText: "", columns: [],
         geneInfoCols: [], geneIdCol: "", geneIdType: "", detectedGeneIdType: "",
         isNormalized: false, detectedIsNormalized: false,
@@ -365,6 +381,8 @@ export default function DataUploadStep({ datasetId, showGeneIdType = true }: Pro
         const sampleHasNA = detectHasNA(cleanParsedData);
         const rawText = unparseCSV(cleanColumns, cleanParsedData);
         updateDs({
+          celFolderPath: undefined,
+          sampleIds: [],
           expressionFileName: "sample_expression.csv",
           expressionRawText: rawText,
           columns: cleanColumns,
@@ -406,6 +424,8 @@ export default function DataUploadStep({ datasetId, showGeneIdType = true }: Pro
   };
 
   const handleExpressionFile = async (file: File) => {
+    const controller = new AbortController();
+    abortControllerRef.current = controller;
     setLoadingMsg(`Parsing ${file.name}…`);
     setLoading(true);
     try {
@@ -413,6 +433,7 @@ export default function DataUploadStep({ datasetId, showGeneIdType = true }: Pro
       const isDesktop = !!desktopPath;
 
       const parsed = await parseExpressionFile(file, { previewOnly: true });
+      setHasAutoDetectedPvalCols(!!parsed.hasDetectionPvalCols);
       const geneIdCol = parsed.geneIdCol;
       const keepIndices = parsed.columns.map((c, idx) => ({ name: c, idx }));
       const cleanColumns = keepIndices.map(item => item.name);
@@ -425,10 +446,23 @@ export default function DataUploadStep({ datasetId, showGeneIdType = true }: Pro
         setLoadingMsg(`Uploading ${file.name} in chunks…`);
         uploadId = await uploadFileInChunks(file, ds.id, "expression", (pct) => {
           setLoadingMsg(`Uploading ${file.name} (${pct}%)…`);
-        });
+        }, controller.signal);
       }
 
+      const autoMatchedDetCols = (cleanColumns || []).filter(c => c.toLowerCase().includes("detection pval"));
+      const autoDetEnabled = autoMatchedDetCols.length > 0;
+      const detPrefix = "Detection Pval";
+      if (autoDetEnabled) {
+        setDetPvalEnabled(true);
+        setDetPvalPrefix(detPrefix);
+        setDetPvalCols(autoMatchedDetCols);
+      }
+
+      const nextDataType = parsed.detectedDataType || ds.dataType || "readcounts";
+
       updateDs({
+        celFolderPath: undefined,
+        sampleIds: [],
         expressionFile: file,
         expressionFileName: file.name,
         expressionFilePath: desktopPath || undefined,
@@ -439,6 +473,10 @@ export default function DataUploadStep({ datasetId, showGeneIdType = true }: Pro
         geneIdCol: geneIdCol,
         detectedGeneIdType: parsed.detectedGeneIdType,
         geneIdType: parsed.detectedGeneIdType,
+        detectedDataType: parsed.detectedDataType,
+        dataType: nextDataType,
+        detectionPvalPrefix: autoDetEnabled ? detPrefix : (ds.detectionPvalPrefix || ""),
+        detectionPvalCols: autoDetEnabled ? autoMatchedDetCols : (ds.detectionPvalCols || []),
         isNormalized: parsed.isNormalized,
         detectedIsNormalized: parsed.isNormalized,
         nSamples: parsed.nSamples,
@@ -450,6 +488,9 @@ export default function DataUploadStep({ datasetId, showGeneIdType = true }: Pro
         uploadDone: false,
       });
     } catch (error: any) {
+      if (error?.name === "AbortError" || controller.signal.aborted) {
+        return;
+      }
       updateDs({
         integrityOk: false,
         integrityIssues: [`Error parsing expression file: ${error.message}`],
@@ -460,6 +501,8 @@ export default function DataUploadStep({ datasetId, showGeneIdType = true }: Pro
   };
 
   const handleClinicalFile = async (file: File) => {
+    const controller = new AbortController();
+    abortControllerRef.current = controller;
     setLoadingMsg(`Parsing ${file.name}…`);
     setLoading(true);
     try {
@@ -474,7 +517,7 @@ export default function DataUploadStep({ datasetId, showGeneIdType = true }: Pro
         setLoadingMsg(`Uploading ${file.name} in chunks…`);
         uploadId = await uploadFileInChunks(file, ds.id, "clinical", (pct) => {
           setLoadingMsg(`Uploading ${file.name} (${pct}%)…`);
-        });
+        }, controller.signal);
       }
 
       updateDs({
@@ -484,7 +527,7 @@ export default function DataUploadStep({ datasetId, showGeneIdType = true }: Pro
         clinicalUploadId: uploadId,
         clinicalRawText: "",
         clinicalSampleIdCol: parsed.clinicalSampleIdCol,
-        clinicalGroupCol: "",
+        clinicalGroupCol: parsed.clinicalGroupCol || "",
         clinicalBatchCol: "",
         clinicalColumns: parsed.clinicalColumns,
         clinicalParsedData: parsed.clinicalParsedData,
@@ -493,6 +536,9 @@ export default function DataUploadStep({ datasetId, showGeneIdType = true }: Pro
         uploadDone: false,
       });
     } catch (error: any) {
+      if (error?.name === "AbortError" || controller.signal.aborted) {
+        return;
+      }
       updateDs({
         integrityIssues: [`Error parsing clinical file: ${error.message}`],
       });
@@ -502,9 +548,11 @@ export default function DataUploadStep({ datasetId, showGeneIdType = true }: Pro
   };
 
   // Samples matching comparison logic
-  const exprSamples = (ds.sampleIds && ds.sampleIds.length > 0)
+  const detPvalSet = new Set(ds.detectionPvalCols || []);
+  const exprSamples = ((ds.sampleIds && ds.sampleIds.length > 0)
     ? ds.sampleIds
-    : getExpressionSampleColumns(ds.columns || [], ds.geneIdCol, ds.geneInfoCols);
+    : getExpressionSampleColumns(ds.columns || [], ds.geneIdCol, ds.geneInfoCols)
+  ).filter(c => !detPvalSet.has(c));
   const hasClinical = !!ds.clinicalFileName;
 
   const isFullMatch = hasClinical && exprSamples.length > 0 && missingClinSamples.length === 0;
@@ -557,12 +605,20 @@ export default function DataUploadStep({ datasetId, showGeneIdType = true }: Pro
     let finalMissingClinSamples = missingClinSamples;
     let finalClinicalNoExprSamples = clinicalNoExprSamples;
     let finalClinicalColumns = datasetToUpload.clinicalColumns;
+    let uploadedQc: any = ds.qc;
+    let uploadedNormalPca: any = ds.normalPca;
 
     if (!ds.uploadDone || hasSettingsChanged || clearedClinical) {
       setLoadingMsg("Uploading data to server…");
       setLoading(true);
+      const controller = new AbortController();
+      abortControllerRef.current = controller;
       try {
-        const res = await uploadRawDatasetDataAPI([datasetToUpload]);
+        const res = await uploadRawDatasetDataAPI(
+          [datasetToUpload],
+          ({ jobId }) => { activeJobIdRef.current = jobId; },
+          controller.signal
+        );
         if (res && res.status === "success" && Array.isArray(res.datasets)) {
           const matched = res.datasets.find((d: any) => d.datasetId === ds.id);
           if (matched) {
@@ -588,12 +644,20 @@ export default function DataUploadStep({ datasetId, showGeneIdType = true }: Pro
             if (matched.clinicalNoExprSamples && Array.isArray(matched.clinicalNoExprSamples)) {
               finalClinicalNoExprSamples = matched.clinicalNoExprSamples;
             }
+            if (matched.qc) {
+              uploadedQc = matched.qc;
+              uploadedNormalPca = matched.qc?.pca || matched.qc?.before?.pca || uploadedNormalPca;
+            }
           }
         }
-      } catch (e) {
+      } catch (e: any) {
+        if (e?.name === "AbortError" || controller.signal.aborted) {
+          return;
+        }
         console.error("Failed to upload data to server:", e);
+      } finally {
+        setLoading(false);
       }
-      setLoading(false);
     }
 
     updateDs({
@@ -628,6 +692,8 @@ export default function DataUploadStep({ datasetId, showGeneIdType = true }: Pro
       clinicalNoExprSamples: finalClinicalNoExprSamples,
       hasMissingClinicalValues: hasMissingClinicalValues,
       removedSamples: removedSamples,
+      qc: uploadedQc,
+      normalPca: uploadedNormalPca,
     });
 
     const sorted = [...state.dpDatasets].sort((a, b) => a.id.localeCompare(b.id));
@@ -701,7 +767,7 @@ export default function DataUploadStep({ datasetId, showGeneIdType = true }: Pro
 
   return (
     <>
-      {loading && <Spinner label={loadingMsg} sublabel="Please wait…" />}
+      {loading && <Spinner label={loadingMsg} sublabel="Please wait…" onCancel={handleCancel} />}
       {showDiscardModal && (
         <DiscardWarnModal
           stepId="upload"
@@ -733,6 +799,65 @@ export default function DataUploadStep({ datasetId, showGeneIdType = true }: Pro
           </div>
         </div>
 
+        {/* CEL folder picker — Electron desktop only */}
+        {!ds.expressionFileName &&
+          typeof window !== "undefined" && !!(window as any).electronAPI?.selectCelFolder && (
+          <div style={{ marginTop: 16, marginBottom: 8 }}>
+            <button className="btn btn-default" onClick={async () => {
+              const result = await (window as any).electronAPI.selectCelFolder();
+              if (!result || result.canceled) return;
+              const { folderPath, celFiles } = result as { folderPath: string; celFiles: string[] };
+              if (!celFiles?.length) {
+                updateDs({
+                  celFolderPath: undefined,
+                  expressionFileName: "",
+                  integrityOk: false,
+                  integrityIssues: [`No .CEL files found in folder: "${folderPath}". Please choose a folder containing Affymetrix .CEL files.`],
+                });
+                return;
+              }
+              const sampleNames = celFiles.map((f: string) => f.replace(/(?:\.CEL|\.cel)(?:\.gz)?$/i, ""));
+              const chosenAffy = (ds.geneIdType && platforms.affymetrix.some(p => p.platform === ds.geneIdType))
+                ? ds.geneIdType
+                : (platforms.affymetrix[0]?.platform || "HG-U133 Plus 2.0");
+              const affyEntry = platforms.affymetrix.find(p => p.platform === chosenAffy);
+              updateDs({
+                celFolderPath: folderPath,
+                expressionFile: null,
+                expressionFilePath: undefined,
+                expressionUploadId: undefined,
+                expressionRawText: "",
+                expressionFileName: `${celFiles.length} CEL files (${folderPath.split(/[\\/]/).pop()})`,
+                columns: ["probe_id", ...sampleNames],
+                geneInfoCols: ["probe_id"],
+                geneIdCol: "probe_id",
+                geneIdType: chosenAffy,
+                detectedGeneIdType: chosenAffy,
+                microarrayPlatformId: chosenAffy,
+                microarrayOrganism: affyEntry?.organism_display || "",
+                sampleIds: sampleNames,
+                nSamples: sampleNames.length,
+                nFeatures: 0,
+                parsedData: [],
+                dataType: "microarray",
+                detectedDataType: "microarray",
+                platform: "affymetrix",
+                isNormalized: true,
+                detectedIsNormalized: true,
+                integrityOk: true,
+                integrityIssues: [],
+                uploadDone: false,
+              });
+            }}>
+              <FolderOpen size={15} style={{ display: "inline-block", verticalAlign: "middle", marginRight: 6 }} />
+              Select CEL Files Folder
+            </button>
+            <div style={{ fontSize: 11, color: "var(--muted-foreground)", marginTop: 4 }}>
+              Local app only — automatically sets Affymetrix microarray and runs ReadAffy + RMA on Continue.
+            </div>
+          </div>
+        )}
+
         {!ds.expressionFileName ? (
           <div
             className={`drop-zone ${expressionDrag ? "dragover" : ""}`}
@@ -743,12 +868,20 @@ export default function DataUploadStep({ datasetId, showGeneIdType = true }: Pro
               input.onchange = e => { const f = (e.target as HTMLInputElement).files?.[0]; if (f) handleExpressionFile(f); };
               input.click();
             }}
+            role="button"
+            tabIndex={0}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" || e.key === " ") {
+                e.preventDefault();
+                (e.currentTarget as HTMLElement).click();
+              }
+            }}
             onDragOver={e => { e.preventDefault(); setExpressionDrag(true); }}
             onDragLeave={() => setExpressionDrag(false)}
             onDrop={e => { e.preventDefault(); setExpressionDrag(false); const f = e.dataTransfer.files?.[0]; if (f) handleExpressionFile(f); }}
             data-testid="dropzone-expression"
           >
-            <div className="drop-zone-icon">📊</div>
+            <div className="drop-zone-icon"><BarChart3 size={32} /></div>
             <div className="drop-zone-title">Drop expression file here</div>
             <div className="drop-zone-hint">CSV · TSV · TXT &nbsp;·&nbsp; Max 500 MB</div>
           </div>
@@ -758,7 +891,7 @@ export default function DataUploadStep({ datasetId, showGeneIdType = true }: Pro
               <FileText size={15} />
               <span className="file-chip-name">{ds.expressionFileName}</span>
               <span style={{ fontSize: 12, color: "hsl(220 9% 55%)" }}>
-                {ds.nFeatures.toLocaleString()} features · {ds.nSamples} samples
+                {ds.celFolderPath && ds.nFeatures === 0 ? "Pending RMA" : `${ds.nFeatures.toLocaleString()} features`} · {ds.nSamples} samples
               </span>
               <button className="file-chip-clear" onClick={() => handleClear("expression")} data-testid="btn-clear-expression">
                 <X size={16} />
@@ -777,7 +910,7 @@ export default function DataUploadStep({ datasetId, showGeneIdType = true }: Pro
                     <span style={{
                       marginLeft: 10, fontSize: 11, padding: "2px 8px", borderRadius: 4,
                       background: "var(--selected-bg)", color: "var(--foreground)",
-                      border: "1px solid var(--border)", fontWeight: 500,
+                      border: "1px solid var(--border)", fontWeight: 500, maxWidth: 600
                     }}>
                       Auto-detected: {ds.detectedIsNormalized ? (isOthersOrProteomics ? "Normalized Data" : "Already normalized") : (isOthersOrProteomics ? "Raw Data" : "Raw counts / unnormalized")}
                     </span>
@@ -859,7 +992,7 @@ export default function DataUploadStep({ datasetId, showGeneIdType = true }: Pro
             </div>
 
             {/* Dataset Name Input */}
-            <div style={{ display: "flex", flexDirection: "column", width: 280, marginBottom: 14 }}>
+            <div style={{ display: "flex", flexDirection: "column", width: 240, marginBottom: 14 }}>
               <label style={{ fontSize: 13, fontWeight: 500, marginBottom: 6 }}>Dataset Name</label>
               <input 
                 type="text" 
@@ -871,16 +1004,28 @@ export default function DataUploadStep({ datasetId, showGeneIdType = true }: Pro
             </div>
 
             {/* Data Type and Platform side-by-side arrangement */}
-            <div style={{ display: "flex", gap: 14, flexWrap: "wrap", marginBottom: 14 }}>
+            <div style={{ display: "flex", gap: 16, alignItems: "flex-start", flexWrap: "wrap", marginBottom: 14 }}>
               
               {/* Data Type Dropdown */}
-              <div style={{ display: "flex", flexDirection: "column", width: 280, position: "relative" }}>
-                <label style={{ fontSize: 13, fontWeight: 500, color: "var(--foreground)", marginBottom: 8 }}>Data Type</label>
+              <div style={{ display: "flex", flexDirection: "column", width: 240, position: "relative" }}>
+                <label style={{ fontSize: 13, fontWeight: 500, color: "var(--foreground)", marginBottom: 8, display: "flex", alignItems: "center", gap: 6, minHeight: 24, flexWrap: "wrap" }}>
+                  Data Type
+                  {ds.detectedDataType && (
+                    <span style={{
+                      fontSize: 10, padding: "1px 6px", borderRadius: 4,
+                      background: "var(--selected-bg)", color: "var(--foreground)",
+                      border: "1px solid var(--border)", fontWeight: 500, whiteSpace: "nowrap"
+                    }}>
+                      Auto: {ds.detectedDataType === "readcounts" ? "Counts" : ds.detectedDataType === "microarray" ? "Microarray" : ds.detectedDataType}
+                    </span>
+                  )}
+                </label>
                 <details style={{ width: "100%" }} data-testid="details-data-type">
                   <summary style={{
                     display: "flex", justifyContent: "space-between", alignItems: "center",
                     padding: "8px 10px", border: "1px solid var(--border)", borderRadius: 7, fontSize: 13,
-                    background: "#fff", cursor: "pointer", listStyle: "none", userSelect: "none"
+                    background: "#fff", cursor: "pointer", listStyle: "none", userSelect: "none",
+                    height: 38, boxSizing: "border-box"
                   }}>
                     <span>
                       {ds.dataType === "readcounts" && "Read counts"}
@@ -951,12 +1096,13 @@ export default function DataUploadStep({ datasetId, showGeneIdType = true }: Pro
               {/* Platform Dropdown */}
               {isMicroarray && (
                 <div style={{ display: "flex", flexDirection: "column", width: 240, position: "relative" }}>
-                  <label style={{ fontSize: 13, fontWeight: 500, color: "var(--foreground)", marginBottom: 8 }}>Platform</label>
+                  <label style={{ fontSize: 13, fontWeight: 500, color: "var(--foreground)", marginBottom: 8, display: "flex", alignItems: "center", minHeight: 24 }}>Platform</label>
                   <details style={{ width: "100%" }} data-testid="details-platform">
                     <summary style={{
                       display: "flex", justifyContent: "space-between", alignItems: "center",
                       padding: "8px 10px", border: "1px solid var(--border)", borderRadius: 7, fontSize: 13,
-                      background: "#fff", cursor: "pointer", listStyle: "none", userSelect: "none"
+                      background: "#fff", cursor: "pointer", listStyle: "none", userSelect: "none",
+                      height: 38, boxSizing: "border-box"
                     }}>
                       <span>
                         {ds.platform === "affymetrix" && "Affymetrix"}
@@ -990,6 +1136,16 @@ export default function DataUploadStep({ datasetId, showGeneIdType = true }: Pro
                             if (ds.dataType === "microarray" && newPlatform === "affymetrix") {
                               patch.isNormalized = true;
                             }
+                            if (newPlatform === "illumina" && (hasAutoDetectedPvalCols || (ds.columns || []).some(c => c.toLowerCase().includes("detection pval")))) {
+                              const autoCols = (ds.columns || []).filter(c => c.toLowerCase().includes("detection pval"));
+                              if (autoCols.length > 0) {
+                                patch.detectionPvalPrefix = "Detection Pval";
+                                patch.detectionPvalCols = autoCols;
+                                setDetPvalEnabled(true);
+                                setDetPvalPrefix("Detection Pval");
+                                setDetPvalCols(autoCols);
+                              }
+                            }
                             updateDs(patch);
                             
                             const details = (e.target as HTMLElement).closest("details");
@@ -1022,7 +1178,7 @@ export default function DataUploadStep({ datasetId, showGeneIdType = true }: Pro
             </div>
             <div className="chips-row" style={{ marginBottom: 16 }}>
               <div className="stat-chip"><div className="stat-chip-val">{ds.nSamples}</div><div className="stat-chip-lbl">Samples</div></div>
-              <div className="stat-chip"><div className="stat-chip-val">{ds.nFeatures.toLocaleString()}</div><div className="stat-chip-lbl">Features</div></div>
+              <div className="stat-chip"><div className="stat-chip-val">{ds.celFolderPath && ds.nFeatures === 0 ? "Pending RMA" : ds.nFeatures.toLocaleString()}</div><div className="stat-chip-lbl">Features</div></div>
             </div>
 
             {/* Column Configuration */}
@@ -1030,16 +1186,17 @@ export default function DataUploadStep({ datasetId, showGeneIdType = true }: Pro
             <div style={{ fontSize: 12, fontWeight: 600, color: "var(--muted-foreground)", marginBottom: 12, textTransform: "uppercase", letterSpacing: ".04em" }}>
               Column Configuration
             </div>
-            <div style={{ display: "flex", gap: 14, flexWrap: "wrap", marginBottom: 14 }}>
+            <div style={{ display: "flex", gap: 16, alignItems: "flex-start", flexWrap: "wrap", marginBottom: 14 }}>
 
               {/* Gene Info Columns Dropdown */}
-              <div style={{ display: "flex", flexDirection: "column", minWidth: 200, position: "relative" }}>
-                <label style={{ fontSize: 12, fontWeight: 500, marginBottom: 5 }}>Gene Info Columns</label>
+              <div style={{ display: "flex", flexDirection: "column", width: 240, position: "relative" }}>
+                <label style={{ fontSize: 13, fontWeight: 500, color: "var(--foreground)", marginBottom: 8, display: "flex", alignItems: "center", minHeight: 24 }}>Gene Info Columns</label>
                 <details style={{ width: "100%" }}>
                   <summary style={{
                     display: "flex", justifyContent: "space-between", alignItems: "center",
                     padding: "8px 10px", border: "1px solid var(--border)", borderRadius: 7, fontSize: 13,
-                    background: "#fff", cursor: "pointer", listStyle: "none", userSelect: "none"
+                    background: "#fff", cursor: "pointer", listStyle: "none", userSelect: "none",
+                    height: 38, boxSizing: "border-box"
                   }}>
                     <span>
                       {(() => {
@@ -1079,13 +1236,14 @@ export default function DataUploadStep({ datasetId, showGeneIdType = true }: Pro
                 </details>
                </div>
 
-              <div style={{ display: "flex", flexDirection: "column", minWidth: 180, position: "relative" }}>
-                <label style={{ fontSize: 12, fontWeight: 500, marginBottom: 5 }}>Gene ID Column</label>
+              <div style={{ display: "flex", flexDirection: "column", width: 240, position: "relative" }}>
+                <label style={{ fontSize: 13, fontWeight: 500, color: "var(--foreground)", marginBottom: 8, display: "flex", alignItems: "center", minHeight: 24 }}>Gene ID Column</label>
                 <details style={{ width: "100%" }} data-testid="details-gene-id-col">
                   <summary style={{
                     display: "flex", justifyContent: "space-between", alignItems: "center",
                     padding: "8px 10px", border: "1px solid var(--border)", borderRadius: 7, fontSize: 13,
-                    background: "#fff", cursor: "pointer", listStyle: "none", userSelect: "none"
+                    background: "#fff", cursor: "pointer", listStyle: "none", userSelect: "none",
+                    height: 38, boxSizing: "border-box"
                   }}>
                     <span>{ds.geneIdCol || "Select column..."}</span>
                     <span style={{ fontSize: 10, color: "var(--muted-foreground)" }}>▼</span>
@@ -1141,75 +1299,162 @@ export default function DataUploadStep({ datasetId, showGeneIdType = true }: Pro
               </div>
             </div>
 
-            {/* Gene ID Type */}
+            {/* Gene ID Type and Detection P-val row */}
             {showGeneIdType && ds.geneIdCol && ds.dataType !== "others" && ds.dataType !== "proteomics" && (
-              <div style={{ marginBottom: 14, width: 400 }}>
-                <label style={{ fontSize: 12, fontWeight: 500, display: "block", marginBottom: 6 }}>
-                  Gene ID Type
-                  {ds.detectedGeneIdType && (
-                    <span style={{
-                      marginLeft: 10, fontSize: 11, fontWeight: 500, padding: "2px 8px", borderRadius: 4,
-                      background: "var(--selected-bg)", color: "var(--foreground)", border: "1px solid var(--border)",
-                    }}>
-                      Auto-detected: {GENE_ID_LABELS[ds.detectedGeneIdType] ?? ds.detectedGeneIdType}
-                    </span>
-                  )}
-                </label>
-                <details style={{ width: 250, position: "relative" }} data-testid="details-gene-id-type">
-                  <summary style={{
-                    display: "flex", justifyContent: "space-between", alignItems: "center",
-                    padding: "8px 10px", border: `1px solid ${idTypeMismatch ? "var(--destructive)" : "var(--border)"}`, borderRadius: 7, fontSize: 13,
-                    background: "#fff", cursor: "pointer", listStyle: "none", userSelect: "none"
-                  }}>
-                    <span>{getGeneIdTypeLabel(ds.geneIdType) || "Select type..."}</span>
-                    <span style={{ fontSize: 10, color: "var(--muted-foreground)" }}>▼</span>
-                  </summary>
+              <div style={{ marginBottom: 14 }}>
+                <div style={{ display: "flex", gap: 16, alignItems: "flex-start", flexWrap: "wrap" }}>
+                  {/* Gene ID Type */}
+                  <div style={{ display: "flex", flexDirection: "column", width: 240, position: "relative" }}>
+                    <label style={{ fontSize: 13, fontWeight: 500, color: "var(--foreground)", marginBottom: 8, display: "flex", alignItems: "center", gap: 6, minHeight: 24, flexWrap: "wrap" }}>
+                      Gene ID Type
+                      {ds.detectedGeneIdType && (
+                        <span style={{
+                          fontSize: 10, padding: "1px 6px", borderRadius: 4,
+                          background: "var(--selected-bg)", color: "var(--foreground)", border: "1px solid var(--border)",
+                          fontWeight: 500, whiteSpace: "nowrap"
+                        }}>
+                          Auto: {GENE_ID_LABELS[ds.detectedGeneIdType] ?? ds.detectedGeneIdType}
+                        </span>
+                      )}
+                    </label>
+                    <details style={{ width: "100%", position: "relative" }} data-testid="details-gene-id-type">
+                      <summary style={{
+                        display: "flex", justifyContent: "space-between", alignItems: "center",
+                        padding: "8px 10px", border: `1px solid ${idTypeMismatch ? "var(--destructive)" : "var(--border)"}`, borderRadius: 7, fontSize: 13,
+                        background: "#fff", cursor: "pointer", listStyle: "none", userSelect: "none",
+                        height: 38, boxSizing: "border-box"
+                      }}>
+                        <span>{getGeneIdTypeLabel(ds.geneIdType) || "Select type..."}</span>
+                        <span style={{ fontSize: 10, color: "var(--muted-foreground)" }}>▼</span>
+                      </summary>
 
-                  <div style={{
-                    position: "absolute", top: "100%", left: 0, right: 0, zIndex: 50, marginTop: 4,
-                    border: "1px solid var(--border)", borderRadius: 7, padding: "4px 0", maxHeight: 160,
-                    overflowY: "auto", background: "#fff", boxShadow: "0 4px 6px -1px rgb(0 0 0 / 0.1), 0 2px 4px -2px rgb(0 0 0 / 0.1)"
-                  }}>
-                    {geneIdTypeOptions.map(opt => (
-                      <div
-                        key={opt.value}
-                        onClick={(e) => {
-                          const val = opt.value;
-                          const allEntries = [...platforms.affymetrix, ...platforms.illumina];
-                          const entry = allEntries.find(e => e.platform === val);
-                          if (entry) {
-                            updateDs({
-                              geneIdType: val as any,
-                              microarrayPlatformId: val,
-                              microarrayOrganism: entry.organism_display
-                            });
-                          } else {
-                            updateDs({
-                              geneIdType: val as any,
-                              microarrayPlatformId: "",
-                              microarrayOrganism: ""
-                            });
-                          }
-                          const details = (e.target as HTMLElement).closest("details");
-                          if (details) details.removeAttribute("open");
-                        }}
-                        style={{
-                          padding: "8px 10px",
-                          fontSize: 12,
-                          cursor: "pointer",
-                          background: ds.geneIdType === opt.value ? "var(--selected-bg)" : "transparent",
-                          fontWeight: ds.geneIdType === opt.value ? 600 : 400
-                        }}
-                        onMouseEnter={e => e.currentTarget.style.background = "var(--selected-bg)"}
-                        onMouseLeave={e => e.currentTarget.style.background = ds.geneIdType === opt.value ? "var(--selected-bg)" : "transparent"}
-                      >
-                        {opt.label}
+                      <div style={{
+                        position: "absolute", top: "100%", left: 0, right: 0, zIndex: 50, marginTop: 4,
+                        border: "1px solid var(--border)", borderRadius: 7, padding: "4px 0", maxHeight: 160,
+                        overflowY: "auto", background: "#fff", boxShadow: "0 4px 6px -1px rgb(0 0 0 / 0.1), 0 2px 4px -2px rgb(0 0 0 / 0.1)"
+                      }}>
+                        {geneIdTypeOptions.map(opt => (
+                          <div
+                            key={opt.value}
+                            onClick={(e) => {
+                              const val = opt.value;
+                              const allEntries = [...platforms.affymetrix, ...platforms.illumina];
+                              const entry = allEntries.find(e => e.platform === val);
+                              if (entry) {
+                                updateDs({
+                                  geneIdType: val as any,
+                                  microarrayPlatformId: val,
+                                  microarrayOrganism: entry.organism_display
+                                });
+                              } else {
+                                updateDs({
+                                  geneIdType: val as any,
+                                  microarrayPlatformId: "",
+                                  microarrayOrganism: ""
+                                });
+                              }
+                              const details = (e.target as HTMLElement).closest("details");
+                              if (details) details.removeAttribute("open");
+                            }}
+                            style={{
+                              padding: "8px 10px",
+                              fontSize: 12,
+                              cursor: "pointer",
+                              background: ds.geneIdType === opt.value ? "var(--selected-bg)" : "transparent",
+                              fontWeight: ds.geneIdType === opt.value ? 600 : 400
+                            }}
+                            onMouseEnter={e => e.currentTarget.style.background = "var(--selected-bg)"}
+                            onMouseLeave={e => e.currentTarget.style.background = ds.geneIdType === opt.value ? "var(--selected-bg)" : "transparent"}
+                          >
+                            {opt.label}
+                          </div>
+                        ))}
                       </div>
-                    ))}
+                    </details>
                   </div>
-                </details>
+
+                  {/* Detection P-val column toggle on the SAME LINE as Gene ID Type */}
+                  {isMicroarray && ds.platform === "illumina" && (
+                    <div style={{ display: "flex", flexDirection: "column", width: 240, position: "relative" }}>
+                      <label style={{
+                        fontSize: 12, fontWeight: 500, color: "var(--foreground)",
+                        marginBottom: 8, display: "flex", alignItems: "center", gap: 6,
+                        minHeight: 24, cursor: "pointer", userSelect: "none"
+                      }}>
+                        <input
+                          type="checkbox"
+                          checked={detPvalEnabled}
+                          onChange={e => {
+                            const checked = e.target.checked;
+                            setDetPvalEnabled(checked);
+                            if (checked) {
+                              const prefix = detPvalPrefix.trim() || "Detection Pval";
+                              const matched = (ds.columns || []).filter(c => c.toLowerCase().includes(prefix.toLowerCase()));
+                              setDetPvalPrefix(prefix);
+                              setDetPvalCols(matched);
+                              updateDs({ detectionPvalPrefix: prefix, detectionPvalCols: matched });
+                            } else {
+                              setDetPvalPrefix("");
+                              setDetPvalCols([]);
+                              updateDs({ detectionPvalPrefix: "", detectionPvalCols: [] });
+                            }
+                          }}
+                          style={{ accentColor: "var(--primary)", cursor: "pointer" }}
+                        />
+                        <span>Probe filter &amp; Detection P-val</span>
+                      </label>
+                      <div style={{ width: "100%" }}>
+                        <input
+                          type="text"
+                          placeholder='Column prefix, e.g. "Detection Pval"'
+                          value={detPvalPrefix}
+                          disabled={!detPvalEnabled}
+                          onClick={() => {
+                            if (!detPvalEnabled) {
+                              setDetPvalEnabled(true);
+                              const prefix = detPvalPrefix.trim() || "Detection Pval";
+                              const matched = (ds.columns || []).filter(c => c.toLowerCase().includes(prefix.toLowerCase()));
+                              setDetPvalPrefix(prefix);
+                              setDetPvalCols(matched);
+                              updateDs({ detectionPvalPrefix: prefix, detectionPvalCols: matched });
+                            }
+                          }}
+                          onChange={e => {
+                            const text = e.target.value;
+                            setDetPvalPrefix(text);
+                            const matched = text.trim()
+                              ? (ds.columns || []).filter(c => c.toLowerCase().includes(text.trim().toLowerCase()))
+                              : [];
+                            setDetPvalCols(matched);
+                            updateDs({ detectionPvalPrefix: text, detectionPvalCols: matched });
+                          }}
+                          style={{
+                            width: "100%", height: 38, padding: "8px 10px",
+                            border: "1px solid var(--border)", borderRadius: 7, fontSize: 13,
+                            boxSizing: "border-box",
+                            background: detPvalEnabled ? "#fff" : "hsl(var(--muted) / 0.4)",
+                            opacity: detPvalEnabled ? 1 : 0.65,
+                            cursor: detPvalEnabled ? "text" : "pointer"
+                          }}
+                        />
+                        {detPvalEnabled && detPvalPrefix.trim() && detPvalCols.length === 0 && (
+                          <div className="banner danger" style={{ marginTop: 4, padding: "4px 8px", fontSize: 11 }}>
+                            <AlertTriangle size={13} style={{ flexShrink: 0 }} />
+                            <span>No column names contain <strong>"{detPvalPrefix}"</strong>. Check spelling.</span>
+                          </div>
+                        )}
+                        {detPvalEnabled && detPvalCols.length > 0 && (
+                          <div style={{ marginTop: 4, fontSize: 11, color: "var(--muted-foreground)" }}>
+                            {detPvalCols.length} column(s) matched: {detPvalCols.slice(0, 3).join(", ")}{detPvalCols.length > 3 ? "…" : ""}
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  )}
+                </div>
+
                 {idTypeMismatch && (
-                  <div className="banner warn" style={{ marginTop: 10, width: 700 }}>
+                  <div className="banner warn" style={{ marginTop: 10, maxWidth: 400 }}>
                     <AlertTriangle size={15} style={{ flexShrink: 0 }} />
                     <span>
                       <strong>ID type mismatch:</strong> Auto-detector suggests <strong>{GENE_ID_LABELS[ds.detectedGeneIdType] || ds.detectedGeneIdType}</strong>{" "}
@@ -1218,17 +1463,23 @@ export default function DataUploadStep({ datasetId, showGeneIdType = true }: Pro
                   </div>
                 )}
                 {!idTypeMismatch && ds.geneIdType && ds.detectedGeneIdType && (
-                  <div className="banner success" style={{ marginTop: 10 }}>
+                  <div className="banner success" style={{ marginTop: 10, maxWidth:400 }}>
                     <CheckCircle size={15} style={{ flexShrink: 0 }} />
                     ID type matches auto-detection ({GENE_ID_LABELS[ds.detectedGeneIdType] || ds.detectedGeneIdType}).
                   </div>
                 )}
                 {ds.dataType === "microarray" && ds.microarrayOrganism && isPlatformProbeId && (
-                  <div className="banner success" style={{ marginTop: 10, width: 700, display: "flex", gap: 8, alignItems: "center" }}>
+                  <div className="banner success" style={{ marginTop: 10, width: 400, display: "flex", gap: 8, alignItems: "center" }}>
                     <CheckCircle size={15} style={{ flexShrink: 0 }} />
                     <span>
                       Platform organism detected: <strong>{ds.microarrayOrganism}</strong>. This organism will be used for downstream annotation.
                     </span>
+                  </div>
+                )}
+                {hasAutoDetectedPvalCols && !detPvalEnabled && isMicroarray && ds.platform === "illumina" && isPlatformProbeId && (
+                  <div className="banner warn" style={{ marginTop: 8, marginBottom: 8 }}>
+                    <AlertTriangle size={14} style={{ flexShrink: 0 }} />
+                    <span>Columns containing <strong>"Detection Pval"</strong> detected in your file. Enable the toggle above to configure probe quality filtering.</span>
                   </div>
                 )}
               </div>
@@ -1239,12 +1490,18 @@ export default function DataUploadStep({ datasetId, showGeneIdType = true }: Pro
             <div style={{ fontSize: 12, fontWeight: 600, color: "hsl(220 9% 45%)", marginBottom: 8, textTransform: "uppercase", letterSpacing: ".04em" }}>
               Preview (first 10 rows)
             </div>
-            <div className="preview-wrap">
-              <table>
-                <thead><tr>{(ds.columns || []).map(col => <th key={col}>{col}</th>)}</tr></thead>
-                <tbody>{(ds.parsedData || []).slice(0, 10).map((row, i) => <tr key={i}>{row.map((cell, j) => <td key={j}>{cell}</td>)}</tr>)}</tbody>
-              </table>
-            </div>
+            {ds.celFolderPath && (!ds.parsedData || ds.parsedData.length === 0) ? (
+              <div style={{ padding: "12px 14px", borderRadius: 7, background: "var(--muted)", color: "var(--muted-foreground)", fontSize: 12 }}>
+                CEL folder selected ({ds.nSamples} samples). Probe intensities will be extracted and normalized via ReadAffy + RMA when you click Continue.
+              </div>
+            ) : (
+              <div className="preview-wrap">
+                <table>
+                  <thead><tr>{(ds.columns || []).map(col => <th key={col}>{col}</th>)}</tr></thead>
+                  <tbody>{(ds.parsedData || []).slice(0, 10).map((row, i) => <tr key={i}>{row.map((cell, j) => <td key={j}>{cell}</td>)}</tr>)}</tbody>
+                </table>
+              </div>
+            )}
           </>
         )}
       </div>
@@ -1284,11 +1541,19 @@ export default function DataUploadStep({ datasetId, showGeneIdType = true }: Pro
               input.onchange = e => { const f = (e.target as HTMLInputElement).files?.[0]; if (f) handleClinicalFile(f); };
               input.click();
             }}
+            role="button"
+            tabIndex={0}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" || e.key === " ") {
+                e.preventDefault();
+                (e.currentTarget as HTMLElement).click();
+              }
+            }}
             onDragOver={e => { e.preventDefault(); setClinicalDrag(true); }}
             onDragLeave={() => setClinicalDrag(false)}
             onDrop={e => { e.preventDefault(); setClinicalDrag(false); const f = e.dataTransfer.files?.[0]; if (f) handleClinicalFile(f); }}
             data-testid="dropzone-clinical">
-            <div className="drop-zone-icon">🧬</div>
+            <div className="drop-zone-icon"><Dna size={32} /></div>
             <div className="drop-zone-title">Drop clinical metadata file here</div>
             <div className="drop-zone-hint">CSV · TSV &nbsp;·&nbsp; SampleID + Group columns required</div>
           </div>
@@ -1430,10 +1695,10 @@ export default function DataUploadStep({ datasetId, showGeneIdType = true }: Pro
       </div>
 
       {/* Integrity check */}
-      {ds.expressionFileName && (
+      {(ds.expressionFileName || (ds.integrityIssues && ds.integrityIssues.length > 0)) && (
         <div className="card">
           <div className="card-title" style={{ marginBottom: 12 }}>Data Integrity Check</div>
-          {hasClinical ? (
+          {ds.expressionFileName && hasClinical ? (
             <>
               {/* Output stats chips */}
               <div style={{ marginBottom: 14 }}>
@@ -1586,18 +1851,7 @@ export default function DataUploadStep({ datasetId, showGeneIdType = true }: Pro
                           name="sampleOverlapChoice"
                           value="all"
                           checked={ds.sampleOverlapChoice === "all"}
-                          onChange={() => {
-                            updateDs({
-                              clinicalFile: null,
-                              clinicalFileName: "",
-                              clinicalSampleIdCol: "",
-                              clinicalGroupCol: "",
-                              clinicalBatchCol: "",
-                              clinicalColumns: [],
-                              clinicalParsedData: [],
-                              sampleOverlapChoice: null,
-                            });
-                          }}
+                          onChange={() => updateDs({ sampleOverlapChoice: "all" })}
                         />
                         Keep all samples in expression data
                       </label>

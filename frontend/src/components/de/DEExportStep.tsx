@@ -106,7 +106,6 @@ export default function DEExportStep() {
         {
           id: `de_all_results|${ds.id}`,
           label: "All Features Table",
-          ext: "CSV",
           desc: `Complete DE results matrix including all genes (${results.length}) performed by using ${deMethodLabel} method (adjusted p-value cutoff: ${state.deConfig.pValueThreshold}, adjustment method: ${state.deConfig.adjustMethod}, log₂FC threshold: |${state.deConfig.logFcThreshold}|)`,
           getTestIds: (fmt) => {
             const t = [`btn-download-all-${ds.id}-${fmt}`, `btn-download-all-${ds.id}-${fmt.toUpperCase()}`];
@@ -119,7 +118,6 @@ export default function DEExportStep() {
         {
           id: `de_sig_results|${ds.id}`,
           label: "Significant Features Table",
-          ext: "CSV",
           desc: `Significant gene sets filtered by thresholds (${sigResults.length}) using ${deMethodLabel} method (adjusted p-value cutoff: ${state.deConfig.pValueThreshold}, adjustment method: ${state.deConfig.adjustMethod}, log₂FC threshold: |${state.deConfig.logFcThreshold}|)`,
           getTestIds: (fmt) => {
             const t = [`btn-download-sig-${ds.id}-${fmt}`, `btn-download-sig-${ds.id}-${fmt.toUpperCase()}`];
@@ -132,19 +130,16 @@ export default function DEExportStep() {
         {
           id: `de_volcano|${ds.id}`,
           label: `Volcano Plot${dsSuffix}`,
-          ext: "PDF",
           desc: `Volcano plot visualization highlighting log₂ Fold Change vs Statistical Significance (-log₁₀ p-value) for ${ds.name}`,
         },
         {
           id: `de_ma|${ds.id}`,
           label: `MA Plot${dsSuffix}`,
-          ext: "PDF",
           desc: `MA plot mapping Average Log Expression vs Log Fold Change for ${ds.name}`,
         },
         {
           id: `de_heatmap_top10|${ds.id}`,
           label: `Top 10 Significant Genes Heatmap${dsSuffix}`,
-          ext: "PDF",
           desc: `Clustered heatmap of the top 10 most significant differentially expressed genes${dsSuffix}, showing expression patterns across all samples`,
         }
       ]
@@ -163,7 +158,6 @@ export default function DEExportStep() {
         {
           id: `meta_results|${metaDsId}`,
           label: "Meta-analysis Results Table",
-          ext: "CSV",
           desc: "Aggregated differential expression statistics across all cohorts",
           getTestIds: (fmt) => {
             const t = [`btn-download-meta-meta_results-${fmt}`, `btn-download-meta-meta_results-${fmt.toUpperCase()}`];
@@ -177,7 +171,6 @@ export default function DEExportStep() {
           {
             id: `forest_plots|${metaDsId}`,
             label: "Forest Plots",
-            ext: "PDF",
             desc: "Forest plots showing effect sizes and confidence intervals across cohorts",
             getTestIds: (fmt: string) => {
               const t = [`btn-download-meta-forest_plots-${fmt}`, `btn-download-meta-forest_plots-${fmt.toUpperCase()}`];
@@ -190,14 +183,12 @@ export default function DEExportStep() {
           {
             id: `de_volcano|${metaDsId}`,
             label: "Meta-analysis Volcano Plot",
-            ext: "PDF",
             desc: "Volcano plot mapping combined effect size (Cohen's d) against statistical significance (-log₁₀ FDR)",
             getTestIds: (fmt: string) => [`btn-download-meta-volcano-${fmt}`, `btn-download-meta-volcano-${fmt.toUpperCase()}`]
           },
           {
             id: `heterogeneity_report|${metaDsId}`,
             label: "Heterogeneity Report",
-            ext: "CSV",
             desc: "Cochran's Q test statistics and I^2 heterogeneity metrics results (Cochran's Q statistic evaluating null hypothesis of homogeneity, I^2 statistic quantifying percentage of total variation across studies due to heterogeneity rather than chance)",
             getTestIds: (fmt: string) => {
               const t = [`btn-download-meta-heterogeneity_report-${fmt}`, `btn-download-meta-heterogeneity_report-${fmt.toUpperCase()}`];
@@ -218,17 +209,19 @@ export default function DEExportStep() {
     const userId = getSessionUserId();
     const metaDsId = `${userId}_de_meta`;
 
+    const deInlineEnCfg = state.deInlineEnSubmittedConfig || state.deInlineEnConfig;
+
     const processCache = (cacheKey: string, dsId: string, dsSuffix: string, dsName: string) => {
       const inlineCache = state.deInlineEnResultsCache[cacheKey];
       if (!inlineCache) return;
 
       const submittedCfg = inlineCache.submittedCfg;
-      const activeMethods = Array.isArray(submittedCfg?.methods) ? submittedCfg.methods : (Array.isArray(state.enConfig.methods) ? state.enConfig.methods : []);
+      const activeMethods = Array.isArray(submittedCfg?.methods) ? submittedCfg.methods : (Array.isArray(deInlineEnCfg.methods) ? deInlineEnCfg.methods : []);
       const isGsea = activeMethods.includes("gsea");
       const isOra = activeMethods.includes("ora");
 
       if (isGsea) {
-        const dbs = Array.isArray(submittedCfg?.gseaDatabase) ? submittedCfg.gseaDatabase : (Array.isArray(state.enConfig.gseaDatabase) ? state.enConfig.gseaDatabase : []);
+        const dbs = Array.isArray(submittedCfg?.gseaDatabase) ? submittedCfg.gseaDatabase : (Array.isArray(deInlineEnCfg.gseaDatabase) ? deInlineEnCfg.gseaDatabase : []);
         dbs.forEach(db => {
           const dbLabel = db.toUpperCase();
           const hasSigGsea = Array.isArray(inlineCache?.gseaResults) && inlineCache.gseaResults.filter((r: any) => r && r.database === db).length > 0;
@@ -236,7 +229,6 @@ export default function DEExportStep() {
             {
               id: `gsea_results|${dsId}|${db}`,
               label: `${dbLabel} GSEA Results Table${dsSuffix}`,
-              ext: "CSV",
               desc: `Significant gene sets with NES, p-value, and FDR q-value computed using ${dbLabel} database${dsSuffix}.`,
               getTestIds: (fmt: string) => [`btn-download-gsea_results-${db}-${fmt}`, `btn-download-gsea_results-${db}-${fmt.toUpperCase()}`]
             },
@@ -247,42 +239,36 @@ export default function DEExportStep() {
               {
                 id: `gsea_dotplot|${dsId}|${db}`,
                 label: `${dbLabel} GSEA Dot Plot${dsSuffix}`,
-                ext: "PDF",
                 desc: `Bubble visualization highlighting top enriched GSEA terms by NES using ${dbLabel}${dsSuffix}.`,
                 getTestIds: (fmt: string) => [`btn-download-gsea_dotplot-${db}-${fmt}`, `btn-download-gsea_dotplot-${db}-${fmt.toUpperCase()}`]
               },
               {
                 id: `gsea_ridgeplot|${dsId}|${db}`,
                 label: `${dbLabel} GSEA Ridge Plot${dsSuffix}`,
-                ext: "PDF",
                 desc: `Ridge plot showing expression distributions of core enrichment genes for top terms using ${dbLabel}${dsSuffix}.`,
                 getTestIds: (fmt: string) => [`btn-download-gsea_ridgeplot-${db}-${fmt}`, `btn-download-gsea_ridgeplot-${db}-${fmt.toUpperCase()}`]
               },
               {
                 id: `gsea_esplot_up|${dsId}|${db}`,
                 label: `${dbLabel} GSEA Enrichment Score Plot (Top Up-regulated)${dsSuffix}`,
-                ext: "PDF",
                 desc: `Running enrichment score profile for the top up-regulated pathway using ${dbLabel}${dsSuffix}.`,
                 getTestIds: (fmt: string) => [`btn-download-gsea_esplot_up-${db}-${fmt}`, `btn-download-gsea_esplot_up-${db}-${fmt.toUpperCase()}`]
               },
               {
                 id: `gsea_esplot_down|${dsId}|${db}`,
                 label: `${dbLabel} GSEA Enrichment Score Plot (Top Down-regulated)${dsSuffix}`,
-                ext: "PDF",
                 desc: `Running enrichment score profile for the top down-regulated pathway using ${dbLabel}${dsSuffix}.`,
                 getTestIds: (fmt: string) => [`btn-download-gsea_esplot_down-${db}-${fmt}`, `btn-download-gsea_esplot_down-${db}-${fmt.toUpperCase()}`]
               },
               {
                 id: `gsea_ranked_list|${dsId}|${db}`,
                 label: `${dbLabel} GSEA Ranked Gene List${dsSuffix}`,
-                ext: "CSV",
                 desc: `Full ranked gene list with calculated cross-study meta-metrics using ${dbLabel}${dsSuffix}.`,
                 getTestIds: (fmt: string) => [`btn-download-gsea_ranked_list-${db}-${fmt}`, `btn-download-gsea_ranked_list-${db}-${fmt.toUpperCase()}`]
               },
               {
                 id: `gsea_leading_edge|${dsId}|${db}`,
                 label: `${dbLabel} GSEA Leading Edge Genes${dsSuffix}`,
-                ext: "CSV",
                 desc: `Core-enrichment leading edge genes extracted for significant terms using ${dbLabel}${dsSuffix}.`,
                 getTestIds: (fmt: string) => [`btn-download-gsea_leading_edge-${db}-${fmt}`, `btn-download-gsea_leading_edge-${db}-${fmt.toUpperCase()}`]
               }
@@ -301,7 +287,7 @@ export default function DEExportStep() {
       }
 
       if (isOra) {
-        const dbs = Array.isArray(submittedCfg?.oraDatabase) ? submittedCfg.oraDatabase : (Array.isArray(state.enConfig.oraDatabase) ? state.enConfig.oraDatabase : []);
+        const dbs = Array.isArray(submittedCfg?.oraDatabase) ? submittedCfg.oraDatabase : (Array.isArray(deInlineEnCfg.oraDatabase) ? deInlineEnCfg.oraDatabase : []);
         dbs.forEach(db => {
           const dbLabel = db.toUpperCase();
           const oraList = Array.isArray(inlineCache?.oraResults) ? inlineCache.oraResults.filter((r: any) => r && r.database === db) : [];
@@ -313,7 +299,6 @@ export default function DEExportStep() {
             {
               id: `ora_results|${dsId}|${db}`,
               label: `${dbLabel} ORA Results Table${dsSuffix}`,
-              ext: "CSV",
               desc: `Gene sets with fold enrichment and hyper-geometric p-values using ${dbLabel} database${dsSuffix}.`,
               getTestIds: (fmt: string) => [`btn-download-ora_results-${db}-${fmt}`, `btn-download-ora_results-${db}-${fmt.toUpperCase()}`]
             },
@@ -323,7 +308,6 @@ export default function DEExportStep() {
             dbFiles.push({
               id: `ora_dotplot_up|${dsId}|${db}`,
               label: `${dbLabel} ORA Dot Plot - Up${dsSuffix}`,
-              ext: "PDF",
               desc: `Bubble visualization highlighting top enriched terms for up-regulated genes using ${dbLabel}${dsSuffix}.`,
               getTestIds: (fmt: string) => [`btn-download-ora_dotplot_up-${db}-${fmt}`, `btn-download-ora_dotplot_up-${db}-${fmt.toUpperCase()}`]
             });
@@ -333,7 +317,6 @@ export default function DEExportStep() {
             dbFiles.push({
               id: `ora_dotplot_down|${dsId}|${db}`,
               label: `${dbLabel} ORA Dot Plot - Down${dsSuffix}`,
-              ext: "PDF",
               desc: `Bubble visualization highlighting top enriched terms for down-regulated genes using ${dbLabel}${dsSuffix}.`,
               getTestIds: (fmt: string) => [`btn-download-ora_dotplot_down-${db}-${fmt}`, `btn-download-ora_dotplot_down-${db}-${fmt.toUpperCase()}`]
             });
@@ -343,7 +326,6 @@ export default function DEExportStep() {
             dbFiles.push({
               id: `ora_dotplot|${dsId}|${db}`,
               label: `${dbLabel} ORA Dot Plot${dsSuffix}`,
-              ext: "PDF",
               desc: `Bubble visualization highlighting top enriched terms by ratio using ${dbLabel}${dsSuffix}.`,
               getTestIds: (fmt: string) => [`btn-download-ora_dotplot-${db}-${fmt}`, `btn-download-ora_dotplot-${db}-${fmt.toUpperCase()}`]
             });

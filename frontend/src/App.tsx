@@ -1,4 +1,4 @@
-import { useReducer, useEffect } from "react";
+import { useReducer, useState, useEffect } from "react";
 import { Switch, Route, Router as WouterRouter } from "wouter";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 
@@ -30,12 +30,25 @@ function Router() {
   );
 }
 
-import { useState } from "react";
+import { Clock } from "lucide-react";
 import DiscardWarnModal from "./components/shared/DiscardWarnModal";
+import { idleManager } from "./lib/idleTimer";
 
 function AppShell() {
   const [state, dispatch] = useReducer(appReducer, initialState);
   const [pendingAction, setPendingAction] = useState<any>(null);
+  const [isIdleExpired, setIsIdleExpired] = useState(false);
+
+  useEffect(() => {
+    idleManager.init();
+    const unsubscribe = idleManager.onDisconnect(() => {
+      setIsIdleExpired(true);
+    });
+    return () => {
+      unsubscribe();
+      idleManager.destroy();
+    };
+  }, []);
 
   useEffect(() => {
     const handleCleanup = () => {
@@ -47,6 +60,33 @@ function AppShell() {
     return () => {
       window.removeEventListener("beforeunload", handleCleanup);
       window.removeEventListener("pagehide", handleCleanup);
+    };
+  }, []);
+
+  useEffect(() => {
+    const handleOutsideClick = (e: MouseEvent) => {
+      const openDetails = document.querySelectorAll("details[open]");
+      openDetails.forEach((details) => {
+        if (!details.contains(e.target as Node)) {
+          details.removeAttribute("open");
+        }
+      });
+    };
+
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        const openDetails = document.querySelectorAll("details[open]");
+        openDetails.forEach((details) => {
+          details.removeAttribute("open");
+        });
+      }
+    };
+
+    document.addEventListener("mousedown", handleOutsideClick);
+    document.addEventListener("keydown", handleKeyDown);
+    return () => {
+      document.removeEventListener("mousedown", handleOutsideClick);
+      document.removeEventListener("keydown", handleKeyDown);
     };
   }, []);
 
@@ -111,6 +151,38 @@ function AppShell() {
               onConfirm={handleConfirm}
               onCancel={handleCancel}
             />
+          )}
+          {isIdleExpired && (
+            <div style={{
+              position: "fixed", inset: 0, zIndex: 99999,
+              background: "rgba(15, 23, 42, 0.75)", backdropFilter: "blur(4px)",
+              display: "flex", alignItems: "center", justifyContent: "center", padding: 20
+            }}>
+              <div style={{
+                background: "#fff", borderRadius: 12, padding: "28px 24px", maxWidth: 440, width: "100%",
+                boxShadow: "0 20px 25px -5px rgb(0 0 0 / 0.1), 0 8px 10px -6px rgb(0 0 0 / 0.1)", textAlign: "center"
+              }}>
+                <div style={{ width: 48, height: 48, borderRadius: "50%", background: "hsl(38 92% 95%)", color: "hsl(38 92% 45%)", display: "inline-flex", alignItems: "center", justifyContent: "center", marginBottom: 16 }}>
+                  <Clock size={26} />
+                </div>
+                <h2 style={{ fontSize: 18, fontWeight: 700, color: "hsl(220 25% 10%)", marginBottom: 8 }}>Session Expired Due to Inactivity</h2>
+                <p style={{ fontSize: 13, color: "hsl(220 9% 46%)", lineHeight: 1.5, marginBottom: 20 }}>
+                  You have been disconnected from the server after 15 minutes of inactivity. All temporary session files have been securely cleared to protect your data and conserve server resources.
+                </p>
+                <button
+                  type="button"
+                  className="btn btn-primary"
+                  onClick={() => {
+                    sessionStorage.clear();
+                    localStorage.clear();
+                    window.location.replace(import.meta.env.BASE_URL);
+                  }}
+                  style={{ width: "100%", padding: "10px 16px", fontSize: 13, fontWeight: 600 }}
+                >
+                  Start New Session
+                </button>
+              </div>
+            </div>
           )}
         </TooltipProvider>
       </QueryClientProvider>

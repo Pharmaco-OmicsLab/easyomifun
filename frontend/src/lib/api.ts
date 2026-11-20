@@ -16,6 +16,21 @@ import type {
 // an alternate backend URL can be configured via VITE_SERVER_URL.
 export const SERVER_URL = (import.meta.env.VITE_SERVER_URL ?? "").replace(/\/$/, "");
 
+let activeJobsRunning = 0;
+export function isAnyJobExecuting(): boolean {
+  return activeJobsRunning > 0;
+}
+export function markJobStarted(): () => void {
+  activeJobsRunning++;
+  let finished = false;
+  return () => {
+    if (!finished) {
+      finished = true;
+      activeJobsRunning = Math.max(0, activeJobsRunning - 1);
+    }
+  };
+}
+
 export interface AnnotationAPIResponse {
   datasetId: string;
   total: number;
@@ -28,6 +43,7 @@ export interface AnnotationAPIResponse {
   columns?: string[];
   parsedData?: any[];
   sampleIds?: string[];
+  qc?: any;
 }
 
 export interface ProcessingAPIResponse {
@@ -40,6 +56,7 @@ export interface ProcessingAPIResponse {
   parsedData?: any[];
   columns?: string[];
   sampleIds?: string[];
+  qc?: any;
 }
 
 export interface PCAPoint {
@@ -103,7 +120,9 @@ export async function fetchMicroarrayPlatformsAPI(): Promise<any> {
 
 export async function annotateDatasetAPI(
   datasets: DatasetConfig[], 
-  config: AnnotationConfig
+  config: AnnotationConfig,
+  onProgress?: (info: { jobId: string; elapsed: number }) => void,
+  signal?: AbortSignal
 ): Promise<AnnotationAPIResponse[]> {
   const url = `${SERVER_URL}/api/annotation`;
   
@@ -132,10 +151,15 @@ export async function annotateDatasetAPI(
 
   console.log("Outgoing Request Payload to /api/annotation:", JSON.stringify(payload, null, 2));
   
-  return submitAndPollJob<AnnotationAPIResponse[]>(url, payload);
+  return submitAndPollJob<AnnotationAPIResponse[]>(url, payload, onProgress, signal);
 }
 
-export async function processDatasetAPI(datasets: DatasetConfig[], config: ProcessingConfig): Promise<any[]> {
+export async function processDatasetAPI(
+  datasets: DatasetConfig[],
+  config: ProcessingConfig,
+  onProgress?: (info: { jobId: string; elapsed: number }) => void,
+  signal?: AbortSignal
+): Promise<any[]> {
   const url = `${SERVER_URL}/api/processing`;
 
   const payload = datasets.map(d => {
@@ -164,51 +188,97 @@ export async function processDatasetAPI(datasets: DatasetConfig[], config: Proce
         if (useNA) break;
       }
     }
-    let filterMethod: any = config.filterMethod;
-    let varianceThreshold: any = config.varianceThreshold;
+    let filterMethod: any = "";
+    let varianceThreshold: any = null;
+    let readcountThreshold: any = null;
+    let abundanceSamplePercent: any = null;
+    let abundanceMethod: any = null;
+    let abundanceThreshold: any = null;
+    let cpmThreshold: any = null;
+    let minSamples: any = null;
 
     if (d.dataType === "readcounts") {
       if (d.isNormalized) {
-        filterMethod = config.normRcFilterMethod;
-        varianceThreshold = config.normRcVariance;
+        filterMethod = config.normRcFilterMethod || "";
+        abundanceMethod = config.normRcAbundanceMethod || "mean";
+        abundanceThreshold = config.normRcAbundanceThreshold ?? 10;
+        varianceThreshold = config.normRcVariance ?? 10;
       } else {
-        filterMethod = config.rcFilterMethod;
-        varianceThreshold = config.rcVariance;
+        filterMethod = config.rcFilterMethod || "";
+        cpmThreshold = config.cpmThreshold ?? 1;
+        minSamples = config.minSamples ?? 2;
+        readcountThreshold = config.rcReadcountThreshold ?? 10;
+        abundanceSamplePercent = config.rcSamplePercent ?? 50;
+        varianceThreshold = config.rcVariance ?? 10;
       }
     } else if (d.dataType === "microarray") {
-      filterMethod = config.maFilterMethod;
-      varianceThreshold = config.maVariance;
+      filterMethod = config.maFilterMethod || "";
+      abundanceMethod = config.maAbundanceMethod || "mean";
+      abundanceThreshold = config.maAbundanceThreshold ?? 10;
+      varianceThreshold = config.maVariance ?? 10;
     } else if (d.dataType === "proteomics") {
-      filterMethod = config.protFilterMethod;
-      varianceThreshold = config.protVariance;
+      filterMethod = config.protFilterMethod || "";
+      abundanceMethod = config.protAbundanceMethod || "mean";
+      abundanceThreshold = config.protAbundanceThreshold ?? 10;
+      varianceThreshold = config.protVariance ?? 10;
     } else if (d.dataType === "others") {
-      filterMethod = config.othFilterMethod;
-      varianceThreshold = config.othVariance;
+      filterMethod = config.othFilterMethod || "";
+      abundanceMethod = config.othAbundanceMethod || "mean";
+      abundanceThreshold = config.othAbundanceThreshold ?? 10;
+      varianceThreshold = config.othVariance ?? 10;
     }
 
     const methodsList = (filterMethod || "").split(",").map((m: any) => m.trim());
+    const isRawRc = d.dataType === "readcounts" && !d.isNormalized;
 
     return {
       datasetId: d.id,
       name: d.name,
+      dataType: d.dataType,
+      isNormalized: !!d.isNormalized,
       filterMethod: filterMethod,
       filterParams: {
-        cpmThreshold: methodsList.includes("cpm") ? config.cpmThreshold : null,
-        minSamples: methodsList.includes("cpm") ? config.minSamples : null,
-        countThreshold: methodsList.includes("min_count") ? config.countThreshold : null,
+        cpmThreshold: methodsList.includes("cpm") ? cpmThreshold : null,
+        minSamples: methodsList.includes("cpm") ? minSamples : null,
+        readcountThreshold: (isRawRc && methodsList.includes("abundance")) ? readcountThreshold : null,
+        abundanceSamplePercent: (isRawRc && methodsList.includes("abundance")) ? abundanceSamplePercent : null,
+        abundanceMethod: (!isRawRc && methodsList.includes("abundance")) ? abundanceMethod : null,
+        abundanceThreshold: (!isRawRc && methodsList.includes("abundance")) ? abundanceThreshold : null,
         varianceThreshold: methodsList.includes("variance") ? varianceThreshold : null,
       },
       missingMethod: useNA ? config.missingMethod : null,
       missingParams: useNA ? { knnK: config.knnK } : null,
       naRemovePercent: useNA ? config.naRemovePercent : null,
-      isNA: useNA,
-      dataType: d.dataType
+      isNA: useNA
     };
   });
-  return submitAndPollJob<any[]>(url, payload);
+  return submitAndPollJob<any[]>(url, payload, onProgress, signal);
 }
 
-export async function normalizeDatasetAPI(datasets: DatasetConfig[], config: NormalizationConfig): Promise<any[]> {
+export async function fetchPreProcessingQCAPI(
+  datasets: DatasetConfig[],
+  onProgress?: (info: { jobId: string; elapsed: number }) => void,
+  signal?: AbortSignal
+): Promise<any[]> {
+  const url = `${SERVER_URL}/api/pre-processing-qc`;
+  const payload = {
+    datasets: datasets.map(d => ({
+      id: d.id,
+      datasetId: d.id,
+      name: d.name,
+      dataType: d.dataType,
+      isNormalized: !!d.isNormalized
+    }))
+  };
+  return submitAndPollJob<any[]>(url, payload, onProgress, signal);
+}
+
+export async function normalizeDatasetAPI(
+  datasets: DatasetConfig[],
+  config: NormalizationConfig,
+  onProgress?: (info: { jobId: string; elapsed: number }) => void,
+  signal?: AbortSignal
+): Promise<any[]> {
   const url = `${SERVER_URL}/api/normalization`;
   const payload = datasets.map(d => {
     const isAffyMicroarray = d.dataType === "microarray" && d.platform === "affymetrix";
@@ -227,15 +297,21 @@ export async function normalizeDatasetAPI(datasets: DatasetConfig[], config: Nor
       priorCount: config.priorCount
     };
   });
-  return submitAndPollJob<any[]>(url, payload);
+  return submitAndPollJob<any[]>(url, payload, onProgress, signal);
 }
 
-export async function fetchPCAResultsAPI(datasets: DatasetConfig[]): Promise<PCAPoint[]> {
+export async function fetchPCAResultsAPI(
+  datasets: DatasetConfig[],
+  onProgress?: (info: { jobId: string; elapsed: number }) => void,
+  signal?: AbortSignal
+): Promise<any[]> {
   const url = `${SERVER_URL}/api/pca`;
   const payload = {
     datasets: datasets.map(d => ({
       id: d.id,
       name: d.name,
+      dataType: d.dataType,
+      isNormalized: !!d.isNormalized,
       isInline: d.isInline ?? false,
       parentModule: d.parentModule || undefined,
       parentDatasetId: d.parentDatasetId || undefined,
@@ -248,10 +324,15 @@ export async function fetchPCAResultsAPI(datasets: DatasetConfig[]): Promise<PCA
     }))
   };
 
-  return submitAndPollJob<PCAPoint[]>(url, payload);
+  return submitAndPollJob<any[]>(url, payload, onProgress, signal);
 }
 
-export async function runBatchCorrectionAPI(datasets: DatasetConfig[], config: BatchConfig): Promise<PCAPoint[]> {
+export async function runBatchCorrectionAPI(
+  datasets: DatasetConfig[],
+  config: BatchConfig,
+  onProgress?: (info: { jobId: string; elapsed: number }) => void,
+  signal?: AbortSignal
+): Promise<any[]> {
   const url = `${SERVER_URL}/api/batch-correction`;
   const payload = datasets.map(d => {
     const methodToUse = d.dataType === "readcounts" ? config.method : config.methodOthers;
@@ -272,7 +353,7 @@ export async function runBatchCorrectionAPI(datasets: DatasetConfig[], config: B
       negativeClass: d.fs_negativeClass || d.negativeClass || ""
     };
   });
-  return submitAndPollJob<PCAPoint[]>(url, payload);
+  return submitAndPollJob<PCAPoint[]>(url, payload, onProgress, signal);
 }
 
 export interface TrainingResponse {
@@ -397,47 +478,52 @@ export async function runFeatureSelectionAPI(
     }
   );
 
-  // 2. Poll status until complete or failed (1-hour timeout limit)
-  const pollUrl = `${SERVER_URL}/api/feature-selection-job?id=${encodeURIComponent(submit.jobId)}`;
-  const startedAt = Date.now();
-  const MAX_MS = 60 * 60 * 1000;
-  let attempt = 0;
+  const jobDone = markJobStarted();
+  try {
+    // 2. Poll status until complete or failed (1-hour timeout limit)
+    const pollUrl = `${SERVER_URL}/api/feature-selection-job?id=${encodeURIComponent(submit.jobId)}`;
+    const startedAt = Date.now();
+    const MAX_MS = 60 * 60 * 1000;
+    let attempt = 0;
 
-  // eslint-disable-next-line no-constant-condition
-  while (true) {
-    const res = await safeFetch<{ status: string; result?: TrainingResponse; message?: string; elapsed?: number; progress?: { current?: number; total?: number; model?: string } }>(
-      pollUrl,
-      { method: "GET", headers: {} }
-    );
+    // eslint-disable-next-line no-constant-condition
+    while (true) {
+      const res = await safeFetch<{ status: string; result?: TrainingResponse; message?: string; elapsed?: number; progress?: { current?: number; total?: number; model?: string } }>(
+        pollUrl,
+        { method: "GET", headers: {} }
+      );
 
-    if (res.status === "done") {
-      if (!res.result) throw new Error("Feature selection finished but returned no result.");
-      const finalResult = res.result as any;
-      finalResult.jobId = submit.jobId;
-      return finalResult;
+      if (res.status === "done") {
+        if (!res.result) throw new Error("Feature selection finished but returned no result.");
+        const finalResult = res.result as any;
+        finalResult.jobId = submit.jobId;
+        return finalResult;
+      }
+
+      if (res.status === "error") {
+        throw new Error(res.message || "Feature selection job failed.");
+      }
+
+      if (onProgress) {
+        onProgress({
+          jobId: submit.jobId,
+          elapsed: res.elapsed ?? Math.floor((Date.now() - startedAt) / 1000),
+          current: res.progress?.current,
+          total: res.progress?.total,
+          model: res.progress?.model
+        });
+      }
+
+      if (Date.now() - startedAt > MAX_MS) {
+        throw new Error("Feature selection timed out.");
+      }
+
+      attempt++;
+      const pollMs = attempt <= 1 ? 200 : (attempt === 2 ? 400 : (attempt === 3 ? 800 : (attempt === 4 ? 1200 : 1500)));
+      await new Promise(r => setTimeout(r, pollMs));
     }
-
-    if (res.status === "error") {
-      throw new Error(res.message || "Feature selection job failed.");
-    }
-
-    if (onProgress) {
-      onProgress({
-        jobId: submit.jobId,
-        elapsed: res.elapsed ?? Math.floor((Date.now() - startedAt) / 1000),
-        current: res.progress?.current,
-        total: res.progress?.total,
-        model: res.progress?.model
-      });
-    }
-
-    if (Date.now() - startedAt > MAX_MS) {
-      throw new Error("Feature selection timed out.");
-    }
-
-    attempt++;
-    const pollMs = attempt <= 1 ? 200 : (attempt === 2 ? 400 : (attempt === 3 ? 800 : (attempt === 4 ? 1200 : 1500)));
-    await new Promise(r => setTimeout(r, pollMs));
+  } finally {
+    jobDone();
   }
 }
 
@@ -448,7 +534,8 @@ export async function runInlineFSAPI(
   parameters?: Record<string, Record<string, string | number | null>>,
   maxFeaturesSelect?: number,
   onProgress?: (info: FSProgress) => void,
-  multiDatasetMode: "individual" | "combine" = "combine"
+  multiDatasetMode: "individual" | "combine" = "combine",
+  signal?: AbortSignal
 ): Promise<TrainingResponse> {
   const modelsPayload: Record<string, { model: string; parameters: Record<string, string | number> }> = {};
   models.forEach(m => {
@@ -494,9 +581,22 @@ export async function runInlineFSAPI(
     {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload)
+      body: JSON.stringify(payload),
+      signal
     }
   );
+
+  if (onProgress) {
+    onProgress({
+      jobId: submit.jobId,
+      elapsed: 0
+    });
+  }
+
+  const abortHandler = () => {
+    cancelFSJobAPI(submit.jobId, true);
+  };
+  signal?.addEventListener("abort", abortHandler, { once: true });
 
   // 2. Poll until done or error (1-hour timeout)
   const pollUrl = `${SERVER_URL}/api/inline-fs-job?id=${encodeURIComponent(submit.jobId)}`;
@@ -504,48 +604,70 @@ export async function runInlineFSAPI(
   const MAX_MS = 60 * 60 * 1000;
   let attempt = 0;
 
-  // eslint-disable-next-line no-constant-condition
-  while (true) {
-    const res = await safeFetch<{ status: string; result?: TrainingResponse; message?: string; elapsed?: number; progress?: { current?: number; total?: number; model?: string } }>(
-      pollUrl,
-      { method: "GET", headers: {} }
-    );
+  const jobDone = markJobStarted();
+  try {
+    // eslint-disable-next-line no-constant-condition
+    while (true) {
+      if (signal?.aborted) {
+        throw new DOMException("Aborted", "AbortError");
+      }
 
-    if (res.status === "done") {
-      if (!res.result) throw new Error("Inline feature selection finished but returned no result.");
-      const finalResult = res.result as any;
-      finalResult.jobId = submit.jobId;
-      return finalResult;
-    }
+      const res = await safeFetch<{ status: string; result?: TrainingResponse; message?: string; elapsed?: number; progress?: { current?: number; total?: number; model?: string } }>(
+        pollUrl,
+        { method: "GET", headers: {}, signal }
+      );
 
-    if (res.status === "error") {
-      throw new Error(res.message || "Inline feature selection job failed.");
-    }
+      if (res.status === "done") {
+        if (!res.result) throw new Error("Inline feature selection finished but returned no result.");
+        const finalResult = res.result as any;
+        finalResult.jobId = submit.jobId;
+        return finalResult;
+      }
 
-    if (onProgress) {
-      onProgress({
-        jobId: submit.jobId,
-        elapsed: res.elapsed ?? Math.floor((Date.now() - startedAt) / 1000),
-        current: res.progress?.current,
-        total: res.progress?.total,
-        model: res.progress?.model
+      if (res.status === "error") {
+        throw new Error(res.message || "Inline feature selection job failed.");
+      }
+
+      if (onProgress) {
+        onProgress({
+          jobId: submit.jobId,
+          elapsed: res.elapsed ?? Math.floor((Date.now() - startedAt) / 1000),
+          current: res.progress?.current,
+          total: res.progress?.total,
+          model: res.progress?.model
+        });
+      }
+
+      if (Date.now() - startedAt > MAX_MS) {
+        throw new Error("Inline feature selection timed out.");
+      }
+
+      attempt++;
+      const pollMs = attempt <= 1 ? 200 : (attempt === 2 ? 400 : (attempt === 3 ? 800 : (attempt === 4 ? 1200 : 1500)));
+      await new Promise((resolve, reject) => {
+        const timer = setTimeout(resolve, pollMs);
+        if (signal) {
+          signal.addEventListener("abort", () => {
+            clearTimeout(timer);
+            reject(new DOMException("Aborted", "AbortError"));
+          }, { once: true });
+        }
       });
     }
-
-    if (Date.now() - startedAt > MAX_MS) {
-      throw new Error("Inline feature selection timed out.");
+  } finally {
+    jobDone();
+    if (signal) {
+      signal.removeEventListener("abort", abortHandler);
     }
-
-    attempt++;
-    const pollMs = attempt <= 1 ? 200 : (attempt === 2 ? 400 : (attempt === 3 ? 800 : (attempt === 4 ? 1200 : 1500)));
-    await new Promise(r => setTimeout(r, pollMs));
   }
 }
 
 // ─── Inline Analysis APIs ─────────────────────────────────────────────────────
 export async function runInlineDEAPI(
   datasets: DatasetConfig[],
-  config: DEConfig
+  config: DEConfig,
+  onProgress?: (info: { jobId: string; elapsed: number }) => void,
+  signal?: AbortSignal
 ): Promise<Record<string, DEResult[]>> {
   const url = `${SERVER_URL}/api/inline-de`;
   const payload = datasets.map(d => {
@@ -572,7 +694,7 @@ export async function runInlineDEAPI(
     };
   });
   console.log("Outgoing Request Payload to /api/inline-de:", JSON.stringify(payload, null, 2));
-  return submitAndPollJob<Record<string, DEResult[]>>(url, payload);
+  return submitAndPollJob<Record<string, DEResult[]>>(url, payload, onProgress, signal);
 }
 
 export async function runInlineDEMetaAPI(
@@ -584,7 +706,9 @@ export async function runInlineDEMetaAPI(
     pValueThreshold?: number | string | null;
     logFcThreshold?: number | string | null;
   } = {},
-  datasets: DatasetConfig[] = []
+  datasets: DatasetConfig[] = [],
+  onProgress?: (info: { jobId: string; elapsed: number }) => void,
+  signal?: AbortSignal
 ): Promise<any> {
   const url = `${SERVER_URL}/api/inline-de-meta`;
   const payload = datasets.map(d => ({
@@ -606,16 +730,16 @@ export async function runInlineDEMetaAPI(
     de_comparisonGroup: d.de_comparisonGroup || d.comparisonGroup || ""
   }));
   console.log("Outgoing Request Payload to /api/inline-de-meta:", JSON.stringify(payload, null, 2));
-  return submitAndPollJob<any>(url, payload);
+  return submitAndPollJob<any>(url, payload, onProgress, signal);
 }
-
-
 
 export async function refitFeaturesAPI(
   jobId: string,
   selectionMethod: "breakoff" | "percentage" | "max_features" | "overlap",
   percentageValue?: number | null | string,
-  maxFeaturesValue?: number | null | string
+  maxFeaturesValue?: number | null | string,
+  onProgress?: (info: { jobId: string; elapsed: number }) => void,
+  signal?: AbortSignal
 ): Promise<TrainingResponse> {
   const url = `${SERVER_URL}/api/refit-features`;
   const isPct = selectionMethod === "percentage";
@@ -630,7 +754,7 @@ export async function refitFeaturesAPI(
     percentageValue: pctToSend,
     maxFeaturesValue: maxToSend
   };
-  return submitAndPollJob<TrainingResponse>(url, payload);
+  return submitAndPollJob<TrainingResponse>(url, payload, onProgress, signal);
 }
 
 export async function runInlineEAAPI(
@@ -640,7 +764,9 @@ export async function runInlineEAAPI(
   datasetId?: string,
   geneIdType?: string,
   direction?: string,
-  datasets?: { id: string; dataType?: string; name?: string; parentModule?: string; module?: string; isInline?: boolean }[]
+  datasets?: { id: string; dataType?: string; name?: string; parentModule?: string; module?: string; isInline?: boolean }[],
+  onProgress?: (info: { jobId: string; elapsed: number }) => void,
+  signal?: AbortSignal
 ): Promise<{
   oraResults?: any[];
   gseaResults?: any[];
@@ -686,14 +812,19 @@ export async function runInlineEAAPI(
     unmappedGenes?: string[];
     totalInputGenes?: number;
     mappedGenesCount?: number;
-  }>(url, payload);
+  }>(url, payload, onProgress, signal);
 }
 
 // ─── General purposes APIs ─────────────────────────────────────────────────────
-export async function redoStepAPI(step: string, datasetIds: string[]): Promise<any> {
+export async function redoStepAPI(
+  step: string,
+  datasetIds: string[],
+  onProgress?: (info: { jobId: string; elapsed: number }) => void,
+  signal?: AbortSignal
+): Promise<any> {
   const url = `${SERVER_URL}/api/redo`;
   const payload = { step, datasetIds };
-  return submitAndPollJob<any>(url, payload);
+  return submitAndPollJob<any>(url, payload, onProgress, signal);
 }
 
 export async function clearDownstreamAPI(step: string, datasetIds: string[]): Promise<any> {
@@ -705,14 +836,15 @@ export async function clearDownstreamAPI(step: string, datasetIds: string[]): Pr
   });
 }
 
-export async function skipStepAPI(step: string, datasetIds: string[]): Promise<any> {
+export async function skipStepAPI(
+  step: string,
+  datasetIds: string[],
+  onProgress?: (info: { jobId: string; elapsed: number }) => void,
+  signal?: AbortSignal
+): Promise<any> {
   const url = `${SERVER_URL}/api/skip`;
   const payload = { step, datasetIds };
-  return safeFetch<any>(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload)
-  });
+  return submitAndPollJob<any>(url, payload, onProgress, signal);
 }
 
 export async function clearAllResultsAPI(): Promise<any> {
@@ -723,7 +855,11 @@ export async function clearAllResultsAPI(): Promise<any> {
   });
 }
 
-export async function uploadRawDatasetDataAPI(datasets: DatasetConfig[]): Promise<any> {
+export async function uploadRawDatasetDataAPI(
+  datasets: DatasetConfig[],
+  onProgress?: (info: { jobId: string; elapsed: number }) => void,
+  signal?: AbortSignal
+): Promise<any> {
   const url = `${SERVER_URL}/api/upload-datasets`;
   const payload = {
     datasets: datasets.map(d => {
@@ -738,6 +874,7 @@ export async function uploadRawDatasetDataAPI(datasets: DatasetConfig[]): Promis
         // Direct local file path (Desktop Electron mode only)
         expressionFilePath: exprUnchanged ? undefined : d.expressionFilePath,
         clinicalFilePath: clinUnchanged ? undefined : d.clinicalFilePath,
+        celFolderPath: exprUnchanged ? undefined : d.celFolderPath,
         // Chunk upload ID (Web mode chunked upload)
         expressionUploadId: exprUnchanged ? undefined : d.expressionUploadId,
         clinicalUploadId: clinUnchanged ? undefined : d.clinicalUploadId,
@@ -751,6 +888,8 @@ export async function uploadRawDatasetDataAPI(datasets: DatasetConfig[]): Promis
         geneInfoCols: d.geneInfoCols || [],
         geneIdCol: d.geneIdCol || "",
         geneIdType: d.geneIdType || "",
+        detectionPvalCols: d.detectionPvalCols || [],
+        detectionPvalPrefix: d.detectionPvalPrefix || "",
         // clinical data
         clinicalColumns: d.clinicalColumns || [],
         clinicalParsedData: clinUnchanged ? [] : (d.clinicalFilePath || d.clinicalUploadId ? [] : (d.clinicalRawText ? [] : (d.clinicalParsedData || []))),
@@ -768,10 +907,14 @@ export async function uploadRawDatasetDataAPI(datasets: DatasetConfig[]): Promis
       };
     })
   };
-  return submitAndPollJob<any>(url, payload);
+  return submitAndPollJob<any>(url, payload, onProgress, signal);
 }
 
-export async function uploadDEDatasetDataAPI(datasets: DatasetConfig[]): Promise<any> {
+export async function uploadDEDatasetDataAPI(
+  datasets: DatasetConfig[],
+  onProgress?: (info: { jobId: string; elapsed: number }) => void,
+  signal?: AbortSignal
+): Promise<any> {
   const url = `${SERVER_URL}/api/upload-datasets`;
   const payload = {
     datasets: datasets.map(d => {
@@ -786,6 +929,7 @@ export async function uploadDEDatasetDataAPI(datasets: DatasetConfig[]): Promise
         // Direct local file path (Desktop Electron mode only)
         expressionFilePath: exprUnchanged ? undefined : d.expressionFilePath,
         clinicalFilePath: clinUnchanged ? undefined : d.clinicalFilePath,
+        celFolderPath: exprUnchanged ? undefined : d.celFolderPath,
         // Chunk upload ID (Web mode chunked upload)
         expressionUploadId: exprUnchanged ? undefined : d.expressionUploadId,
         clinicalUploadId: clinUnchanged ? undefined : d.clinicalUploadId,
@@ -799,6 +943,8 @@ export async function uploadDEDatasetDataAPI(datasets: DatasetConfig[]): Promise
         geneInfoCols: d.geneInfoCols || [],
         geneIdCol: d.geneIdCol || "",
         geneIdType: d.geneIdType || "",
+        detectionPvalCols: d.detectionPvalCols || [],
+        detectionPvalPrefix: d.detectionPvalPrefix || "",
         // clinical data
         clinicalColumns: d.clinicalColumns || [],
         clinicalParsedData: clinUnchanged ? [] : (d.clinicalFilePath || d.clinicalUploadId ? [] : (d.clinicalRawText ? [] : (d.clinicalParsedData || []))),
@@ -812,7 +958,7 @@ export async function uploadDEDatasetDataAPI(datasets: DatasetConfig[]): Promise
       };
     })
   };
-  return submitAndPollJob<any>(url, payload);
+  return submitAndPollJob<any>(url, payload, onProgress, signal);
 }
 
 export async function clearDatasetAPI(datasetId: string, scope: "expression" | "clinical"): Promise<any> {
@@ -835,7 +981,9 @@ export async function supplementClinicalDataAPI(
   clinicalFilePath?: string,
   clinicalUploadId?: string,
   positiveClass?: string,
-  negativeClass?: string
+  negativeClass?: string,
+  onProgress?: (info: { jobId: string; elapsed: number }) => void,
+  signal?: AbortSignal
 ): Promise<any> {
   const url = `${SERVER_URL}/api/supplement-clinical`;
   const payload = {
@@ -855,10 +1003,14 @@ export async function supplementClinicalDataAPI(
     fs_negativeClass: negativeClass || ""
   };
   console.log("Outgoing Request Payload to /api/supplement-clinical:", JSON.stringify(payload, null, 2));
-  return submitAndPollJob<any>(url, payload);
+  return submitAndPollJob<any>(url, payload, onProgress, signal);
 }
 
-export async function uploadFSDatasetsAPI(datasets: DatasetConfig[]): Promise<any> {
+export async function uploadFSDatasetsAPI(
+  datasets: DatasetConfig[],
+  onProgress?: (info: { jobId: string; elapsed: number }) => void,
+  signal?: AbortSignal
+): Promise<any> {
   const url = `${SERVER_URL}/api/upload-datasets`;
   const payload = {
     datasets: datasets.map(d => {
@@ -873,6 +1025,7 @@ export async function uploadFSDatasetsAPI(datasets: DatasetConfig[]): Promise<an
         // Direct local file path (Desktop Electron mode only)
         expressionFilePath: exprUnchanged ? undefined : d.expressionFilePath,
         clinicalFilePath: clinUnchanged ? undefined : d.clinicalFilePath,
+        celFolderPath: exprUnchanged ? undefined : d.celFolderPath,
         // Chunk upload ID (Web mode chunked upload)
         expressionUploadId: exprUnchanged ? undefined : d.expressionUploadId,
         clinicalUploadId: clinUnchanged ? undefined : d.clinicalUploadId,
@@ -886,6 +1039,8 @@ export async function uploadFSDatasetsAPI(datasets: DatasetConfig[]): Promise<an
         geneInfoCols: d.geneInfoCols || [],
         geneIdCol: d.geneIdCol || "",
         geneIdType: d.geneIdType || "",
+        detectionPvalCols: d.detectionPvalCols || [],
+        detectionPvalPrefix: d.detectionPvalPrefix || "",
         // clinical data
         clinicalColumns: d.clinicalColumns || [],
         clinicalParsedData: clinUnchanged ? [] : (d.clinicalFilePath || d.clinicalUploadId ? [] : (d.clinicalRawText ? [] : (d.clinicalParsedData || []))),
@@ -901,7 +1056,7 @@ export async function uploadFSDatasetsAPI(datasets: DatasetConfig[]): Promise<an
         fs_positiveClass: d.fs_positiveClass || d.positiveClass || "",
         fs_negativeClass: d.fs_negativeClass || d.negativeClass || "",
         // FS-specific parameters
-        featureOrientation: d.fs_featuresOrientation || "",
+        featureOrientation: "column",
         featureIndexValue: d.fs_featureIndexValue !== undefined ? d.fs_featureIndexValue : 0,
         datasetPurpose: d.fs_datasetPurpose || "",
         isInternalValidation: d.fs_isInternalValidation !== undefined ? d.fs_isInternalValidation : false,
@@ -910,10 +1065,14 @@ export async function uploadFSDatasetsAPI(datasets: DatasetConfig[]): Promise<an
       };
     })
   };
-  return submitAndPollJob<any>(url, payload);
+  return submitAndPollJob<any>(url, payload, onProgress, signal);
 }
 
-export async function uploadEADatasetDataAPI(datasets: DatasetConfig[]): Promise<any> {
+export async function uploadEADatasetDataAPI(
+  datasets: DatasetConfig[],
+  onProgress?: (info: { jobId: string; elapsed: number }) => void,
+  signal?: AbortSignal
+): Promise<any> {
   const url = `${SERVER_URL}/api/upload-datasets`;
   const payload = {
     datasets: datasets.map(d => {
@@ -950,7 +1109,7 @@ export async function uploadEADatasetDataAPI(datasets: DatasetConfig[]): Promise
       };
     })
   };
-  return submitAndPollJob<any>(url, payload);
+  return submitAndPollJob<any>(url, payload, onProgress, signal);
 }
 
 export interface DatasetInfoItem {
@@ -976,6 +1135,7 @@ export interface DatasetInfoResponse {
   status: string;
   datasets: Record<string, DatasetInfoItem>;
   sharedFeaturesCount: number;
+  sharedFeaturesByHierarchy?: Record<string, number>;
   sharedFeatures?: string[] | null;
 }
 
@@ -1127,17 +1287,32 @@ export async function cancelComputeJobAPI(jobId: string): Promise<void> {
 async function submitAndPollJob<T>(
   url: string,
   payload: unknown,
-  onProgress?: (info: { jobId: string; elapsed: number }) => void
+  onProgress?: (info: { jobId: string; elapsed: number }) => void,
+  signal?: AbortSignal
 ): Promise<T> {
+  const jobDone = markJobStarted();
   // 1. Submit the job
   const submit = await safeFetch<{ jobId: string; status: string }>(
     url,
     {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload)
+      body: JSON.stringify(payload),
+      signal
     }
   );
+
+  if (onProgress) {
+    onProgress({
+      jobId: submit.jobId,
+      elapsed: 0
+    });
+  }
+
+  const abortHandler = () => {
+    cancelComputeJobAPI(submit.jobId);
+  };
+  signal?.addEventListener("abort", abortHandler, { once: true });
 
   // 2. Poll status until complete or failed (1-hour timeout limit)
   const pollUrl = `${SERVER_URL}/api/compute-job?id=${encodeURIComponent(submit.jobId)}`;
@@ -1145,50 +1320,84 @@ async function submitAndPollJob<T>(
   const MAX_MS = 60 * 60 * 1000;
   let attempt = 0;
 
-  // eslint-disable-next-line no-constant-condition
-  while (true) {
-    const res = await safeFetch<{ status: string; result?: T; message?: string; elapsed?: number }>(
-      pollUrl,
-      { method: "GET", headers: {} }
-    );
-    if (res.status === "done") {
-      if (res.result === undefined || res.result === null) {
-        throw new Error(`Job finished but returned no result.`);
+  try {
+    // eslint-disable-next-line no-constant-condition
+    while (true) {
+      if (signal?.aborted) {
+        throw new DOMException("Aborted", "AbortError");
       }
-      return res.result;
-    }
-    if (res.status === "error") {
-      throw new Error(res.message || `Job failed.`);
-    }
-    if (onProgress) {
-      onProgress({
-        jobId: submit.jobId,
-        elapsed: res.elapsed ?? Math.floor((Date.now() - startedAt) / 1000)
+
+      const res = await safeFetch<{ status: string; result?: T; message?: string; elapsed?: number }>(
+        pollUrl,
+        { method: "GET", headers: {}, signal }
+      );
+      if (res.status === "done") {
+        if (res.result === undefined || res.result === null) {
+          throw new Error(`Job finished but returned no result.`);
+        }
+        return res.result;
+      }
+      if (res.status === "error") {
+        throw new Error(res.message || `Job failed.`);
+      }
+      if (onProgress) {
+        onProgress({
+          jobId: submit.jobId,
+          elapsed: res.elapsed ?? Math.floor((Date.now() - startedAt) / 1000)
+        });
+      }
+      if (Date.now() - startedAt > MAX_MS) {
+        throw new Error(`Job timed out.`);
+      }
+      attempt++;
+      const pollMs = attempt <= 1 ? 200 : (attempt === 2 ? 400 : (attempt === 3 ? 800 : (attempt === 4 ? 1200 : 1500)));
+      await new Promise((resolve, reject) => {
+        const timer = setTimeout(resolve, pollMs);
+        if (signal) {
+          signal.addEventListener("abort", () => {
+            clearTimeout(timer);
+            reject(new DOMException("Aborted", "AbortError"));
+          }, { once: true });
+        }
       });
     }
-    if (Date.now() - startedAt > MAX_MS) {
-      throw new Error(`Job timed out.`);
+  } finally {
+    jobDone();
+    if (signal) {
+      signal.removeEventListener("abort", abortHandler);
     }
-    attempt++;
-    const pollMs = attempt <= 1 ? 200 : (attempt === 2 ? 400 : (attempt === 3 ? 800 : (attempt === 4 ? 1200 : 1500)));
-    await new Promise(r => setTimeout(r, pollMs));
   }
 }
 
 async function runComputeJob<T>(
   kind: "meta" | "de",
   payload: unknown,
-  onProgress?: (info: { jobId: string; elapsed: number }) => void
+  onProgress?: (info: { jobId: string; elapsed: number }) => void,
+  signal?: AbortSignal
 ): Promise<T> {
+  const jobDone = markJobStarted();
   // 1. Submit the job
   const submit = await safeFetch<{ jobId: string; status: string }>(
     `${SERVER_URL}/api/compute-job`,
     {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ kind, payload })
+      body: JSON.stringify({ kind, payload }),
+      signal
     }
   );
+
+  if (onProgress) {
+    onProgress({
+      jobId: submit.jobId,
+      elapsed: 0
+    });
+  }
+
+  const abortHandler = () => {
+    cancelComputeJobAPI(submit.jobId);
+  };
+  signal?.addEventListener("abort", abortHandler, { once: true });
 
   // 2. Poll status until complete or failed (1-hour timeout limit)
   const pollUrl = `${SERVER_URL}/api/compute-job?id=${encodeURIComponent(submit.jobId)}`;
@@ -1196,33 +1405,52 @@ async function runComputeJob<T>(
   const MAX_MS = 60 * 60 * 1000;
   let attempt = 0;
 
-  // eslint-disable-next-line no-constant-condition
-  while (true) {
-    const res = await safeFetch<{ status: string; result?: T; message?: string; elapsed?: number }>(
-      pollUrl,
-      { method: "GET", headers: {} }
-    );
-    if (res.status === "done") {
-      if (res.result === undefined || res.result === null) {
-        throw new Error(`${kind} job finished but returned no result.`);
+  try {
+    // eslint-disable-next-line no-constant-condition
+    while (true) {
+      if (signal?.aborted) {
+        throw new DOMException("Aborted", "AbortError");
       }
-      return res.result;
-    }
-    if (res.status === "error") {
-      throw new Error(res.message || `${kind} job failed.`);
-    }
-    if (onProgress) {
-      onProgress({
-        jobId: submit.jobId,
-        elapsed: res.elapsed ?? Math.floor((Date.now() - startedAt) / 1000)
+
+      const res = await safeFetch<{ status: string; result?: T; message?: string; elapsed?: number }>(
+        pollUrl,
+        { method: "GET", headers: {}, signal }
+      );
+      if (res.status === "done") {
+        if (res.result === undefined || res.result === null) {
+          throw new Error(`${kind} job finished but returned no result.`);
+        }
+        return res.result;
+      }
+      if (res.status === "error") {
+        throw new Error(res.message || `${kind} job failed.`);
+      }
+      if (onProgress) {
+        onProgress({
+          jobId: submit.jobId,
+          elapsed: res.elapsed ?? Math.floor((Date.now() - startedAt) / 1000)
+        });
+      }
+      if (Date.now() - startedAt > MAX_MS) {
+        throw new Error(`${kind} job timed out.`);
+      }
+      attempt++;
+      const pollMs = attempt <= 1 ? 200 : (attempt === 2 ? 400 : (attempt === 3 ? 800 : (attempt === 4 ? 1200 : 1500)));
+      await new Promise((resolve, reject) => {
+        const timer = setTimeout(resolve, pollMs);
+        if (signal) {
+          signal.addEventListener("abort", () => {
+            clearTimeout(timer);
+            reject(new DOMException("Aborted", "AbortError"));
+          }, { once: true });
+        }
       });
     }
-    if (Date.now() - startedAt > MAX_MS) {
-      throw new Error(`${kind} job timed out.`);
+  } finally {
+    jobDone();
+    if (signal) {
+      signal.removeEventListener("abort", abortHandler);
     }
-    attempt++;
-    const pollMs = attempt <= 1 ? 200 : (attempt === 2 ? 400 : (attempt === 3 ? 800 : (attempt === 4 ? 1200 : 1500)));
-    await new Promise(r => setTimeout(r, pollMs));
   }
 }
 
@@ -1230,7 +1458,8 @@ async function runComputeJob<T>(
 export async function runDifferentialExpressionAPI(
   datasets: DatasetConfig[],
   config: DEConfig,
-  onProgress?: (info: { jobId: string; elapsed: number }) => void
+  onProgress?: (info: { jobId: string; elapsed: number }) => void,
+  signal?: AbortSignal
 ): Promise<Record<string, DEResult[]>> {
   const payload = datasets.map(d => {
     // Determine the method per dataset based on normalization/data type
@@ -1254,7 +1483,7 @@ export async function runDifferentialExpressionAPI(
 
   console.log("Outgoing Request Payload to /api/compute-job (kind=de):", JSON.stringify(payload, null, 2));
 
-  return runComputeJob<Record<string, DEResult[]>>("de", payload, onProgress);
+  return runComputeJob<Record<string, DEResult[]>>("de", payload, onProgress, signal);
 }
 
 
@@ -1268,7 +1497,8 @@ export async function runMetaAnalysisAPI(
     logFcThreshold?: number | string | null;
   } = {},
   datasets: DatasetConfig[] = [],
-  onProgress?: (info: { jobId: string; elapsed: number }) => void
+  onProgress?: (info: { jobId: string; elapsed: number }) => void,
+  signal?: AbortSignal
 ): Promise<any> {
   const payload = datasets.map(d => ({
     datasetId: d.id || "",
@@ -1286,7 +1516,7 @@ export async function runMetaAnalysisAPI(
     de_comparisonGroup: d.de_comparisonGroup || d.comparisonGroup || ""
   }));
   console.log("Outgoing Request Payload to /api/compute-job (kind=meta):", JSON.stringify(payload, null, 2));
-  return runComputeJob<any>("meta", payload, onProgress);
+  return runComputeJob<any>("meta", payload, onProgress, signal);
 }
 
 // ─── FS Module APIs ─────────────────────────────────────────────────────
@@ -1321,7 +1551,9 @@ export async function runCrossValidationAPI(
   method: CVMethod,
   folds: number,
   datasets: DatasetConfig[],
-  multiDatasetMode: "individual" | "combine" = "combine"
+  multiDatasetMode: "individual" | "combine" = "combine",
+  onProgress?: (info: { jobId: string; elapsed: number }) => void,
+  signal?: AbortSignal
 ): Promise<CVResult[]> {
   const url = `${SERVER_URL}/api/cross-validation`;
   const payload = {
@@ -1354,7 +1586,7 @@ export async function runCrossValidationAPI(
   };
   
   console.log("Outgoing Request Payload to /api/cross-validation:", JSON.stringify(payload, null, 2));
-  return submitAndPollJob<CVResult[]>(url, payload);
+  return submitAndPollJob<CVResult[]>(url, payload, onProgress, signal);
 }
 
 export interface TestingResult {
@@ -1412,7 +1644,9 @@ export async function runTestingAPI(
 // ─── EA Module APIs ─────────────────────────────────────────────────────
 export async function runEnrichmentAnalysisAPI(
   config: EnrichmentConfig,
-  datasetId?: string
+  datasetId?: string,
+  onProgress?: (info: { jobId: string; elapsed: number }) => void,
+  signal?: AbortSignal
 ): Promise<{ oraResults?: any[]; gseaResults?: any[] }> {
   const url = `${SERVER_URL}/api/ea`;
   const methods = config.methods || ["ora"];
@@ -1428,5 +1662,66 @@ export async function runEnrichmentAnalysisAPI(
     maxGeneSetSize: config.maxGeneSetSize !== undefined && config.maxGeneSetSize !== null ? config.maxGeneSetSize : 500,
     organism: config.organism || ""
   };
-  return submitAndPollJob<{ oraResults?: any[]; gseaResults?: any[] }>(url, payload);
+  return submitAndPollJob<{ oraResults?: any[]; gseaResults?: any[] }>(url, payload, onProgress, signal);
+}
+
+/**
+ * Triggers export job and polls until complete, returning the blob and standardized filename.
+ */
+export async function downloadExportFileAPI(
+  userId: string,
+  type: string,
+  dsId: string,
+  ext: string,
+  model?: string
+): Promise<{ blob: Blob; filename: string }> {
+  const payload: any = {
+    userId,
+    type,
+    dsId,
+    ext: ext.toLowerCase(),
+  };
+  if (model) payload.model = model;
+
+  const postRes = await fetch(`${SERVER_URL}/api/export-job`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+
+  if (!postRes.ok) {
+    let msg = `Failed to start export job (${postRes.status})`;
+    try {
+      const err = await postRes.json();
+      if (err?.message) msg = err.message;
+    } catch (_) {}
+    throw new Error(msg);
+  }
+
+  const { jobId } = await postRes.json();
+  if (!jobId) throw new Error("No export jobId returned.");
+
+  const maxAttempts = 120;
+  for (let i = 0; i < maxAttempts; i++) {
+    await new Promise((r) => setTimeout(r, 1000));
+    const res = await fetch(`${SERVER_URL}/api/export-job?id=${encodeURIComponent(jobId)}`);
+    const ct = res.headers.get("Content-Type") || "";
+
+    if (res.ok) {
+      if (ct.includes("application/json")) {
+        const json = await res.json();
+        if (json.status === "running") continue;
+        if (json.status === "error" || json.status === "failed") throw new Error(json.message || "Export job failed");
+      } else {
+        const blob = await res.blob();
+        const disposition = res.headers.get("Content-Disposition") || "";
+        const match = disposition.match(/filename="?([^"]+)"?/);
+        const filename = match ? match[1] : `${type}.${ext}`;
+        return { blob, filename };
+      }
+    } else {
+      throw new Error(`Export polling failed (${res.status})`);
+    }
+  }
+  throw new Error("Export job timed out.");
 }

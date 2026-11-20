@@ -1,200 +1,477 @@
 import { useLocation } from "wouter";
-import { MonitorCog, BarChart2, Search, ChartNoAxesCombined } from "lucide-react";
+import { MonitorCog, BarChart2, Search, ChartNoAxesCombined, BookOpen, X } from "lucide-react";
+import { useState, useEffect } from "react";
 import PlotFootnote from "../components/shared/PlotFootnote";
 import { useAppStore } from "../store/appStore";
 import ReloadButton from "../components/shared/ReloadButton";
+import QuickStartGuideModal, { type GuideModuleId } from "../components/shared/QuickStartGuideModal";
 
+// Independent analysis modules and suites
 const modules = [
   {
     id: "feature-selection",
+    path: "/feature-selection",
     href: "/feature-selection",
-    icon: Search,
+    testId: "card-feature-selection",
+    badge: "Standalone Workbench",
+    badgeColor: "#b45309",
+    badgeBg: "#fef3c7",
+    title: "Feature Selection (FS)",
     label: "Feature Selection",
-    description: "Apply supervised ML models (Logistic, SVM, RF, GBM) to identify the most informative features.",
-    bg: "#eef2ff",
-    border: "#fde68a",
-    accent: "#f59e0b",
+    description: "Supervised machine learning biomarker panel discovery with STABL, Boruta, RF, GBM, SVM, and Logistic Regression.",
+    icon: Search,
+    submodules: [
+      "6 Supervised ML Classifiers",
+      "K-Fold CV & External Validation",
+      "ROC & Classification Metrics",
+    ],
   },
   {
     id: "de-analysis",
+    path: "/de-analysis",
     href: "/de-analysis",
-    icon: BarChart2,
+    testId: "card-de-analysis",
+    badge: "Independent Analysis Suite",
+    badgeColor: "#0369a1",
+    badgeBg: "#e0f2fe",
+    title: "DE Analysis",
     label: "Differential Expression Analysis",
-    description: "Identify differentially expressed genes between conditions. Supports multi-dataset meta-analysis with volcano and MA plots.",
-    bg: "#eef2ff",
-    border: "#a7f3d0",
-    accent: "#10b981",
+    description: "Statistical differential expression testing on pre-normalized matrices with interactive volcano plots and multi-cohort meta-analysis.",
+    icon: BarChart2,
+    submodules: [
+      "Differential Expression Testing",
+      "Multi-Cohort Meta-Analysis",
+      "Inline Enrichment Analysis (EA)",
+    ],
   },
   {
     id: "enrichment",
+    path: "/enrichment",
     href: "/enrichment",
-    icon: ChartNoAxesCombined,
+    testId: "card-enrichment",
+    badge: "Standalone Workbench",
+    badgeColor: "#7c3aed",
+    badgeBg: "#ede9fe",
+    title: "Enrichment Analysis (EA)",
     label: "Enrichment Analysis",
-    description: "Perform ORA and GSEA on differential expression results using GO, KEGG, Reactome, and MSigDB gene sets.",
-    bg: "#eef2ff",
-    border: "#e9d5ff",
-    accent: "#a855f7",
+    description: "Dedicated pathway enrichment platform to perform ORA and GSEA from custom gene lists or pre-computed ranked statistics.",
+    icon: ChartNoAxesCombined,
+    submodules: [
+      "Over-Representation Analysis (ORA)",
+      "Gene Set Enrichment Analysis (GSEA)",
+      "GO, KEGG, Reactome, MSigDB",
+    ],
   },
   {
     id: "data-processing",
+    path: "/data-processing",
     href: "/data-processing",
-    icon: MonitorCog,
+    testId: "card-data-processing",
+    badge: "Integrated Analysis Suite",
+    badgeColor: "#1e40af",
+    badgeBg: "#dbeafe",
+    title: "Data Processing (DP)",
     label: "Data Processing",
-    description: "Upload expression data, annotate features, apply quality filtering and normalization across multiple datasets.",
-    bg: "#eef2ff",
-    border: "#c4d1f5",
-    accent: "#7835ff",
+    description: "End-to-end data ingestion, annotation, QC filtering, batch effect correction, and cross-cohort normalization.",
+    icon: MonitorCog,
+    submodules: [
+      "Inline DE & Meta-Analysis",
+      "Inline Enrichment Analysis (EA)",
+      "Inline Feature Selection (FS)",
+    ],
   },
 ];
 
 export function HomeElectron() {
   const [, navigate] = useLocation();
   const { dispatch } = useAppStore();
+  const [showGuide, setShowGuide] = useState(false);
+  const [guideModule, setGuideModule] = useState<GuideModuleId>("data-processing");
 
   return (
-    <div style={{ minHeight: "100vh", background: "#eaefff", display: "flex", flexDirection: "column" }}>
+    <div style={{ minHeight: "100vh", background: "#f8fafc", display: "flex", flexDirection: "column" }}>
       {/* Keyframe animations */}
       <style>{`
         @keyframes fadeIn { from { opacity: 0 } to { opacity: 1 } }
-        @keyframes slideUp { from { opacity: 0; transform: translateY(16px) } to { opacity: 1; transform: translateY(0) } }
+        @keyframes slideUp { from { opacity: 0; transform: translateY(14px) } to { opacity: 1; transform: translateY(0) } }
       `}</style>
 
-      {/* Top ribbon */}
-      <div className="ribbon">
-        <div className="ribbon-logo" style={{ display: "flex", alignItems: "center", gap: "10px" }}>
-          <img
-            src={`${import.meta.env.BASE_URL}favicon.svg`}
-            alt="EasyOmiFun Logo"
-            style={{ width: "32px", height: "32px", objectFit: "contain" }}
-          />
-          <span 
-            className="ribbon-app-name" 
-            style={{ 
-              fontSize: "16px", 
-              fontWeight: "700", 
-              letterSpacing: "-0.01em",
-              display: "inline-block",
-              background: "linear-gradient(90deg, #7835ff 0%, #3b82f6 50%, #289ddf 100%)",
-              WebkitBackgroundClip: "text",
-              WebkitTextFillColor: "transparent",
-              backgroundClip: "text"
+      {/* Top Bar matching @easyomicsmarker_ui/ authoritative scientific design */}
+      <header
+        style={{
+          background: "#172554",
+          borderBottom: "1px solid rgba(255, 255, 255, 0.12)",
+          padding: "0 24px",
+          height: 56,
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "space-between",
+          position: "sticky",
+          top: 0,
+          zIndex: 100,
+        }}
+      >
+        {/* Left: Logo, Name, Lab Pill */}
+        <div style={{ display: "flex", alignItems: "center", gap: 14 }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+            <img
+              src={`${import.meta.env.BASE_URL}favicon.svg`}
+              alt="EasyOmiFun Logo"
+              style={{ width: 32, height: 32, objectFit: "contain" }}
+            />
+            <span
+              style={{
+                fontFamily: "var(--font-display)",
+                fontSize: 17,
+                fontWeight: 700,
+                color: "#ffffff",
+                letterSpacing: "-0.01em",
+              }}
+            >
+              EasyOmiFun
+            </span>
+          </div>
+
+          <div
+            style={{
+              background: "rgba(255, 255, 255, 0.12)",
+              color: "#e2e8f0",
+              fontSize: 11,
+              fontWeight: 600,
+              letterSpacing: "0.04em",
+              padding: "3px 10px",
+              borderRadius: 9999,
+              textTransform: "uppercase",
+              display: "inline-flex",
+              alignItems: "center",
+            }}
+          >
+            CGU · The Pharmaco-Omics Lab
+          </div>
+        </div>
+
+        {/* Right: Quick-Start Guide, ReloadButton */}
+        <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+          <button
+            type="button"
+            onClick={() => {
+              setGuideModule("data-processing");
+              setShowGuide(true);
+            }}
+            data-testid="btn-quickstart-guide"
+            style={{
+              display: "flex",
+              alignItems: "center",
+              gap: 6,
+              background: "rgba(255, 255, 255, 0.1)",
+              color: "#f8fafc",
+              border: "1px solid rgba(255, 255, 255, 0.2)",
+              borderRadius: 8,
+              padding: "6px 12px",
+              fontSize: 12,
+              fontWeight: 600,
+              cursor: "pointer",
+              transition: "all 0.15s ease",
+            }}
+            onMouseEnter={e => {
+              e.currentTarget.style.background = "rgba(255, 255, 255, 0.18)";
+              e.currentTarget.style.borderColor = "rgba(255, 255, 255, 0.35)";
+            }}
+            onMouseLeave={e => {
+              e.currentTarget.style.background = "rgba(255, 255, 255, 0.1)";
+              e.currentTarget.style.borderColor = "rgba(255, 255, 255, 0.2)";
+            }}
+          >
+            <BookOpen size={14} />
+            <span style={{ display: "inline" }}>Data Format & Method Guide</span>
+          </button>
+
+          <ReloadButton />
+        </div>
+      </header>
+
+      {/* Hero Banner */}
+      <section
+        style={{
+          background: "#ffffff",
+          padding: "48px 28px 42px",
+          textAlign: "center",
+          borderBottom: "1px solid #e2e8f0",
+        }}
+      >
+        <div style={{ maxWidth: 860, margin: "0 auto" }}>
+          {/* Logo above EasyOmiFun */}
+          <div style={{ display: "flex", justifyContent: "center", marginBottom: 20 }}>
+            <img
+              src={`${import.meta.env.BASE_URL}favicon.svg`}
+              alt="EasyOmiFun Logo"
+              style={{
+                width: 120,
+                height: 120,
+                objectFit: "contain",
+                filter: "drop-shadow(0 10px 22px rgba(30, 64, 175, 0.16))",
+              }}
+            />
+          </div>
+
+          <h1
+            style={{
+              fontFamily: "var(--font-display)",
+              fontSize: 44,
+              fontWeight: 800,
+              color: "#0f172a",
+              marginBottom: 12,
+              lineHeight: 1.15,
+              letterSpacing: "-0.025em",
             }}
           >
             EasyOmiFun
-          </span>
-        </div>
-        <div style={{ flex: 1 }} />
-        <ReloadButton />
-      </div>
-
-      {/* Hero */}
-      <div style={{
-        background: "#ffffff",
-        padding: "60px 28px 48px",
-        textAlign: "center",
-        borderBottom: "1px solid #c4d1f5",
-      }}>
-        <br /><br />
-        <h1 style={{
-          fontSize: 48,
-          fontWeight: 800,
-          display: "inline-block",
-          background: "linear-gradient(90deg, #7835ff 0%, #3b82f6 50%, #289ddf 100%)",
-          WebkitBackgroundClip: "text",
-          WebkitTextFillColor: "transparent",
-          backgroundClip: "text",
-          marginBottom: 16,
-          lineHeight: 1.2,
-          letterSpacing: "-0.02em"
-        }}>
-          EasyOmiFun
-        </h1>
-        <p style={{ fontSize: 18, color: "#606c80", maxWidth: 1500, margin: "0 auto", lineHeight: 1.6 }}>
-          An end-to-end platform for processing transcriptomics data to Differential Expression analysis to Enrichment analysis.
-          <br />Supports integration of multiple datasets and ML adaptation.
-          <br />
-        </p>
-      </div>
-      
-      {/* Module cards */}
-      <div style={{ flex: 1, padding: "40px 28px", background: "#eaefff" }}>
-        <div style={{ maxWidth: 1100, margin: "0 auto" }}>
-          <p style={{ fontSize: 12, fontWeight: 700, textTransform: "uppercase", letterSpacing: ".08em", color: "#606c80", marginBottom: 20 }}>
-            Analysis Modules
+          </h1>
+          <p
+            style={{
+              fontSize: 17,
+              color: "#475569",
+              maxWidth: 740,
+              margin: "0 auto",
+              lineHeight: 1.6,
+            }}
+          >
+            An interactive platform for the discovery of clinically relevant biomarkers, equipped with comprehensive multi-omics data processing, rigorous statistical modeling, and deep biological interpretation.
           </p>
-          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(260px, 1fr))", gap: 20 }}>
+        </div>
+      </section>
+
+      {/* Accessible Module Cards */}
+      <main style={{ flex: 1, padding: "36px 28px 48px", background: "#f8fafc" }}>
+        <div style={{ maxWidth: 1100, margin: "0 auto" }}>
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 20 }}>
+            <div>
+              <p
+                style={{
+                  fontSize: 12,
+                  fontWeight: 700,
+                  textTransform: "uppercase",
+                  letterSpacing: ".08em",
+                  color: "#1e40af",
+                  margin: 0,
+                }}
+              >
+                Analysis Suites & Workbenches (Independent Modules)
+              </p>
+              <p style={{ fontSize: 13, color: "#64748b", margin: "4px 0 0 0" }}>
+                Select an independent analysis module below, or launch full multi-dataset data processing with integrated downstream submodules.
+              </p>
+            </div>
+          </div>
+
+          <div
+            style={{
+              display: "grid",
+              gridTemplateColumns: "repeat(auto-fit, minmax(250px, 1fr))",
+              gap: 20,
+            }}
+          >
             {modules.map((mod) => {
               const Icon = mod.icon;
               return (
                 <div
                   key={mod.id}
-                  data-testid={`card-module-${mod.id}`}
+                  role="button"
+                  tabIndex={0}
+                  data-testid={mod.testId}
                   onClick={() => {
                     dispatch({ type: "RESET_STORE", pipelineMode: mod.id === "data-processing" });
-                    navigate(mod.href);
+                    navigate(mod.path);
+                  }}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter" || e.key === " ") {
+                      e.preventDefault();
+                      dispatch({ type: "RESET_STORE", pipelineMode: mod.id === "data-processing" });
+                      navigate(mod.path);
+                    }
                   }}
                   style={{
                     background: "#ffffff",
-                    border: "1px solid #c4d1f5",
-                    borderRadius: 12,
-                    padding: "24px", 
+                    border: "1px solid #cbd5e1",
+                    borderRadius: 14,
+                    padding: "20px",
                     cursor: "pointer",
-                    transition: "all .2s ease-in-out",
-                    height: 220,      
-                    boxSizing: "border-box",       
-                    position: "relative",          
+                    transition: "all .15s ease",
                     display: "flex",
                     flexDirection: "column",
-                    alignItems: "center"
+                    alignItems: "flex-start",
+                    textAlign: "left",
+                    minHeight: 250,
+                    boxSizing: "border-box",
+                    boxShadow: "0 1px 3px rgba(15, 23, 42, 0.05)",
+                    position: "relative",
                   }}
                   onMouseEnter={e => {
-                    (e.currentTarget as HTMLDivElement).style.borderColor = "#7835ff";
-                    (e.currentTarget as HTMLDivElement).style.transform = "translateY(-4px)";
-                    (e.currentTarget as HTMLDivElement).style.boxShadow = "0 12px 24px rgba(120, 53, 255, 0.12)";
+                    e.currentTarget.style.borderColor = "#1e40af";
+                    e.currentTarget.style.transform = "translateY(-3px)";
+                    e.currentTarget.style.boxShadow = "0 12px 24px -6px rgba(30, 64, 175, 0.15)";
                   }}
                   onMouseLeave={e => {
-                    (e.currentTarget as HTMLDivElement).style.borderColor = "#c4d1f5";
-                    (e.currentTarget as HTMLDivElement).style.transform = "translateY(0)";
-                    (e.currentTarget as HTMLDivElement).style.boxShadow = "none";
+                    e.currentTarget.style.borderColor = "#cbd5e1";
+                    e.currentTarget.style.transform = "translateY(0)";
+                    e.currentTarget.style.boxShadow = "0 1px 3px rgba(15, 23, 42, 0.05)";
                   }}
                 >
-                  <div style={{
-                    width: 70,               
-                    height: 70,              
-                    borderRadius: 12,
-                    background: mod.bg,
-                    display: "flex",
-                    alignItems: "center",
-                    justifyContent: "center",
-                    position: "absolute",
-                    top: "35%",
-                    left: "50%",
-                    transform: "translate(-50%, -50%)" 
-                  }}>
-                    <Icon size={35} color={mod.accent} />
+                  {/* Top row: Icon + Category Badge */}
+                  <div
+                    style={{
+                      display: "flex",
+                      alignItems: "center",
+                      justifyContent: "space-between",
+                      width: "100%",
+                      marginBottom: 14,
+                    }}
+                  >
+                    <div
+                      style={{
+                        width: 40,
+                        height: 40,
+                        borderRadius: 10,
+                        background: mod.badgeBg,
+                        display: "flex",
+                        alignItems: "center",
+                        justifyContent: "center",
+                        color: mod.badgeColor,
+                      }}
+                    >
+                      <Icon size={20} />
+                    </div>
+                    <span
+                      style={{
+                        fontSize: 11,
+                        fontWeight: 700,
+                        background: mod.badgeBg,
+                        color: mod.badgeColor,
+                        padding: "3px 9px",
+                        borderRadius: 9999,
+                        letterSpacing: "0.02em",
+                      }}
+                    >
+                      {mod.badge}
+                    </span>
                   </div>
 
-                  <h3 style={{ 
-                    fontSize: 16, 
-                    fontWeight: 600, 
-                    color: "#101a36", 
-                    lineHeight: 1.3,
-                    textAlign: "center",
-                    width: "calc(100% - 48px)", 
-                    position: "absolute",
-                    top: 130                  
-                  }}>
-                    {mod.label}
+                  {/* Title */}
+                  <h3
+                    style={{
+                      fontSize: 17,
+                      fontWeight: 700,
+                      color: "#0f172a",
+                      margin: "0 0 6px 0",
+                      lineHeight: 1.3,
+                    }}
+                  >
+                    {mod.title}
                   </h3>
+
+                  {/* Description */}
+                  <p
+                    style={{
+                      fontSize: 13,
+                      color: "#475569",
+                      lineHeight: 1.5,
+                      margin: 0,
+                    }}
+                  >
+                    {mod.description}
+                  </p>
+
+                  {/* Submodules & Capabilities list */}
+                  <div style={{ marginTop: 12, marginBottom: 14, width: "100%", borderTop: "1px solid #f1f5f9", paddingTop: 10, flex: 1 }}>
+                    <div style={{ fontSize: 11, fontWeight: 700, textTransform: "uppercase", letterSpacing: ".04em", color: "#64748b", marginBottom: 6 }}>
+                      {mod.id === "data-processing" || mod.id === "de-analysis" ? "Integrated Submodules" : "Core Capabilities"}
+                    </div>
+                    <ul style={{ listStyle: "none", margin: 0, padding: 0, display: "flex", flexDirection: "column", gap: 5 }}>
+                      {mod.submodules.map((sub, i) => (
+                        <li key={i} style={{ fontSize: 12, color: "#334155", display: "flex", alignItems: "center", gap: 6 }}>
+                          <span style={{ color: mod.badgeColor, fontSize: 13, lineHeight: 1 }}>•</span>
+                          <span>{sub}</span>
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+
+                  {/* Bottom Action Row: Format & Guide Button + Launch Module */}
+                  <div
+                    style={{
+                      display: "flex",
+                      alignItems: "center",
+                      justifyContent: "space-between",
+                      width: "100%",
+                      marginTop: "auto",
+                      paddingTop: 8,
+                    }}
+                  >
+                    <button
+                      type="button"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        setGuideModule(mod.id as GuideModuleId);
+                        setShowGuide(true);
+                      }}
+                      style={{
+                        display: "inline-flex",
+                        alignItems: "center",
+                        gap: 5,
+                        fontSize: 11,
+                        fontWeight: 600,
+                        color: "#1e40af",
+                        background: "#eff6ff",
+                        border: "1px solid #bfdbfe",
+                        borderRadius: 6,
+                        padding: "4px 8px",
+                        cursor: "pointer",
+                        transition: "all 0.15s ease",
+                      }}
+                      onMouseEnter={e => {
+                        e.currentTarget.style.background = "#dbeafe";
+                        e.currentTarget.style.borderColor = "#93c5fd";
+                      }}
+                      onMouseLeave={e => {
+                        e.currentTarget.style.background = "#eff6ff";
+                        e.currentTarget.style.borderColor = "#bfdbfe";
+                      }}
+                    >
+                      <BookOpen size={12} />
+                      <span>Format & Guide</span>
+                    </button>
+
+                    <div
+                      style={{
+                        display: "flex",
+                        alignItems: "center",
+                        gap: 4,
+                        color: "#1e40af",
+                        fontSize: 13,
+                        fontWeight: 700,
+                      }}
+                    >
+                      <span>Launch</span>
+                      <span>→</span>
+                    </div>
+                  </div>
                 </div>
               );
             })}
           </div>
         </div>
-      </div>
+      </main>
 
-      {/* Page Footer Footnote Ribbon */}
-      <PlotFootnote style={{ borderRadius: "0px", marginTop: "0px", borderTop: "1px solid rgba(255, 255, 255, 0.1)" }} />
+      {/* Page Footer */}
+      <PlotFootnote />
+
+      {/* Data Format & Method Guide modal */}
+      {showGuide && (
+        <QuickStartGuideModal
+          onClose={() => setShowGuide(false)}
+          initialModuleId={guideModule}
+        />
+      )}
     </div>
   );
 }

@@ -1,11 +1,11 @@
-import { useState } from "react";
-import { FileText, AlertTriangle, CheckCircle } from "lucide-react";
+import { useState, useRef } from "react";
+import { FileText, AlertTriangle, CheckCircle, FileSpreadsheet } from "lucide-react";
 import { useAppStore } from "../../store/appStore";
 import Spinner from "../Spinner";
 import { type EnrichmentConfig } from "../../dataObject";
 import { parseExpressionFile, detectGeneIdType, getDesktopFilePath } from "../../lib/dataParser";
 import { uploadFileInChunks } from "../../lib/chunkUploader";
-import { fetchSampleDataAPI, uploadEADatasetDataAPI, clearDatasetAPI } from "../../lib/api";
+import { fetchSampleDataAPI, uploadEADatasetDataAPI, clearDatasetAPI, cancelComputeJobAPI } from "../../lib/api";
 import DiscardWarnModal from "../shared/DiscardWarnModal";
 
 const GENE_ID_LABELS: Record<string, string> = {
@@ -35,6 +35,21 @@ export default function EnrichmentUploadStep({ datasetId }: { datasetId: string 
   const [drag, setDrag] = useState(false);
   const [showDiscardModal, setShowDiscardModal] = useState(false);
 
+  const abortControllerRef = useRef<AbortController | null>(null);
+  const activeJobIdRef = useRef<string | null>(null);
+
+  const handleCancel = () => {
+    if (activeJobIdRef.current) {
+      cancelComputeJobAPI(activeJobIdRef.current);
+      activeJobIdRef.current = null;
+    }
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort();
+      abortControllerRef.current = null;
+    }
+    setLoading(false);
+  };
+
   if (!ds) return null;
 
   const updateDs = (patch: Partial<typeof ds>) =>
@@ -43,12 +58,8 @@ export default function EnrichmentUploadStep({ datasetId }: { datasetId: string 
   const updateConfig = (patch: Partial<EnrichmentConfig>) =>
     dispatch({ type: "EN_SET_CONFIG", patch });
 
-  const handleClear = async () => {
-    try {
-      await clearDatasetAPI(datasetId, "expression");
-    } catch (e) {
-      console.warn("clearDatasetAPI failed (non-fatal):", e);
-    }
+  const handleClear = () => {
+    clearDatasetAPI(datasetId, "expression").catch((e) => console.warn("clearDatasetAPI failed (non-fatal):", e));
     updateDs({
       expressionFile: null,
       expressionFileName: "",
@@ -115,6 +126,8 @@ export default function EnrichmentUploadStep({ datasetId }: { datasetId: string 
   const handleFile = async (file: File) => {
     setLoading(true);
     setLoadingMsg(`Parsing ${file.name}…`);
+    const controller = new AbortController();
+    abortControllerRef.current = controller;
     try {
       const desktopPath = getDesktopFilePath(file);
       const isDesktop = !!desktopPath;
@@ -127,7 +140,7 @@ export default function EnrichmentUploadStep({ datasetId }: { datasetId: string 
         setLoadingMsg(`Uploading ${file.name} in chunks…`);
         uploadId = await uploadFileInChunks(file, ds.id, "expression", (pct) => {
           setLoadingMsg(`Uploading ${file.name} (${pct}%)…`);
-        });
+        }, controller.signal);
       }
 
       updateDs({
@@ -157,6 +170,9 @@ export default function EnrichmentUploadStep({ datasetId }: { datasetId: string 
         updateConfig({ rankByCol: parsed.columns[1] });
       }
     } catch (error: any) {
+      if (error?.name === "AbortError" || controller.signal.aborted) {
+        return;
+      }
       updateDs({
         integrityOk: false,
         integrityIssues: [`Error parsing file: ${error.message}`],
@@ -189,6 +205,8 @@ export default function EnrichmentUploadStep({ datasetId }: { datasetId: string 
     if (!ds.uploadDone || hasSettingsChanged) {
       setLoading(true);
       setLoadingMsg("Uploading temporary data to server…");
+      const controller = new AbortController();
+      abortControllerRef.current = controller;
       try {
         if (ds.expressionFileName && ds.parsedData) {
           await uploadEADatasetDataAPI([{
@@ -196,13 +214,17 @@ export default function EnrichmentUploadStep({ datasetId }: { datasetId: string 
             isNormalized: "" as any,
             dataType: "" as any,
             platform: "" as any,
-          }]);
+          }], ({ jobId }) => { activeJobIdRef.current = jobId; }, controller.signal);
           updateDs({
             integrityOk: true,
             integrityIssues: [],
           });
         }
       } catch (e: any) {
+        if (e?.name === "AbortError" || controller.signal.aborted) {
+          setLoading(false);
+          return;
+        }
         console.error("Failed to upload temporary data to server:", e);
         updateDs({
           integrityOk: false,
@@ -249,7 +271,7 @@ export default function EnrichmentUploadStep({ datasetId }: { datasetId: string 
 
   return (
     <>
-      {loading && <Spinner label={loadingMsg} sublabel="Please wait…" />}
+      {loading && <Spinner label={loadingMsg} sublabel="Please wait…" onCancel={handleCancel} />}
 
       {/* Gene List Upload OR Config + Preview Table */}
       <div className="card" style={{ marginBottom: 14 }}>
@@ -286,11 +308,19 @@ export default function EnrichmentUploadStep({ datasetId }: { datasetId: string 
                 i.onchange = e => { const f = (e.target as HTMLInputElement).files?.[0]; if (f) handleFile(f); };
                 i.click();
               }}
+              role="button"
+              tabIndex={0}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" || e.key === " ") {
+                  e.preventDefault();
+                  (e.currentTarget as HTMLElement).click();
+                }
+              }}
               onDragOver={e => { e.preventDefault(); setDrag(true); }}
               onDragLeave={() => setDrag(false)}
               onDrop={e => { e.preventDefault(); setDrag(false); const f = e.dataTransfer.files?.[0]; if (f) handleFile(f); }}
             >
-              <div className="drop-zone-icon">📊</div>
+              <div className="drop-zone-icon"><FileSpreadsheet size={32} /></div>
               <div className="drop-zone-title">Drop gene list file here</div>
               <div className="drop-zone-hint">CSV · TSV · TXT</div>
             </div>

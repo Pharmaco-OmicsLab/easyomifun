@@ -1,5 +1,5 @@
-import { useState } from "react";
-import { skipStepAPI } from "../../lib/api";
+import { useState, useRef } from "react";
+import { skipStepAPI, cancelComputeJobAPI } from "../../lib/api";
 import Spinner from "../Spinner";
 
 interface Props {
@@ -12,12 +12,36 @@ interface Props {
 
 export default function SkipModal({ stepName, stepId, datasetIds, onConfirm, onCancel }: Props) {
   const [loading, setLoading] = useState(false);
+  const abortControllerRef = useRef<AbortController | null>(null);
+  const activeJobIdRef = useRef<string | null>(null);
+
+  const handleModalCancel = () => {
+    if (activeJobIdRef.current) {
+      cancelComputeJobAPI(activeJobIdRef.current);
+      activeJobIdRef.current = null;
+    }
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort();
+      abortControllerRef.current = null;
+    }
+    setLoading(false);
+  };
 
   const handleConfirm = async () => {
     setLoading(true);
+    const controller = new AbortController();
+    abortControllerRef.current = controller;
     try {
-      await skipStepAPI(stepId, datasetIds);
-    } catch (err) {
+      await skipStepAPI(
+        stepId,
+        datasetIds,
+        ({ jobId }) => { activeJobIdRef.current = jobId; },
+        controller.signal
+      );
+    } catch (err: any) {
+      if (err?.name === "AbortError" || controller.signal.aborted) {
+        return;
+      }
       console.error("Failed to call skip API:", err);
     } finally {
       setLoading(false);
@@ -27,7 +51,7 @@ export default function SkipModal({ stepName, stepId, datasetIds, onConfirm, onC
 
   return (
     <div className="modal-backdrop" onClick={onCancel}>
-      {loading && <Spinner label="Skipping step on server..." />}
+      {loading && <Spinner label="Skipping step on server..." onCancel={handleModalCancel} />}
       <div className="modal-box" onClick={e => e.stopPropagation()} style={{ maxWidth: 380 }}>
         <div className="modal-title" style={{ textAlign: "center", marginBottom: 8, fontSize: 15 }}>
           <strong>Skip {stepName}?</strong>

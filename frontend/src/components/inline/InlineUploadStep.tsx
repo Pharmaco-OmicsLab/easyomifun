@@ -1,11 +1,11 @@
-import { useState, useEffect } from "react";
-import { FileText, X, AlertTriangle, CheckCircle, Info, Download } from "lucide-react";
+import { useState, useEffect, useMemo, useRef } from "react";
+import { FileText, X, AlertTriangle, CheckCircle, Info, Download, Dna } from "lucide-react";
 import { useAppStore } from "../../store/appStore";
 import Spinner from "../Spinner";
 import { computeDPSteps, isMissingClinical } from "../../dataObject";
 import { parseClinicalFile, alignSamplesLocal, unparseCSV, getDesktopFilePath, getExpressionSampleColumns, isAnnotationOrInfoColumn } from "../../lib/dataParser";
 import { uploadFileInChunks } from "../../lib/chunkUploader";
-import { fetchSampleDataAPI, supplementClinicalDataAPI } from "../../lib/api";
+import { fetchSampleDataAPI, supplementClinicalDataAPI, cancelComputeJobAPI, clearDatasetAPI } from "../../lib/api";
 import WarnSampleModal from "../shared/WarnSampleModal";
 import DiscardWarnModal from "../shared/DiscardWarnModal";
 import ChangeWarnModal from "../shared/ChangeWarnModal";
@@ -67,59 +67,47 @@ const filterDatasetForUpload = (dataset: any, choice: "all" | "overlap", mode: "
   let filteredExpressionRows = dataset.parsedData || [];
   let nSamples = dataset.nSamples || 0;
 
-  const isFsHeaders = dataset.fs_featuresOrientation === "headers";
+  const geneIdCol = dataset.geneIdCol || (dataset.columns && dataset.columns[0]) || "";
+  const geneInfoCols = dataset.geneInfoCols || [];
+  
+  const fsFeatureIdx = dataset.fs_featureIndexValue !== undefined ? (dataset.fs_featureIndexValue - 1) : -1;
+  
+  const exprSampleCols = (dataset.sampleIds && dataset.sampleIds.length > 0)
+    ? dataset.sampleIds
+    : getExpressionSampleColumns(dataset.columns || [], geneIdCol, geneInfoCols);
+  
+  const commonSamples = exprSampleCols.filter((s: string) => validClinicalSamples.includes(s));
 
-  if (isFsHeaders) {
-    const sampleIdColIdx = (dataset.fs_featureIndexValue || 1) - 1;
-    filteredExpressionRows = (dataset.parsedData || []).filter((row: any[]) => {
-      const rowSampleId = row[sampleIdColIdx];
-      return rowSampleId && validClinicalSamples.includes(rowSampleId);
-    });
-    const commonSamples = filteredExpressionRows.map((row: any[]) => row[sampleIdColIdx]);
-    nSamples = commonSamples.length;
-  } else {
-    const geneIdCol = dataset.geneIdCol || (dataset.columns && dataset.columns[0]) || "";
-    const geneInfoCols = dataset.geneInfoCols || [];
-    
-    const fsFeatureIdx = dataset.fs_featureIndexValue !== undefined ? (dataset.fs_featureIndexValue - 1) : -1;
-    
-    const exprSampleCols = (dataset.sampleIds && dataset.sampleIds.length > 0)
-      ? dataset.sampleIds
-      : getExpressionSampleColumns(dataset.columns || [], geneIdCol, geneInfoCols);
-    
-    const commonSamples = exprSampleCols.filter((s: string) => validClinicalSamples.includes(s));
+  keepCols = (dataset.columns || []).filter((c: string, idx: number) => {
+    if (idx === fsFeatureIdx) return true;
+    if (isAnnotationOrInfoColumn(c, geneIdCol, geneInfoCols)) return true;
+    return commonSamples.includes(c);
+  });
 
-    keepCols = (dataset.columns || []).filter((c: string, idx: number) => {
-      if (idx === fsFeatureIdx) return true;
-      if (isAnnotationOrInfoColumn(c, geneIdCol, geneInfoCols)) return true;
-      return commonSamples.includes(c);
-    });
-
-    const keepIndices = keepCols.map((c: string) => (dataset.columns || []).indexOf(c));
-    
-    if (dataset.uploadDone) {
-      filteredExpressionRows = (dataset.parsedData || []).map((row: any[], rIdx: number) => {
-        if (!row) return row;
-        if (rIdx < 10) {
-          return keepIndices.map(idx => row[idx]);
-        }
-        // Keep it minimized
-        const newRow: any[] = [];
-        const geneIdIdx = dataset.columns ? dataset.columns.indexOf(geneIdCol) : -1;
-        const targetIdx = geneIdIdx !== -1 ? geneIdIdx : 0;
-        const keepGeneIdIdx = keepCols.indexOf(geneIdCol);
-        const newTargetIdx = keepGeneIdIdx !== -1 ? keepGeneIdIdx : 0;
-        newRow[newTargetIdx] = row[targetIdx] !== undefined ? row[targetIdx] : row[0];
-        return newRow;
-      });
-    } else {
-      filteredExpressionRows = (dataset.parsedData || []).map((row: any[]) => {
+  const keepIndices = keepCols.map((c: string) => (dataset.columns || []).indexOf(c));
+  
+  if (dataset.uploadDone) {
+    filteredExpressionRows = (dataset.parsedData || []).map((row: any[], rIdx: number) => {
+      if (!row) return row;
+      if (rIdx < 10) {
         return keepIndices.map(idx => row[idx]);
-      });
-    }
-    
-    nSamples = commonSamples.length;
+      }
+      // Keep it minimized
+      const newRow: any[] = [];
+      const geneIdIdx = dataset.columns ? dataset.columns.indexOf(geneIdCol) : -1;
+      const targetIdx = geneIdIdx !== -1 ? geneIdIdx : 0;
+      const keepGeneIdIdx = keepCols.indexOf(geneIdCol);
+      const newTargetIdx = keepGeneIdIdx !== -1 ? keepGeneIdIdx : 0;
+      newRow[newTargetIdx] = row[targetIdx] !== undefined ? row[targetIdx] : row[0];
+      return newRow;
+    });
+  } else {
+    filteredExpressionRows = (dataset.parsedData || []).map((row: any[]) => {
+      return keepIndices.map(idx => row[idx]);
+    });
   }
+  
+  nSamples = commonSamples.length;
 
   const finalClinicalRows = filteredClinicalRows.filter((row: any[]) => {
     return validClinicalSamples.includes(row[sampleIdx]);
@@ -128,7 +116,9 @@ const filterDatasetForUpload = (dataset: any, choice: "all" | "overlap", mode: "
   return {
     ...dataset,
     columns: keepCols,
-    sampleIds: isFsHeaders ? dataset.sampleIds : ((dataset.sampleIds && dataset.sampleIds.length > 0) ? dataset.sampleIds.filter((s: string) => validClinicalSamples.includes(s)) : keepCols.filter((c: string) => !isAnnotationOrInfoColumn(c, dataset.geneIdCol, dataset.geneInfoCols))),
+    sampleIds: ((dataset.sampleIds && dataset.sampleIds.length > 0)
+      ? dataset.sampleIds.filter((s: string) => validClinicalSamples.includes(s))
+      : keepCols.filter((c: string) => !isAnnotationOrInfoColumn(c, dataset.geneIdCol, dataset.geneInfoCols))),
     parsedData: filteredExpressionRows,
     clinicalParsedData: finalClinicalRows,
     nSamples: nSamples,
@@ -145,6 +135,21 @@ export default function InlineUploadStep({ datasetId, mode, editingFromSummary =
   const [showDiscardModal, setShowDiscardModal] = useState(false);
   const [showChangeWarnModal, setShowChangeWarnModal] = useState(false);
   const [showSkipModal, setShowSkipModal] = useState(false);
+
+  const abortControllerRef = useRef<AbortController | null>(null);
+  const activeJobIdRef = useRef<string | null>(null);
+
+  const handleCancel = () => {
+    if (activeJobIdRef.current) {
+      cancelComputeJobAPI(activeJobIdRef.current);
+      activeJobIdRef.current = null;
+    }
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort();
+      abortControllerRef.current = null;
+    }
+    setLoading(false);
+  };
 
   const [matchingSamples, setMatchingSamples] = useState<string[]>([]);
   const [missingClinSamples, setMissingClinSamples] = useState<string[]>([]);
@@ -211,18 +216,61 @@ export default function InlineUploadStep({ datasetId, mode, editingFromSummary =
     JSON.stringify(ds?.columns || [])
   ]);
 
-  if (!ds) return null;
-
-  const updateDs = (patch: Partial<typeof ds>) => {
+  const updateDs = (patch: Partial<any>) => {
     dispatch({ type: "DP_UPDATE_DATASET", id: datasetId, patch } as never);
   };
 
-  const handleClear = async () => {
-    try {
-      await clearDatasetAPI(ds.id, "clinical");
-    } catch (e) {
-      console.warn("clearDatasetAPI failed (non-fatal):", e);
+  const uniqueGroupValues: string[] = useMemo(() => {
+    if (!ds?.clinicalGroupCol || !ds?.clinicalColumns || !ds?.clinicalParsedData) return [];
+    const gIdx = ds.clinicalColumns.indexOf(ds.clinicalGroupCol);
+    if (gIdx === -1) return [];
+    const vals = (ds.clinicalParsedData as any[][])
+      .map(row => String(row[gIdx] ?? "").trim())
+      .filter(v => v !== "" && v !== "NA" && v !== "NaN");
+    return [...new Set(vals)];
+  }, [ds?.clinicalGroupCol, ds?.clinicalColumns, ds?.clinicalParsedData]);
+
+  // Auto-sync positive and negative classes when 2 classes are available
+  useEffect(() => {
+    if (mode !== "fs" || !ds || !ds.clinicalGroupCol || uniqueGroupValues.length !== 2) return;
+    const pos = ds.fs_positiveClass;
+    const neg = ds.fs_negativeClass;
+    const isPosValid = !!pos && uniqueGroupValues.includes(pos);
+    const isNegValid = !!neg && uniqueGroupValues.includes(neg);
+    if (!isPosValid || !isNegValid || pos === neg) {
+      let nextPos = isPosValid ? pos! : uniqueGroupValues[1];
+      let nextNeg = uniqueGroupValues.find(v => v !== nextPos) || uniqueGroupValues[0];
+      if (isNegValid && !isPosValid) {
+        nextNeg = neg!;
+        nextPos = uniqueGroupValues.find(v => v !== nextNeg) || uniqueGroupValues[1];
+      }
+      updateDs({
+        fs_positiveClass: nextPos,
+        fs_negativeClass: nextNeg
+      });
     }
+  }, [mode, ds?.clinicalGroupCol, uniqueGroupValues, ds?.fs_positiveClass, ds?.fs_negativeClass]);
+
+  // Auto-detect group column if not set but clinical columns exist
+  useEffect(() => {
+    if (mode === "batch" || !ds || ds.clinicalGroupCol || !ds.clinicalColumns || ds.clinicalColumns.length <= 1) return;
+    const cols = ds.clinicalColumns;
+    let found = cols.find((c: string) => {
+      const lc = c.toLowerCase();
+      return lc.includes("group") || lc.includes("condition") || lc.includes("class") || lc.includes("treatment");
+    });
+    if (!found && cols.length > 1) {
+      found = cols.find((c: string) => c !== ds.clinicalSampleIdCol) || cols[1];
+    }
+    if (found) {
+      updateDs({ clinicalGroupCol: found });
+    }
+  }, [mode, ds?.clinicalGroupCol, ds?.clinicalColumns, ds?.clinicalSampleIdCol]);
+
+  if (!ds) return null;
+
+  const handleClear = () => {
+    clearDatasetAPI(ds.id, "clinical").catch((e) => console.warn("clearDatasetAPI failed (non-fatal):", e));
     dispatch({
       type: "RESET_DOWNSTREAM_STEPS",
       datasetId: ds.id,
@@ -294,6 +342,8 @@ export default function InlineUploadStep({ datasetId, mode, editingFromSummary =
   };
 
   const handleClinicalFile = async (file: File) => {
+    const controller = new AbortController();
+    abortControllerRef.current = controller;
     setLoadingMsg(`Parsing ${file.name}…`);
     setLoading(true);
     try {
@@ -307,7 +357,7 @@ export default function InlineUploadStep({ datasetId, mode, editingFromSummary =
         setLoadingMsg(`Uploading ${file.name} in chunks…`);
         uploadId = await uploadFileInChunks(file, ds.id, "clinical", (pct) => {
           setLoadingMsg(`Uploading ${file.name} (${pct}%)…`);
-        });
+        }, controller.signal);
       }
 
       let autoPos = "";
@@ -344,6 +394,9 @@ export default function InlineUploadStep({ datasetId, mode, editingFromSummary =
         uploadDone: false,
       });
     } catch (error: any) {
+      if (error?.name === "AbortError" || controller.signal.aborted) {
+        return;
+      }
       updateDs({
         integrityIssues: [`Error parsing clinical file: ${error.message}`],
       });
@@ -368,16 +421,6 @@ export default function InlineUploadStep({ datasetId, mode, editingFromSummary =
   const isNoOverlap = hasClinical && exprSamples.length > 0 && matchingSamples.length === 0;
   const isPartialMatch = hasClinical && exprSamples.length > 0 && matchingSamples.length > 0 && (matchingSamples.length !== exprSamples.length || clinSamples.length !== exprSamples.length);
 
-  // Derive unique class count from the selected group column (FS only)
-  const uniqueGroupValues: string[] = (() => {
-    if (mode !== "fs" || !ds.clinicalGroupCol || !ds.clinicalColumns || !ds.clinicalParsedData) return [];
-    const gIdx = ds.clinicalColumns.indexOf(ds.clinicalGroupCol);
-    if (gIdx === -1) return [];
-    const vals = ds.clinicalParsedData
-      .map((row: any[]) => String(row[gIdx] ?? "").trim())
-      .filter(v => v !== "" && v !== "NA" && v !== "NaN");
-    return [...new Set(vals)];
-  })();
   const uniqueGroupCount = uniqueGroupValues.length;
   const hasMultipleClasses = mode === "fs" && ds.clinicalGroupCol !== "" && uniqueGroupCount !== 2;
   const hasUnsetClasses = mode === "fs" && ds.clinicalGroupCol !== "" && (
@@ -387,27 +430,6 @@ export default function InlineUploadStep({ datasetId, mode, editingFromSummary =
     !uniqueGroupValues.includes(ds.fs_positiveClass) ||
     !uniqueGroupValues.includes(ds.fs_negativeClass)
   );
-
-  // Auto-sync positive and negative classes when 2 classes are available
-  useEffect(() => {
-    if (mode !== "fs" || !ds || !ds.clinicalGroupCol || uniqueGroupValues.length !== 2) return;
-    const pos = ds.fs_positiveClass;
-    const neg = ds.fs_negativeClass;
-    const isPosValid = !!pos && uniqueGroupValues.includes(pos);
-    const isNegValid = !!neg && uniqueGroupValues.includes(neg);
-    if (!isPosValid || !isNegValid || pos === neg) {
-      let nextPos = isPosValid ? pos! : uniqueGroupValues[1];
-      let nextNeg = uniqueGroupValues.find(v => v !== nextPos) || uniqueGroupValues[0];
-      if (isNegValid && !isPosValid) {
-        nextNeg = neg!;
-        nextPos = uniqueGroupValues.find(v => v !== nextNeg) || uniqueGroupValues[1];
-      }
-      updateDs({
-        fs_positiveClass: nextPos,
-        fs_negativeClass: nextNeg
-      });
-    }
-  }, [mode, ds?.clinicalGroupCol, JSON.stringify(uniqueGroupValues), ds?.fs_positiveClass, ds?.fs_negativeClass]);
 
   // Derive unique batch count from the selected batch column (Batch mode only)
   const uniqueBatchValues: string[] = (() => {
@@ -525,6 +547,8 @@ export default function InlineUploadStep({ datasetId, mode, editingFromSummary =
     if (!done || hasSettingsChanged) {
       setLoadingMsg("Updating clinical metadata on server…");
       setLoading(true);
+      const controller = new AbortController();
+      abortControllerRef.current = controller;
       try {
         if (datasetToUpload.clinicalFileName && (datasetToUpload.clinicalParsedData || datasetToUpload.clinicalFilePath || datasetToUpload.clinicalUploadId || (datasetToUpload.clinicalColumns && datasetToUpload.clinicalColumns.length > 0))) {
           // Use supplementClinicalDataAPI to upload only the clinical data
@@ -541,7 +565,9 @@ export default function InlineUploadStep({ datasetId, mode, editingFromSummary =
             isClinUnchanged ? undefined : datasetToUpload.clinicalFilePath,
             isClinUnchanged ? undefined : datasetToUpload.clinicalUploadId,
             mode === "fs" ? datasetToUpload.fs_positiveClass : undefined,
-            mode === "fs" ? datasetToUpload.fs_negativeClass : undefined
+            mode === "fs" ? datasetToUpload.fs_negativeClass : undefined,
+            ({ jobId }) => { activeJobIdRef.current = jobId; },
+            controller.signal
           );
           if (res && res.status === "success") {
             if (res.samples !== undefined) datasetToUpload.nSamples = res.samples;
@@ -550,10 +576,15 @@ export default function InlineUploadStep({ datasetId, mode, editingFromSummary =
             if (res.sampleIds && Array.isArray(res.sampleIds)) datasetToUpload.sampleIds = res.sampleIds;
           }
         }
-      } catch (e) {
+      } catch (e: any) {
+        if (e?.name === "AbortError" || controller.signal.aborted) {
+          setLoading(false);
+          return;
+        }
         console.error("Failed to upload clinical data to server:", e);
+      } finally {
+        setLoading(false);
       }
-      setLoading(false);
     }
 
     updateDs({
@@ -631,7 +662,7 @@ export default function InlineUploadStep({ datasetId, mode, editingFromSummary =
 
   return (
     <>
-      {loading && <Spinner label={loadingMsg} sublabel="Please wait…" />}
+      {loading && <Spinner label={loadingMsg} sublabel="Please wait…" onCancel={handleCancel} />}
 
       {/* Clinical Data Upload */}
       <div className="card">
@@ -665,11 +696,19 @@ export default function InlineUploadStep({ datasetId, mode, editingFromSummary =
               input.onchange = e => { const f = (e.target as HTMLInputElement).files?.[0]; if (f) handleClinicalFile(f); };
               input.click();
             }}
+            role="button"
+            tabIndex={0}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" || e.key === " ") {
+                e.preventDefault();
+                (e.currentTarget as HTMLElement).click();
+              }
+            }}
             onDragOver={e => { e.preventDefault(); setClinicalDrag(true); }}
             onDragLeave={() => setClinicalDrag(false)}
             onDrop={e => { e.preventDefault(); setClinicalDrag(false); const f = e.dataTransfer.files?.[0]; if (f) handleClinicalFile(f); }}
             data-testid="dropzone-clinical">
-            <div className="drop-zone-icon">🧬</div>
+            <div className="drop-zone-icon"><Dna size={32} /></div>
             <div className="drop-zone-title">Drop clinical metadata file here</div>
             <div className="drop-zone-hint">CSV · TSV &nbsp;·&nbsp; SampleID + Group columns required</div>
           </div>
@@ -1229,6 +1268,14 @@ export default function InlineUploadStep({ datasetId, mode, editingFromSummary =
                   <span>Warning: the system will only keep samples that have both expression and clinical data.</span>
                 </div>
               )}
+              {(mode === "fs" || mode === "inline-fs" || mode === "de") && ds.hasNA && (
+                <div className="banner warn" style={{ marginBottom: 10 }}>
+                  <AlertTriangle size={15} style={{ flexShrink: 0 }} />
+                  <span>
+                    <strong>Notice:</strong> Missing values detected in the expression matrix. The system will automatically impute missing values using KNN imputation prior to {mode === "de" ? "differential expression analysis" : "feature selection"}.
+                  </span>
+                </div>
+              )}
               {!isNoOverlap && !isPartialMatch && hasClinical && !hasDanger && (
                 <div className="banner success" style={{ marginBottom: 10 }}>
                   <CheckCircle size={15} style={{ flexShrink: 0 }} />
@@ -1255,7 +1302,7 @@ export default function InlineUploadStep({ datasetId, mode, editingFromSummary =
           {mode === "batch" && (
             <button className="btn btn-default" onClick={() => {
               setShowSkipModal(true);
-            }} data-testid="btn-skip-batch-clinical-upload" style={{ color: "var(--muted-foreground)" }}>
+            }} data-testid="btn-skip-batch-clinical-upload">
               Skip Batch Correction
             </button>
           )}

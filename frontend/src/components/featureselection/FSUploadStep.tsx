@@ -1,12 +1,12 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useMemo, useRef } from "react";
 import { useLocation } from "wouter";
-import { FileText, X, AlertTriangle, CheckCircle, Download, Layers } from "lucide-react";
+import { FileText, X, AlertTriangle, CheckCircle, Download, Layers, BarChart3, Dna } from "lucide-react";
 import { useAppStore } from "../../store/appStore";
 import Spinner from "../Spinner";
 import { parseExpressionFile, parseClinicalFile, alignSamplesLocal, unparseCSV, validateFSSamplesLocal, getDesktopFilePath } from "../../lib/dataParser";
 import { uploadFileInChunks } from "../../lib/chunkUploader";
-import { fetchSampleDataAPI, uploadFSDatasetsAPI, clearDatasetAPI, redoStepAPI, clearDownstreamAPI } from "../../lib/api";
-import { getHierarchyGroup, type DataType, type FSMultiDatasetMode, type FSValidationStrategy } from "../../dataObject";
+import { fetchSampleDataAPI, uploadFSDatasetsAPI, clearDatasetAPI, redoStepAPI, clearDownstreamAPI, cancelComputeJobAPI } from "../../lib/api";
+import { getHierarchyGroup, formatDataTypeLabel, type DataType, type FSMultiDatasetMode, type FSValidationStrategy } from "../../dataObject";
 import WarnSampleModal from "../shared/WarnSampleModal";
 import DiscardWarnModal from "../shared/DiscardWarnModal";
 
@@ -64,61 +64,49 @@ const filterDatasetForUpload = (dataset: any, choice: "all" | "overlap") => {
   let filteredExpressionRows = dataset.parsedData || [];
   let nSamples = dataset.nSamples || 0;
 
-  const isFsHeaders = dataset.fs_featuresOrientation === "headers";
+  const geneIdCol = dataset.geneIdCol || (dataset.columns && dataset.columns[0]) || "";
+  const geneInfoCols = dataset.geneInfoCols || [];
+  
+  const fsFeatureIdx = dataset.fs_featureIndexValue !== undefined ? (dataset.fs_featureIndexValue - 1) : -1;
+  
+  const exprSampleCols = (dataset.columns || []).filter((c: string, idx: number) => {
+    if (idx === fsFeatureIdx) return false;
+    if (c === geneIdCol || geneInfoCols.includes(c)) return false;
+    return true;
+  });
+  
+  const commonSamples = exprSampleCols.filter((s: string) => validClinicalSamples.includes(s));
 
-  if (isFsHeaders) {
-    const sampleIdColIdx = (dataset.fs_featureIndexValue || 1) - 1;
-    filteredExpressionRows = (dataset.parsedData || []).filter((row: any[]) => {
-      const rowSampleId = row[sampleIdColIdx];
-      return rowSampleId && validClinicalSamples.includes(rowSampleId);
-    });
-    const commonSamples = filteredExpressionRows.map((row: any[]) => row[sampleIdColIdx]);
-    nSamples = commonSamples.length;
-  } else {
-    const geneIdCol = dataset.geneIdCol || (dataset.columns && dataset.columns[0]) || "";
-    const geneInfoCols = dataset.geneInfoCols || [];
-    
-    const fsFeatureIdx = dataset.fs_featureIndexValue !== undefined ? (dataset.fs_featureIndexValue - 1) : -1;
-    
-    const exprSampleCols = (dataset.columns || []).filter((c: string, idx: number) => {
-      if (idx === fsFeatureIdx) return false;
-      if (c === geneIdCol || geneInfoCols.includes(c)) return false;
-      return true;
-    });
-    
-    const commonSamples = exprSampleCols.filter((s: string) => validClinicalSamples.includes(s));
+  keepCols = (dataset.columns || []).filter((c: string, idx: number) => {
+    if (idx === fsFeatureIdx) return true;
+    if (c === geneIdCol || geneInfoCols.includes(c)) return true;
+    return commonSamples.includes(c);
+  });
 
-    keepCols = (dataset.columns || []).filter((c: string, idx: number) => {
-      if (idx === fsFeatureIdx) return true;
-      if (c === geneIdCol || geneInfoCols.includes(c)) return true;
-      return commonSamples.includes(c);
-    });
-
-    const keepIndices = keepCols.map((c: string) => (dataset.columns || []).indexOf(c));
-    
-    if (dataset.uploadDone) {
-      filteredExpressionRows = (dataset.parsedData || []).map((row: any[], rIdx: number) => {
-        if (!row) return row;
-        if (rIdx < 10) {
-          return keepIndices.map(idx => row[idx]);
-        }
-        // Keep it minimized
-        const newRow: any[] = [];
-        const geneIdIdx = dataset.columns ? dataset.columns.indexOf(geneIdCol) : -1;
-        const targetIdx = geneIdIdx !== -1 ? geneIdIdx : 0;
-        const keepGeneIdIdx = keepCols.indexOf(geneIdCol);
-        const newTargetIdx = keepGeneIdIdx !== -1 ? keepGeneIdIdx : 0;
-        newRow[newTargetIdx] = row[targetIdx] !== undefined ? row[targetIdx] : row[0];
-        return newRow;
-      });
-    } else {
-      filteredExpressionRows = (dataset.parsedData || []).map((row: any[]) => {
+  const keepIndices = keepCols.map((c: string) => (dataset.columns || []).indexOf(c));
+  
+  if (dataset.uploadDone) {
+    filteredExpressionRows = (dataset.parsedData || []).map((row: any[], rIdx: number) => {
+      if (!row) return row;
+      if (rIdx < 10) {
         return keepIndices.map(idx => row[idx]);
-      });
-    }
-    
-    nSamples = commonSamples.length;
+      }
+      // Keep it minimized
+      const newRow: any[] = [];
+      const geneIdIdx = dataset.columns ? dataset.columns.indexOf(geneIdCol) : -1;
+      const targetIdx = geneIdIdx !== -1 ? geneIdIdx : 0;
+      const keepGeneIdIdx = keepCols.indexOf(geneIdCol);
+      const newTargetIdx = keepGeneIdIdx !== -1 ? keepGeneIdIdx : 0;
+      newRow[newTargetIdx] = row[targetIdx] !== undefined ? row[targetIdx] : row[0];
+      return newRow;
+    });
+  } else {
+    filteredExpressionRows = (dataset.parsedData || []).map((row: any[]) => {
+      return keepIndices.map(idx => row[idx]);
+    });
   }
+  
+  nSamples = commonSamples.length;
 
   const finalClinicalRows = filteredClinicalRows.filter((row: any[]) => {
     return validClinicalSamples.includes(row[sampleIdx]);
@@ -144,6 +132,21 @@ export default function FSUploadStep({ datasetId }: Props) {
   const [showWarnModal, setShowWarnModal] = useState(false);
   const [showDiscardModal, setShowDiscardModal] = useState(false);
 
+  const abortControllerRef = useRef<AbortController | null>(null);
+  const activeJobIdRef = useRef<string | null>(null);
+
+  const handleCancel = () => {
+    if (activeJobIdRef.current) {
+      cancelComputeJobAPI(activeJobIdRef.current);
+      activeJobIdRef.current = null;
+    }
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort();
+      abortControllerRef.current = null;
+    }
+    setLoading(false);
+  };
+
   const [matchingSamples, setMatchingSamples] = useState<string[]>([]);
   const [missingClinSamples, setMissingClinSamples] = useState<string[]>([]);
   const [clinicalNoExprSamples, setClinicalNoExprSamples] = useState<string[]>([]);
@@ -153,9 +156,7 @@ export default function FSUploadStep({ datasetId }: Props) {
 
   // Samples matching comparison logic
   const exprSamples = ds
-    ? (ds.fs_featuresOrientation === "headers" 
-      ? (ds.parsedData ? ds.parsedData.map(r => r[(ds.fs_featureIndexValue || 1) - 1]).filter(Boolean) : [])
-      : ds.columns.filter((c, idx) => idx !== ((ds.fs_featureIndexValue || 1) - 1) && !(ds.geneInfoCols || []).includes(c)))
+    ? ds.columns.filter((c, idx) => idx !== ((ds.fs_featureIndexValue || 1) - 1) && !(ds.geneInfoCols || []).includes(c))
     : [];
 
   const sampleIdIdx = ds && ds.clinicalFileName && ds.clinicalSampleIdCol && ds.clinicalColumns
@@ -186,9 +187,7 @@ export default function FSUploadStep({ datasetId }: Props) {
         return;
       }
       try {
-        const exprSamples = currentDs.fs_featuresOrientation === "headers" 
-          ? (currentDs.parsedData ? currentDs.parsedData.map(r => r[(currentDs.fs_featureIndexValue || 1) - 1]).filter(Boolean) : [])
-          : currentDs.columns.filter((c, idx) => idx !== ((currentDs.fs_featureIndexValue || 1) - 1) && !(currentDs.geneInfoCols || []).includes(c));
+        const exprSamples = currentDs.columns.filter((c, idx) => idx !== ((currentDs.fs_featureIndexValue || 1) - 1) && !(currentDs.geneInfoCols || []).includes(c));
 
         const res = alignSamplesLocal({
           expressionColumns: exprSamples,
@@ -226,21 +225,48 @@ export default function FSUploadStep({ datasetId }: Props) {
     JSON.stringify(clinSamples)
   ]);
 
+  const updateDs = (patch: Partial<any>) =>
+    dispatch({ type: "FS_UPDATE_DATASET", id: datasetId, patch });
+
+  const uniqueGroupValues: string[] = useMemo(() => {
+    if (!ds?.clinicalGroupCol || !ds?.clinicalColumns || !ds?.clinicalParsedData) return [];
+    const gIdx = ds.clinicalColumns.indexOf(ds.clinicalGroupCol);
+    if (gIdx === -1) return [];
+    const vals = (ds.clinicalParsedData as any[][])
+      .map(row => String(row[gIdx] ?? "").trim())
+      .filter(v => v !== "" && v !== "NA" && v !== "NaN");
+    return [...new Set(vals)];
+  }, [ds?.clinicalGroupCol, ds?.clinicalColumns, ds?.clinicalParsedData]);
+
+  // Auto-sync positive and negative classes when group column changes or when one changes
+  useEffect(() => {
+    if (!ds || !ds.clinicalGroupCol || uniqueGroupValues.length !== 2) return;
+    const [valA, valB] = uniqueGroupValues;
+    const currentPos = ds.fs_positiveClass;
+    const currentNeg = ds.fs_negativeClass;
+    if (!currentPos && !currentNeg) {
+      updateDs({ fs_positiveClass: valA, fs_negativeClass: valB });
+    } else if (currentPos && (!currentNeg || currentNeg === currentPos || !uniqueGroupValues.includes(currentNeg))) {
+      const nextNeg = uniqueGroupValues.find(v => v !== currentPos) || "";
+      if (nextNeg !== currentNeg) {
+        updateDs({ fs_negativeClass: nextNeg });
+      }
+    } else if (currentNeg && (!currentPos || currentPos === currentNeg || !uniqueGroupValues.includes(currentPos))) {
+      const nextPos = uniqueGroupValues.find(v => v !== currentNeg) || "";
+      if (nextPos !== currentPos) {
+        updateDs({ fs_positiveClass: nextPos });
+      }
+    }
+  }, [ds?.clinicalGroupCol, uniqueGroupValues, ds?.fs_positiveClass, ds?.fs_negativeClass]);
+
   const requireClinical = true;
 
   if (!ds) return null;
 
   const multipleDs = state.fsDatasets.length > 1;
 
-  const updateDs = (patch: Partial<typeof ds>) =>
-    dispatch({ type: "FS_UPDATE_DATASET", id: datasetId, patch });
-
-  const handleClear = async (scope: "expression" | "clinical") => {
-    try {
-      await clearDatasetAPI(ds.id, scope);
-    } catch (e) {
-      console.warn("clearDatasetAPI failed (non-fatal):", e);
-    }
+  const handleClear = (scope: "expression" | "clinical") => {
+    clearDatasetAPI(ds.id, scope).catch((e) => console.warn("clearDatasetAPI failed (non-fatal):", e));
     dispatch({
       type: "RESET_DOWNSTREAM_STEPS",
       datasetId: ds.id,
@@ -287,7 +313,7 @@ export default function FSUploadStep({ datasetId }: Props) {
           expressionFileName: "sample_expression.csv",
           expressionRawText: rawText,
           columns: result.columns,
-          geneInfoCols: result.columns.length > 0 ? [result.columns[0]] : [],
+          geneInfoCols: [],
           geneIdCol: result.columns[0] || "GeneID",
           geneIdType: "ensembl",
           detectedGeneIdType: "ensembl",
@@ -339,6 +365,8 @@ export default function FSUploadStep({ datasetId }: Props) {
   };
 
   const handleExpressionFile = async (file: File) => {
+    const controller = new AbortController();
+    abortControllerRef.current = controller;
     setLoadingMsg(`Parsing ${file.name}…`);
     setLoading(true);
     try {
@@ -352,6 +380,9 @@ export default function FSUploadStep({ datasetId }: Props) {
         .map((c, idx) => ({ name: c, idx }))
         .filter(item => !geneInfoColsToExclude.includes(item.name));
       const cleanColumns = keepIndices.map(item => item.name);
+      if (cleanColumns.length > 0 && (!cleanColumns[0] || cleanColumns[0].trim() === "")) {
+        cleanColumns[0] = geneIdCol || "GeneID";
+      }
       const cleanParsedData = parsed.parsedData.map(row => keepIndices.map(item => row[item.idx]));
 
       let uploadId: string | undefined = undefined;
@@ -360,7 +391,7 @@ export default function FSUploadStep({ datasetId }: Props) {
         setLoadingMsg(`Uploading ${file.name} in chunks…`);
         uploadId = await uploadFileInChunks(file, ds.id, "expression", (pct) => {
           setLoadingMsg(`Uploading ${file.name} (${pct}%)…`);
-        });
+        }, controller.signal);
       }
 
       updateDs({
@@ -370,8 +401,8 @@ export default function FSUploadStep({ datasetId }: Props) {
         expressionUploadId: uploadId,
         expressionRawText: "",
         columns: cleanColumns,
-        geneInfoCols: cleanColumns.length > 0 ? [cleanColumns[0]] : [],
-        geneIdCol: geneIdCol,
+        geneInfoCols: [],
+        geneIdCol: geneIdCol || (cleanColumns.length > 0 ? cleanColumns[0] : "GeneID"),
         detectedGeneIdType: parsed.detectedGeneIdType,
         geneIdType: parsed.detectedGeneIdType,
         fs_featuresOrientation: ds.fs_featuresOrientation || "column",
@@ -387,6 +418,9 @@ export default function FSUploadStep({ datasetId }: Props) {
         uploadDone: false,
       });
     } catch (error: any) {
+      if (error?.name === "AbortError" || controller.signal.aborted) {
+        return;
+      }
       updateDs({
         integrityOk: false,
         integrityIssues: [`Error parsing expression file: ${error.message}`],
@@ -397,6 +431,8 @@ export default function FSUploadStep({ datasetId }: Props) {
   };
 
   const handleClinicalFile = async (file: File) => {
+    const controller = new AbortController();
+    abortControllerRef.current = controller;
     setLoadingMsg(`Parsing ${file.name}…`);
     setLoading(true);
     try {
@@ -411,7 +447,7 @@ export default function FSUploadStep({ datasetId }: Props) {
         setLoadingMsg(`Uploading ${file.name} in chunks…`);
         uploadId = await uploadFileInChunks(file, ds.id, "clinical", (pct) => {
           setLoadingMsg(`Uploading ${file.name} (${pct}%)…`);
-        });
+        }, controller.signal);
       }
 
       const groupCol = parsed.clinicalColumns.find(c => c !== parsed.clinicalSampleIdCol) || "";
@@ -446,6 +482,9 @@ export default function FSUploadStep({ datasetId }: Props) {
         uploadDone: false,
       });
     } catch (error: any) {
+      if (error?.name === "AbortError" || controller.signal.aborted) {
+        return;
+      }
       updateDs({
         integrityIssues: [`Error parsing clinical file: ${error.message}`],
       });
@@ -464,38 +503,16 @@ export default function FSUploadStep({ datasetId }: Props) {
   let computedSamples = ds.nSamples || 0;
   let computedFeatures = ds.nFeatures || 0;
 
-  if (ds.fs_featuresOrientation === "headers") {
-    // Columns are Features, Rows are Samples
-    // Target identifier column index (1-based index mapped to 0-based array position)
-    const targetIdx = ds.fs_featureIndexValue ? ds.fs_featureIndexValue - 1 : 0;
-    
-    // Total sample count matches number of data rows minus non-sample configuration offsets if any apply
-    computedSamples = ds.nFeatures || totalRows;
-    
-    // Total features equals total columns minus index identifiers and explicitly defined non-sample columns
-    let excludedColsCount = nonSampleCount;
-    if (ds.geneInfoCols && ds.columns && !ds.geneInfoCols.includes(ds.columns[targetIdx])) {
-      excludedColsCount += 1;
-    } else if (!ds.geneInfoCols) {
-      excludedColsCount = 1;
-    }
-    computedFeatures = Math.max(0, totalCols - excludedColsCount);
-  } else {
-    // Features are Rows, Columns are Samples
-    const targetIdx = ds.fs_featureIndexValue ? ds.fs_featureIndexValue - 1 : 0;
-    
-    // Total features equals total data rows in the uploaded file
-    computedFeatures = ds.nFeatures || totalRows;
-    
-    // Total samples equals total columns minus index identifiers and explicitly defined non-sample columns
-    let excludedColsCount = nonSampleCount;
-    if (ds.geneInfoCols && ds.columns && !ds.geneInfoCols.includes(ds.columns[targetIdx])) {
-      excludedColsCount += 1;
-    } else if (!ds.geneInfoCols) {
-      excludedColsCount = 1;
-    }
-    computedSamples = Math.max(0, totalCols - excludedColsCount);
+  // Features are Rows, Columns are Samples
+  const targetIdx = ds.fs_featureIndexValue ? ds.fs_featureIndexValue - 1 : 0;
+  computedFeatures = ds.nFeatures || totalRows;
+  let excludedColsCount = nonSampleCount;
+  if (ds.geneInfoCols && ds.columns && !ds.geneInfoCols.includes(ds.columns[targetIdx])) {
+    excludedColsCount += 1;
+  } else if (!ds.geneInfoCols) {
+    excludedColsCount = 1;
   }
+  computedSamples = Math.max(0, totalCols - excludedColsCount);
   // ----------------------------------------
 
 
@@ -505,16 +522,6 @@ export default function FSUploadStep({ datasetId }: Props) {
   const isNoOverlap = hasClinical && exprSamples.length > 0 && matchingSamples.length === 0;
   const isPartialMatch = hasClinical && exprSamples.length > 0 && matchingSamples.length > 0 && (matchingSamples.length !== exprSamples.length || clinSamples.length !== exprSamples.length);
 
-  // Derive unique class count from the selected group column
-  const uniqueGroupValues: string[] = (() => {
-    if (!ds.clinicalGroupCol || !ds.clinicalColumns || !ds.clinicalParsedData) return [];
-    const gIdx = ds.clinicalColumns.indexOf(ds.clinicalGroupCol);
-    if (gIdx === -1) return [];
-    const vals = (ds.clinicalParsedData as any[][])
-      .map(row => String(row[gIdx] ?? "").trim())
-      .filter(v => v !== "" && v !== "NA" && v !== "NaN");
-    return [...new Set(vals)];
-  })();
   const uniqueGroupCount = uniqueGroupValues.length;
   const hasMultipleClasses = ds.clinicalGroupCol !== "" && uniqueGroupCount !== 2;
   const hasUnsetClasses = ds.clinicalGroupCol !== "" && (
@@ -524,27 +531,6 @@ export default function FSUploadStep({ datasetId }: Props) {
     !uniqueGroupValues.includes(ds.fs_positiveClass) ||
     !uniqueGroupValues.includes(ds.fs_negativeClass)
   );
-
-  // Auto-sync positive and negative classes when group column changes or when one changes
-  useEffect(() => {
-    if (!ds || !ds.clinicalGroupCol || uniqueGroupValues.length !== 2) return;
-    const [valA, valB] = uniqueGroupValues;
-    const currentPos = ds.fs_positiveClass;
-    const currentNeg = ds.fs_negativeClass;
-    if (!currentPos && !currentNeg) {
-      updateDs({ fs_positiveClass: valA, fs_negativeClass: valB });
-    } else if (currentPos && (!currentNeg || currentNeg === currentPos || !uniqueGroupValues.includes(currentNeg))) {
-      const nextNeg = uniqueGroupValues.find(v => v !== currentPos) || "";
-      if (nextNeg !== currentNeg) {
-        updateDs({ fs_negativeClass: nextNeg });
-      }
-    } else if (currentNeg && (!currentPos || currentPos === currentNeg || !uniqueGroupValues.includes(currentPos))) {
-      const nextPos = uniqueGroupValues.find(v => v !== currentNeg) || "";
-      if (nextPos !== currentPos) {
-        updateDs({ fs_positiveClass: nextPos });
-      }
-    }
-  }, [ds?.clinicalGroupCol, JSON.stringify(uniqueGroupValues), ds?.fs_positiveClass, ds?.fs_negativeClass]);
 
   const hasDanger =
     isNoOverlap ||
@@ -584,7 +570,6 @@ export default function FSUploadStep({ datasetId }: Props) {
     ds.platform !== ds.submittedPlatform ||
     ds.geneIdCol !== ds.submittedGeneIdCol ||
     ds.geneIdType !== ds.submittedGeneIdType ||
-    ds.fs_featuresOrientation !== ds.submittedFsFeaturesOrientation ||
     ds.fs_featureIndexValue !== ds.submittedFsFeatureIndexValue ||
     ds.fs_datasetPurpose !== ds.submittedFsDatasetPurpose ||
     ds.fs_isInternalValidation !== ds.submittedFsIsInternalValidation
@@ -626,9 +611,7 @@ export default function FSUploadStep({ datasetId }: Props) {
           });
 
           // Intersect with expression samples to get actual matched samples
-          const exprSamples = d.fs_featuresOrientation === "headers" 
-            ? (d.parsedData ? d.parsedData.map(r => r[(d.fs_featureIndexValue || 1) - 1]).filter(Boolean) : [])
-            : d.columns.filter((c, idx) => idx !== ((d.fs_featureIndexValue || 1) - 1) && !(d.geneInfoCols || []).includes(c));
+          const exprSamples = d.columns.filter((c, idx) => idx !== ((d.fs_featureIndexValue || 1) - 1) && !(d.geneInfoCols || []).includes(c));
           const activeMatched = exprSamples.filter(s => !!sampleGroupsMap[s]);
           const groupCounts: Record<string, number> = {};
           activeMatched.forEach(s => {
@@ -652,43 +635,9 @@ export default function FSUploadStep({ datasetId }: Props) {
   const idx = sorted.findIndex(d => d.id === datasetId);
   const isLastDataset = state.fsDatasets.length <= 1 || idx === sorted.length - 1;
 
-  // Compute shared feature count across all datasets (only meaningful on the last dataset step)
-  // Aware of feature orientation: when features are column names (headers) vs in a single column (rows).
-  const getFsDatasetFeatureIds = (d: typeof sorted[0]): Set<string> => {
-    if (d.fs_featuresOrientation === "headers") {
-      const sampleIdCol = d.clinicalSampleIdCol || d.geneIdCol || "SampleID";
-      const infoCols = d.geneInfoCols || [];
-      const featureCols = (d.columns || []).filter(c => c !== sampleIdCol && !infoCols.includes(c));
-      return new Set(featureCols);
-    }
-    if (!d.parsedData || d.parsedData.length === 0) return new Set();
-    const geneIdIdx = d.columns ? d.columns.indexOf(d.geneIdCol) : -1;
-    if (geneIdIdx === -1) return new Set(d.parsedData.map(row => String(row[0])));
-    return new Set(d.parsedData.map(row => String(row[geneIdIdx])));
-  };
-
-  const sharedFsFeatureCount: number = (() => {
-    if (state.fsDatasets.length <= 1) return 0;
-    if (sorted.some(d => !d.parsedData || d.parsedData.length === 0)) return 0;
-    let intersection = getFsDatasetFeatureIds(sorted[0]);
-    for (let i = 1; i < sorted.length; i++) {
-      const next = getFsDatasetFeatureIds(sorted[i]);
-      intersection = new Set([...intersection].filter(x => next.has(x)));
-    }
-    return intersection.size;
-  })();
-
-  const sharedFsFeatureError: string | null =
-    state.fsDatasets.length > 1 &&
-    isLastDataset &&
-    sorted.every(d => d.parsedData && d.parsedData.length > 0) &&
-    sharedFsFeatureCount <= 10
-      ? `Only ${sharedFsFeatureCount} shared feature(s) found across datasets. At least 11 shared features are required to proceed.`
-      : null;
-
-  // Cross-dataset purpose allocation is deferred to ModelSelectionStep.
-  const validationError = isLastDataset ? (sharedFsFeatureError ?? null) : null;
-  const isBlockedByValidation = state.fsDatasets.length > 1 && isLastDataset && !!validationError;
+  // Authoritative shared feature validation across datasets is performed after upload on the Upload Summary (all-datasets) and Model Selection steps using the full server expression matrices.
+  const validationError: string | null = null;
+  const isBlockedByValidation = false;
 
   
   const completedModules: string[] = [];
@@ -699,9 +648,11 @@ export default function FSUploadStep({ datasetId }: Props) {
   const handleNext = async () => {
     setLoading(true);
     setLoadingMsg("Uploading dataset to server…");
+    const controller = new AbortController();
+    abortControllerRef.current = controller;
     let datasetToUpload = { ...ds };
     if (ds.clinicalFileName) {
-      datasetToUpload = filterDatasetForUpload(ds, "overlap");
+      datasetToUpload = filterDatasetForUpload(datasetToUpload, "overlap");
     }
 
     let missingCount = ds.processingMissingValuesCount || 0;
@@ -713,10 +664,20 @@ export default function FSUploadStep({ datasetId }: Props) {
 
     try {
       if (datasetToUpload.expressionFileName && (datasetToUpload.parsedData || datasetToUpload.expressionFilePath || datasetToUpload.expressionUploadId)) {
-        const res = await uploadFSDatasetsAPI([datasetToUpload]);
-        if (res && res.status === "success" && Array.isArray(res.datasets)) {
+        const res = await uploadFSDatasetsAPI(
+          [datasetToUpload],
+          ({ jobId }) => { activeJobIdRef.current = jobId; },
+          controller.signal
+        );
+        if (!res || res.status !== "success") {
+          throw new Error(res?.error || "Failed to process dataset on server");
+        }
+        if (Array.isArray(res.datasets)) {
           const matched = res.datasets.find((d: any) => d.datasetId === ds.id);
           if (matched) {
+            if (matched.error) {
+              throw new Error(matched.error);
+            }
             if (matched.missingValuesCount !== undefined) {
               missingCount = matched.missingValuesCount;
             }
@@ -744,8 +705,14 @@ export default function FSUploadStep({ datasetId }: Props) {
           }
         }
       }
-    } catch (e) {
+    } catch (e: any) {
+      setLoading(false);
+      if (e?.name === "AbortError" || controller.signal.aborted) {
+        return;
+      }
       console.error("Failed to upload dataset to server:", e);
+      alert(e?.message || "Failed to upload dataset to server. Please check your data files and try again.");
+      return;
     }
 
     // Only run cross-dataset server-side validation on the last dataset upload.
@@ -806,6 +773,8 @@ export default function FSUploadStep({ datasetId }: Props) {
       fs_negativeClass: datasetToUpload.fs_negativeClass,
       clinicalParsedData: datasetToUpload.clinicalParsedData,
       clinicalColumns: finalClinicalColumns,
+      dataType: datasetToUpload.dataType,
+      submittedDataType: datasetToUpload.dataType,
       submittedExpressionFileName: ds.expressionFileName,
       submittedClinicalFileName: datasetToUpload.clinicalFileName,
       submittedClinicalSampleIdCol: datasetToUpload.clinicalSampleIdCol,
@@ -860,13 +829,11 @@ export default function FSUploadStep({ datasetId }: Props) {
     }
   };
 
-  const targetSelectorLabel = ds.fs_featuresOrientation === "column" 
-    ? "Feature Column:" 
-    : "Sample ID Column:";
+  const targetSelectorLabel = "Feature ID Column:";
 
   return (
     <>
-      {loading && <Spinner label={loadingMsg} sublabel="Please wait…" />}
+      {loading && <Spinner label={loadingMsg} sublabel="Please wait…" onCancel={handleCancel} />}
       {showDiscardModal && (
         <DiscardWarnModal
           stepId="upload"
@@ -908,11 +875,19 @@ export default function FSUploadStep({ datasetId }: Props) {
               input.onchange = e => { const f = (e.target as HTMLInputElement).files?.[0]; if (f) handleExpressionFile(f); };
               input.click();
             }}
+            role="button"
+            tabIndex={0}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" || e.key === " ") {
+                e.preventDefault();
+                (e.currentTarget as HTMLElement).click();
+              }
+            }}
             onDragOver={e => { e.preventDefault(); setExpressionDrag(true); }}
             onDragLeave={() => setExpressionDrag(false)}
             onDrop={e => { e.preventDefault(); setExpressionDrag(false); const f = e.dataTransfer.files?.[0]; if (f) handleExpressionFile(f); }}
           >
-            <div className="drop-zone-icon">📊</div>
+            <div className="drop-zone-icon"><BarChart3 size={32} /></div>
             <div className="drop-zone-title">Drop expression file here</div>
             <div className="drop-zone-hint">CSV · TSV · TXT</div>
           </div>
@@ -948,8 +923,8 @@ export default function FSUploadStep({ datasetId }: Props) {
                   <label style={{ fontSize: 13, fontWeight: 500 }}>Data Type</label>
                   <span style={{
                     fontSize: 10, fontWeight: 700, padding: "1px 6px", borderRadius: 4,
-                    background: getHierarchyGroup(ds.dataType || "readcounts") === "transcriptomics" ? "hsl(214 50% 93%)" : (getHierarchyGroup(ds.dataType || "readcounts") === "proteomics" ? "hsl(140 40% 93%)" : "hsl(30 50% 93%)"),
-                    color: getHierarchyGroup(ds.dataType || "readcounts") === "transcriptomics" ? "hsl(214 58% 30%)" : (getHierarchyGroup(ds.dataType || "readcounts") === "proteomics" ? "hsl(140 50% 25%)" : "hsl(30 60% 30%)"),
+                    background: "hsl(214 50% 93%)",
+                    color: "hsl(214 58% 30%)",
                     border: "1px solid var(--border)"
                   }}>
                     {getHierarchyGroup(ds.dataType || "readcounts").toUpperCase()}
@@ -963,35 +938,32 @@ export default function FSUploadStep({ datasetId }: Props) {
                     background: "#fff", cursor: "pointer", listStyle: "none", userSelect: "none"
                   }}>
                     <span>
-                      {ds.dataType === "microarray" && "Microarray"}
-                      {ds.dataType === "proteomics" && "Proteomics"}
-                      {ds.dataType === "others" && "Others (Untyped)"}
-                      {(!ds.dataType || ds.dataType === "readcounts") && "RNA-seq (Readcounts)"}
+                      {formatDataTypeLabel(ds.dataType || "readcounts")}
                     </span>
                     <span style={{ fontSize: 10, color: "var(--muted-foreground)" }}>▼</span>
                   </summary>
 
                   <div style={{
                     position: "absolute", top: "100%", left: 0, right: 0, zIndex: 50, marginTop: 4,
-                    border: "1px solid var(--border)", borderRadius: 7, padding: "4px 0", maxHeight: 160,
+                    border: "1px solid var(--border)", borderRadius: 7, padding: "4px 0", maxHeight: 200,
                     overflowY: "auto", background: "#fff", boxShadow: "0 4px 6px -1px rgb(0 0 0 / 0.1), 0 2px 4px -2px rgb(0 0 0 / 0.1)"
                   }}>
                     {[
-                      { value: "readcounts", label: "RNA-seq (Readcounts)" },
+                      { value: "readcounts", label: "Read counts" },
                       { value: "microarray", label: "Microarray probe intensities" },
                       { value: "proteomics", label: "Proteomics" },
-                      { value: "others", label: "Others (eg. metabolomics, lipidomics)" }
+                      { value: "type1",      label: "Type 1 (General)" },
+                      { value: "type2",      label: "Type 2 (General)" },
+                      { value: "others",     label: "Others (eg. metabolomics, lipidomics)" },
                     ].map((option) => {
-                      const isSelected = (ds.dataType || "readcounts") === option.value;
+                      const effectiveType = ds.dataType || "readcounts";
+                      const isSelected = effectiveType === option.value;
                       return (
                         <div
                           key={option.value}
                           onClick={(e) => {
                             const newType = option.value as DataType;
-                            const patch: Partial<typeof ds> = { dataType: newType };
-                            if (newType !== "microarray") {
-                              patch.platform = "";
-                            }
+                            const patch: Partial<typeof ds> = { dataType: newType, platform: "" };
                             updateDs(patch);
                             const details = (e.target as HTMLElement).closest("details");
                             if (details) details.removeAttribute("open");
@@ -1015,63 +987,6 @@ export default function FSUploadStep({ datasetId }: Props) {
 
             {/* Configuration */}
             <div style={{ marginBottom: 18, display: "flex", flexDirection: "row", gap: 14 }}> 
-              {/* Orientation Selector Dropdown */}
-              <div style={{ display: "flex", flexDirection: "column", width: 200, position: "relative" }}>
-                <label style={{ fontSize: 13, fontWeight: 500, marginBottom: 5 }}>Features Orientation</label>
-                <details style={{ width: "100%" }}>
-                  <summary style={{
-                    display: "flex", justifyContent: "space-between", alignItems: "center",
-                    padding: "8px 10px", border: "1px solid var(--border)", borderRadius: 7, fontSize: 13,
-                    background: "#fff", cursor: "pointer", listStyle: "none", userSelect: "none"
-                  }}>
-                    <span>
-                      {ds.fs_featuresOrientation === "column" ? "Features are Rows" : "Features are Headers"}
-                    </span>
-                    <span style={{ fontSize: 10, color: "var(--muted-foreground)" }}>▼</span>
-                  </summary>
-                  
-                  <div style={{
-                    position: "absolute", top: "100%", left: 0, right: 0, zIndex: 50, marginTop: 4, 
-                    border: "1px solid var(--border)", borderRadius: 7, padding: "4px 0", maxHeight: 160,  
-                    overflowY: "auto", background: "#fff", boxShadow: "0 4px 6px -1px rgb(0 0 0 / 0.1), 0 2px 4px -2px rgb(0 0 0 / 0.1)"
-                  }}>
-                    <div
-                      onClick={(e) => {
-                        updateDs({ fs_featuresOrientation: "headers" });
-                        const details = (e.target as HTMLElement).closest("details");
-                        if (details) details.removeAttribute("open");
-                      }}
-                      style={{
-                        padding: "8px 10px", fontSize: 12, cursor: "pointer",
-                        background: ds.fs_featuresOrientation !== "column" ? "var(--selected-bg)" : "transparent",
-                        fontWeight: ds.fs_featuresOrientation !== "column" ? 600 : 400
-                      }}
-                      onMouseEnter={e => e.currentTarget.style.background = "var(--selected-bg)"}
-                      onMouseLeave={e => e.currentTarget.style.background = ds.fs_featuresOrientation !== "column" ? "var(--selected-bg)" : "transparent"}
-                    >
-                      Features are Headers
-                    </div>
-
-                    <div
-                      onClick={(e) => {
-                        updateDs({ fs_featuresOrientation: "column" });
-                        const details = (e.target as HTMLElement).closest("details");
-                        if (details) details.removeAttribute("open");
-                      }}
-                      style={{
-                        padding: "8px 10px", fontSize: 12, cursor: "pointer",
-                        background: ds.fs_featuresOrientation === "column" ? "var(--selected-bg)" : "transparent",
-                        fontWeight: ds.fs_featuresOrientation === "column" ? 600 : 400
-                      }}
-                      onMouseEnter={e => e.currentTarget.style.background = "var(--selected-bg)"}
-                      onMouseLeave={e => e.currentTarget.style.background = ds.fs_featuresOrientation === "column" ? "var(--selected-bg)" : "transparent"}
-                    >
-                      Features are Rows
-                    </div>
-                  </div>
-                </details>
-              </div>
-
               {/* Target Selector Column */}
               <div style={{ display: "flex", flexDirection: "column", width: 200, position: "relative" }}>
                 <label style={{ fontSize: 12, fontWeight: 500, marginBottom: 4 }}>{targetSelectorLabel}</label>
@@ -1224,11 +1139,19 @@ export default function FSUploadStep({ datasetId }: Props) {
               input.onchange = e => { const f = (e.target as HTMLInputElement).files?.[0]; if (f) handleClinicalFile(f); };
               input.click();
             }}
+            role="button"
+            tabIndex={0}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" || e.key === " ") {
+                e.preventDefault();
+                (e.currentTarget as HTMLElement).click();
+              }
+            }}
             onDragOver={e => { e.preventDefault(); setClinicalDrag(true); }}
             onDragLeave={() => setClinicalDrag(false)}
             onDrop={e => { e.preventDefault(); setClinicalDrag(false); const f = e.dataTransfer.files?.[0]; if (f) handleClinicalFile(f); }}
             data-testid="dropzone-clinical">
-            <div className="drop-zone-icon">🧬</div>
+            <div className="drop-zone-icon"><Dna size={32} /></div>
             <div className="drop-zone-title">Drop clinical metadata file here</div>
             <div className="drop-zone-hint">CSV · TSV &nbsp;·&nbsp; SampleID + Group columns required</div>
           </div>
@@ -1678,6 +1601,14 @@ export default function FSUploadStep({ datasetId }: Props) {
             <div className="banner warn" style={{ marginBottom: 10 }}>
               <AlertTriangle size={15} style={{ flexShrink: 0 }} />
               <span>Warning: the system will only keep samples that have both expression and clinical data.</span>
+            </div>
+          )}
+          {ds.hasNA && (
+            <div className="banner warn" style={{ marginBottom: 10 }}>
+              <AlertTriangle size={15} style={{ flexShrink: 0 }} />
+              <span>
+                <strong>Notice:</strong> Missing values detected in the expression matrix. The system will automatically impute missing values using KNN imputation during feature selection.
+              </span>
             </div>
           )}
           {!hasMismatch && hasClinical && !hasDanger && (
