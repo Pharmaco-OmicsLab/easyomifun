@@ -769,6 +769,10 @@ run_ea_compute <- function(config) {
       db_clean <- gsub("[:/\\\\?*\"<>| ]", "_", db)
       gse_obj <- combined_res$gseObjects[[db]]
       if (!is.null(gse_obj) && nrow(as.data.frame(gse_obj)) > 0) {
+        # Save GSEA object RDS for fast on-demand plot rendering during export
+        obj_path <- session_file_path(dataset_id, sprintf("%s_gsea_obj_%s.rds", dataset_id, db_clean))
+        saveRDS(gse_obj, file = obj_path)
+
         dot_path   <- session_file_path(dataset_id, sprintf("%s_gsea_dotplot_%s.pdf", dataset_id, db_clean))
         ridge_path <- session_file_path(dataset_id, sprintf("%s_gsea_ridgeplot_%s.pdf", dataset_id, db_clean))
         es_up_path <- session_file_path(dataset_id, sprintf("%s_gsea_esplot_up_%s.pdf", dataset_id, db_clean))
@@ -808,44 +812,10 @@ run_ea_compute <- function(config) {
           if (dev.cur() > 1) dev.off()
         })
         
-        tryCatch({
-          pdf(ridge_path, width = 10, height = 7)
-          print(enrichplot::ridgeplot(gse_obj, showCategory = 10, label_format = 60) + 
-                  theme(axis.text.y = element_text(size = 12), aspect.ratio = 1.2))
-          dev.off()
-          register_export_file(uid_val, "gsea_ridgeplot", dataset_id, ridge_path, "ea", "gsea", db = db_clean, ext = "pdf")
-        }, error = function(e) {
-          if (dev.cur() > 1) dev.off()
-        })
-        
-        gse_df <- as.data.frame(gse_obj)
-        if (nrow(gse_df) > 0) {
-          up_rows <- gse_df[gse_df$NES > 0, ]
-          if (nrow(up_rows) > 0) {
-            top_up_id <- up_rows$ID[order(up_rows$NES, decreasing = TRUE)[1]]
-            tryCatch({
-              pdf(es_up_path, width = 9, height = 6)
-              print(enrichplot::gseaplot2(gse_obj, geneSetID = top_up_id, title = gse_df$Description[gse_df$ID == top_up_id]))
-              dev.off()
-              register_export_file(uid_val, "gsea_esplot_up", dataset_id, es_up_path, "ea", "gsea", db = db_clean, ext = "pdf")
-            }, error = function(e) {
-              if (dev.cur() > 1) dev.off()
-            })
-          }
-          
-          dn_rows <- gse_df[gse_df$NES < 0, ]
-          if (nrow(dn_rows) > 0) {
-            top_dn_id <- dn_rows$ID[order(dn_rows$NES, decreasing = FALSE)[1]]
-            tryCatch({
-              pdf(es_dn_path, width = 9, height = 6)
-              print(enrichplot::gseaplot2(gse_obj, geneSetID = top_dn_id, title = gse_df$Description[gse_df$ID == top_dn_id]))
-              dev.off()
-              register_export_file(uid_val, "gsea_esplot_down", dataset_id, es_dn_path, "ea", "gsea", db = db_clean, ext = "pdf")
-            }, error = function(e) {
-              if (dev.cur() > 1) dev.off()
-            })
-          }
-        }
+        # Register ridgeplot and ES plots for lazy on-demand rendering during export
+        register_export_file(uid_val, "gsea_ridgeplot", dataset_id, ridge_path, "ea", "gsea", db = db_clean, ext = "pdf")
+        register_export_file(uid_val, "gsea_esplot_up", dataset_id, es_up_path, "ea", "gsea", db = db_clean, ext = "pdf")
+        register_export_file(uid_val, "gsea_esplot_down", dataset_id, es_dn_path, "ea", "gsea", db = db_clean, ext = "pdf")
       }
     }
   }
@@ -1504,6 +1474,10 @@ run_inline_ea_compute <- function(payload) {
       db_clean <- gsub("[:/\\\\?*\"<>| ]", "_", db)
       gse_obj <- combined_res$gseObjects[[db]]
       if (!is.null(gse_obj) && nrow(as.data.frame(gse_obj)) > 0) {
+        # Save GSEA object RDS for fast on-demand plot rendering during export
+        obj_path <- session_file_path(dataset_id, sprintf("%s_gsea_obj_%s.rds", dataset_id, db_clean))
+        saveRDS(gse_obj, file = obj_path)
+
         dot_path   <- session_file_path(dataset_id, sprintf("%s_gsea_dotplot_%s.pdf", dataset_id, db_clean))
         ridge_path <- session_file_path(dataset_id, sprintf("%s_gsea_ridgeplot_%s.pdf", dataset_id, db_clean))
         es_up_path <- session_file_path(dataset_id, sprintf("%s_gsea_esplot_up_%s.pdf", dataset_id, db_clean))
@@ -1544,44 +1518,10 @@ run_inline_ea_compute <- function(payload) {
           if (dev.cur() > 1) dev.off()
         })
         
-        tryCatch({
-          pdf(ridge_path, width = 10, height = 7)
-          print(enrichplot::ridgeplot(gse_obj, showCategory = 10, label_format = 60) + 
-                  theme(axis.text.y = element_text(size = 12), aspect.ratio = 1.2))
-          dev.off()
-          register_export_file(uid_val, "gsea_ridgeplot", dataset_id, ridge_path, "ea", "gsea", db = db_clean, ext = "pdf")
-        }, error = function(e) {
-          if (dev.cur() > 1) dev.off()
-        })
-        
-        gse_df <- as.data.frame(gse_obj)
-        if (nrow(gse_df) > 0) {
-          up_rows <- gse_df[gse_df$NES > 0, ]
-          if (nrow(up_rows) > 0) {
-            top_up_id <- up_rows$ID[order(up_rows$NES, decreasing = TRUE)[1]]
-            tryCatch({
-              pdf(es_up_path, width = 9, height = 6)
-              print(enrichplot::gseaplot2(gse_obj, geneSetID = top_up_id, title = gse_df$Description[gse_df$ID == top_up_id]))
-              dev.off()
-              register_export_file(uid_val, "gsea_esplot_up", dataset_id, es_up_path, "ea", "gsea", db = db_clean, ext = "pdf")
-            }, error = function(e) {
-              if (dev.cur() > 1) dev.off()
-            })
-          }
-          
-          dn_rows <- gse_df[gse_df$NES < 0, ]
-          if (nrow(dn_rows) > 0) {
-            top_dn_id <- dn_rows$ID[order(dn_rows$NES, decreasing = FALSE)[1]]
-            tryCatch({
-              pdf(es_dn_path, width = 9, height = 6)
-              print(enrichplot::gseaplot2(gse_obj, geneSetID = top_dn_id, title = gse_df$Description[gse_df$ID == top_dn_id]))
-              dev.off()
-              register_export_file(uid_val, "gsea_esplot_down", dataset_id, es_dn_path, "ea", "gsea", db = db_clean, ext = "pdf")
-            }, error = function(e) {
-              if (dev.cur() > 1) dev.off()
-            })
-          }
-        }
+        # Register ridgeplot and ES plots for lazy on-demand rendering during export
+        register_export_file(uid_val, "gsea_ridgeplot", dataset_id, ridge_path, "ea", "gsea", db = db_clean, ext = "pdf")
+        register_export_file(uid_val, "gsea_esplot_up", dataset_id, es_up_path, "ea", "gsea", db = db_clean, ext = "pdf")
+        register_export_file(uid_val, "gsea_esplot_down", dataset_id, es_dn_path, "ea", "gsea", db = db_clean, ext = "pdf")
       }
     }
   }

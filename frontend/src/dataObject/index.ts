@@ -1,9 +1,9 @@
 export type GeneIdType = "ensembl" | "entrez" | "genename" | "others" | "" | string;
-export type DataType = "readcounts" | "microarray" | "proteomics" | "others";
+export type DataType = "readcounts" | "microarray" | "proteomics" | "type1" | "type2" | "others";
 export type Platform = "" | "affymetrix" | "illumina"
 export type MissingValueMethod = "mean" | "median" | "knn" | "remove" | "zero";
 export type NormMethod = "tmm" | "deseq2" | "cpm" | "quantile" | "vsn" | "none" | "vst" | "rlog" | "uq";
-export type FilterMethod = "cpm" | "min_count" | "variance" | "none";
+export type FilterMethod = "cpm" | "abundance" | "variance" | "none";
 export type PValueAdjMethod = "BH" | "BY" | "bonferroni" | "holm" | "none";
 export type BatchMethod = "combat" | "combat_seq" | "limma_removebatch" | "none";
 export type MetaMethod = "combine_pvalue" | "effect_size" | "vote_counting" | "shared_genes";
@@ -16,14 +16,27 @@ export type GSEADb = "MSigDB_H" | "MSigDB_C5" | "MSigDB_C2" | "KEGG" | "GO_BP" |
 export type MLModel = "logistic" | "svm" | "randomforest" | "gbm" | "stabl" | "boruta";
 export type CVMethod = "k_fold" | "loocv";
 
-export type HierarchyGroup = "transcriptomics" | "proteomics" | "others";
+export type HierarchyGroup = "transcriptomics" | "proteomics" | "general" | "others";
 export type FSMultiDatasetMode = "individual" | "combine";
 export type FSValidationStrategy = "train-test-split" | "cv-only";
 
 export function getHierarchyGroup(dataType: DataType | string): HierarchyGroup {
   if (dataType === "readcounts" || dataType === "microarray") return "transcriptomics";
   if (dataType === "proteomics") return "proteomics";
+  if (dataType === "type1" || dataType === "type2") return "general";
   return "others";
+}
+
+export function formatDataTypeLabel(dataType?: DataType | string): string {
+  switch ((dataType || "").toLowerCase()) {
+    case "readcounts": return "Read counts";
+    case "microarray": return "Microarray probe intensities";
+    case "proteomics": return "Proteomics";
+    case "type1":      return "Type 1";
+    case "type2":      return "Type 2";
+    case "others":     return "Others (eg. metabolomics, lipidomics)";
+    default:           return dataType || "Read counts";
+  }
 }
 
 export function canPoolDatasets(dt1: DataType | string, dt2: DataType | string): boolean {
@@ -71,6 +84,36 @@ export function isEAEligible(
   return true;
 }
 
+export interface PCAPlotPoint {
+  sample: string;
+  pc1: number;
+  pc2: number;
+  group?: string;
+  batch?: string;
+  dataset?: string;
+}
+
+export interface PCAPlotData {
+  pc1Label: string;
+  pc2Label: string;
+  title?: string;
+  isLog2Transformed?: boolean;
+  points: PCAPlotPoint[];
+}
+
+export interface QCSingleStageData {
+  meanVariance?: {
+    means: number[];
+    vars: number[];
+    names: string[];
+  };
+  distribution?: {
+    grid: number[];
+    samples: Array<{ name: string; y: number[] }>;
+  };
+  pca?: PCAPlotData;
+}
+
 export interface GeneColumn { name: string; isGeneId: boolean; }
 
 export interface DatasetConfig {
@@ -88,6 +131,7 @@ export interface DatasetConfig {
   isNormalized: boolean;
   detectedIsNormalized: boolean;
   dataType: DataType;
+  detectedDataType?: DataType;
   platform: Platform;
   microarrayPlatformId?: string;
   microarrayOrganism?: string;
@@ -123,6 +167,24 @@ export interface DatasetConfig {
   processingRemovedFeatures: number;
   processingRetainedFeatures: number;
   processingMissingValuesCount: number;
+  qc?: {
+    before?: QCSingleStageData;
+    after?: QCSingleStageData;
+    meanVariance?: {
+      means: number[];
+      vars: number[];
+      names: string[];
+    };
+    distribution?: {
+      grid: number[];
+      samples: Array<{ name: string; y: number[] }>;
+    };
+    pca?: PCAPlotData;
+  };
+  normalPca?: PCAPlotData;
+  pcaInteractive?: PCAPlotData;
+  pcaBeforeInteractive?: PCAPlotData;
+  pcaAfterInteractive?: PCAPlotData;
   uploadDone: boolean;
   annotationDone: boolean;
   processingDone: boolean;
@@ -173,13 +235,15 @@ export interface DatasetConfig {
   isInline?: boolean;
   parentDatasetId?: string;
   groups?: string[];
+  detectionPvalPrefix?: string;    // user-typed pattern for contains-match
+  detectionPvalCols?: string[];    // matched column names (excluded from samples)
+  celFolderPath?: string;          // desktop CEL folder path (Electron only)
   sharedFeaturesCount?: number;
 }
 
 export interface ProcessingConfig {
   filterMethod: FilterMethod | "" | null;
   cpmThreshold: number | "" | null;
-  countThreshold: number | "" | null;
   varianceThreshold: number | "" | null;
   minSamples: number | "" | null;
   missingMethod: MissingValueMethod | "" | null;
@@ -192,10 +256,20 @@ export interface ProcessingConfig {
   maFilterMethod?: FilterMethod | "" | null;
   protFilterMethod?: FilterMethod | "" | null;
   othFilterMethod?: FilterMethod | "" | null;
+  rcReadcountThreshold?: number | "" | null;
+  rcSamplePercent?: number | "" | null;
   rcVariance?: number | "" | null;
+  normRcAbundanceMethod?: "mean" | "median" | "" | null;
+  normRcAbundanceThreshold?: number | "" | null;
   normRcVariance?: number | "" | null;
+  maAbundanceMethod?: "mean" | "median" | "" | null;
+  maAbundanceThreshold?: number | "" | null;
   maVariance?: number | "" | null;
+  protAbundanceMethod?: "mean" | "median" | "" | null;
+  protAbundanceThreshold?: number | "" | null;
   protVariance?: number | "" | null;
+  othAbundanceMethod?: "mean" | "median" | "" | null;
+  othAbundanceThreshold?: number | "" | null;
   othVariance?: number | "" | null;
 }
 

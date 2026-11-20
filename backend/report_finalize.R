@@ -184,7 +184,9 @@ finalize_upload_datasets <- function(res) {
 }
 
 finalize_annotation <- function(res, datasets, strategy, organisms, biotypes) {
+  if (!is.list(res) || inherits(res, "try-error")) return(res)
   for (r in res) {
+    if (!is.list(r) || inherits(r, "try-error")) next
     if (!is.null(r$datasetId)) {
       tryCatch({
         d_config <- NULL
@@ -221,7 +223,9 @@ finalize_annotation <- function(res, datasets, strategy, organisms, biotypes) {
 }
 
 finalize_processing <- function(res, body_data) {
+  if (!is.list(res) || inherits(res, "try-error")) return(res)
   for (r in res) {
+    if (!is.list(r) || inherits(r, "try-error")) next
     if (!is.null(r$datasetId) && !is.null(r$parsedData) && length(r$parsedData) > 0) {
       tryCatch({
         d_config <- NULL
@@ -232,24 +236,38 @@ finalize_processing <- function(res, body_data) {
           }
         }
         if (!is.null(d_config)) {
+          dtype <- d_config$dataType %||% "readcounts"
           filt_method <- d_config$filterMethod %||% "none"
           impute_method <- d_config$imputeMethod %||% "none"
           
           filt_text <- ""
-          if (filt_method == "skip") {
+          if (filt_method == "skip" || filt_method == "none" || identical(filt_method, "")) {
             filt_text <- "No variance or expression filtering was applied."
-          } else if (filt_method == "variance") {
-            var_cutoff <- d_config$varianceCutoff %||% 10
-            filt_text <- sprintf("Variance filtering was applied, retaining features with expression variance exceeding the **%s%%** percentile threshold.", var_cutoff)
-          } else if (filt_method == "cpm") {
-            cpm_thresh <- d_config$cpmThreshold %||% 1
-            cpm_samples <- d_config$cpmSamplesCount %||% 1
-            filt_text <- sprintf("Counts-per-million (CPM) filtering was applied, retaining features with CPM &ge; **%s** in at least **%s** samples.", cpm_thresh, cpm_samples)
-          } else if (filt_method == "min_count") {
-            min_count <- d_config$minCountThreshold %||% 10
-            filt_text <- sprintf("Minimum count filtering was applied, retaining features with raw counts &ge; **%s** in at least one sample.", min_count)
           } else {
-            filt_text <- "No filtering was applied."
+            methods_vec <- trimws(unlist(strsplit(filt_method, ",")))
+            parts <- character()
+            for (m in methods_vec) {
+              if (m == "variance") {
+                var_cutoff <- d_config$varianceCutoff %||% 10
+                parts <- c(parts, sprintf("Variance filtering was applied, retaining features with expression variance exceeding the **%s%%** percentile threshold.", var_cutoff))
+              } else if (m == "cpm") {
+                cpm_thresh <- d_config$cpmThreshold %||% 1
+                cpm_samples <- d_config$cpmSamplesCount %||% 1
+                parts <- c(parts, sprintf("Counts-per-million (CPM) filtering was applied, retaining features with CPM &ge; **%s** in at least **%s** samples.", cpm_thresh, cpm_samples))
+              } else if (m == "abundance") {
+                is_raw_rc <- identical(dtype, "readcounts") && !isTRUE(d_config$isNormalized)
+                if (is_raw_rc) {
+                  rc_thresh <- d_config$readcountThreshold %||% 10
+                  s_pct <- d_config$abundanceSamplePercent %||% 50
+                  parts <- c(parts, sprintf("Abundance filtering was applied, removing features with readcounts < **%s** in at least **%s%%** of samples.", rc_thresh, s_pct))
+                } else {
+                  abund_method <- d_config$abundanceMethod %||% "mean"
+                  abund_thresh <- d_config$abundanceThreshold %||% 10
+                  parts <- c(parts, sprintf("Abundance filtering was applied based on feature **%s** across samples, retaining features above the **%s%%** percentile threshold.", abund_method, abund_thresh))
+                }
+              }
+            }
+            filt_text <- if (length(parts) > 0) paste(parts, collapse = " ") else "No filtering was applied."
           }
           
           na_remove_pct <- d_config$naRemovePercent
@@ -259,11 +277,25 @@ finalize_processing <- function(res, body_data) {
           }
 
           impute_text <- ""
+          is_raw_rc <- identical(dtype, "readcounts") && !isTRUE(d_config$isNormalized)
           if (impute_method == "knn") {
             k_val <- d_config$knnNeighbors %||% 5
             impute_text <- sprintf("Missing values were imputed using **k-Nearest Neighbors (kNN)** imputation with k=%s, estimated from the observed expression profile.", k_val)
+            if (is_raw_rc) {
+              impute_text <- paste(impute_text, "For raw readcounts, imputed values were floored to the nearest integer.")
+            }
           } else if (impute_method == "median") {
             impute_text <- "Missing values were imputed using the **median** value of each feature across samples."
+            if (is_raw_rc) {
+              impute_text <- paste(impute_text, "For raw readcounts, imputed values were floored to the nearest integer.")
+            }
+          } else if (impute_method == "mean") {
+            impute_text <- "Missing values were imputed using the **mean** value of each feature across samples."
+            if (is_raw_rc) {
+              impute_text <- paste(impute_text, "For raw readcounts, imputed values were floored to the nearest integer.")
+            }
+          } else if (impute_method == "zero") {
+            impute_text <- "Missing values were imputed with zero."
           } else {
             impute_text <- "No missing value imputation was performed."
           }
@@ -293,7 +325,9 @@ finalize_processing <- function(res, body_data) {
 }
 
 finalize_normalization <- function(res, datasets, method_val, transform_type, prior_count) {
+  if (!is.list(res) || inherits(res, "try-error")) return(res)
   for (r in res) {
+    if (!is.list(r) || inherits(r, "try-error")) next
     if (!is.null(r$datasetId) && !is.null(r$parsedData) && length(r$parsedData) > 0) {
       tryCatch({
         d_config <- NULL
@@ -338,8 +372,11 @@ finalize_normalization <- function(res, datasets, method_val, transform_type, pr
         cat("[WARNING] Failed to append normalization results to report:", e$message, "\n")
       })
     }
+  }
 
+  if (is.list(datasets)) {
     for (d in datasets) {
+      if (!is.list(d) || inherits(d, "try-error")) next
       d_id <- d$id %||% d$datasetId
       if (!is.null(d_id)) {
         tryCatch(ensure_boxplot_before(d_id), error = function(e) NULL)
@@ -351,8 +388,10 @@ finalize_normalization <- function(res, datasets, method_val, transform_type, pr
 }
 
 finalize_batch_correction <- function(res, datasets, method_val, method_others) {
-  if (length(datasets) > 0) {
+  if (!is.list(res) || inherits(res, "try-error")) return(res)
+  if (is.list(datasets) && length(datasets) > 0) {
     for (d in datasets) {
+      if (!is.list(d) || inherits(d, "try-error")) next
       d_id <- d$id %||% d$datasetId
       if (!is.null(d_id)) {
         tryCatch(generate_pca_plots_for_export(d_id), error = function(e) NULL)
@@ -360,26 +399,30 @@ finalize_batch_correction <- function(res, datasets, method_val, method_others) 
       }
     }
 
-    ds_id_first <- datasets[[1]]$id
-    user_id_val <- get_user_id(ds_id_first)
-    if (is.null(user_id_val) || !nzchar(user_id_val)) user_id_val <- get_user_id(get_base_id(ds_id_first))
-    
-    batch_col <- datasets[[1]]$clinicalBatchCol %||% "Batch"
-    
-    ds_names <- sapply(datasets, function(d) if (!is.null(d$name) && nzchar(d$name)) d$name else d$id)
-    ds_names_str <- paste(ds_names, collapse = ", ")
-    
-    correct_method <- method_val
-    if (datasets[[1]]$dataType != "readcounts") {
-      correct_method <- method_others
+    first_d <- datasets[[1]]
+    if (is.list(first_d)) {
+      ds_id_first <- first_d$id %||% first_d$datasetId
+      user_id_val <- get_user_id(ds_id_first)
+      if (is.null(user_id_val) || !nzchar(user_id_val)) user_id_val <- get_user_id(get_base_id(ds_id_first))
+      
+      batch_col <- first_d$clinicalBatchCol %||% "Batch"
+      
+      ds_names <- sapply(datasets, function(d) if (is.list(d) && !is.null(d$name) && nzchar(d$name)) d$name else (if (is.list(d)) d$id %||% d$datasetId else ""))
+      ds_names <- ds_names[nzchar(ds_names)]
+      ds_names_str <- paste(ds_names, collapse = ", ")
+      
+      correct_method <- method_val
+      if (!identical(first_d$dataType, "readcounts")) {
+        correct_method <- method_others
+      }
+      
+      batch_md <- sprintf(
+        "Batch effect correction was applied across the following datasets: **%s**.\n\n**Correction Method:** %s\n**Batch Covariate Column:** %s\n\nCorrected expression data has been saved to the session repository. Quality control PCA plots before and after batch correction have been generated to assess correction efficacy.",
+        ds_names_str, toupper(correct_method), batch_col
+      )
+      
+      append_step_to_report(user_id_val, "Batch Effect Correction", batch_md, module = "dp")
     }
-    
-    batch_md <- sprintf(
-      "Batch effect correction was applied across the following datasets: **%s**.\n\n**Correction Method:** %s\n**Batch Covariate Column:** %s\n\nCorrected expression data has been saved to the session repository. Quality control PCA plots before and after batch correction have been generated to assess correction efficacy.",
-      ds_names_str, toupper(correct_method), batch_col
-    )
-    
-    append_step_to_report(user_id_val, "Batch Effect Correction", batch_md, module = "dp")
   }
   return(res)
 }
@@ -389,6 +432,7 @@ finalize_pca <- function(res) {
 }
 
 finalize_ea <- function(res, config) {
+  if (!is.list(res) || inherits(res, "try-error")) return(res)
   dataset_id <- if (!is.null(config$datasetId)) config$datasetId else ""
   methods_val <- if (!is.null(config$methods)) config$methods else list("ora")
   ora_db      <- config$oraDatabase
@@ -445,7 +489,9 @@ finalize_ea <- function(res, config) {
 }
 
 finalize_de_results <- function(res, datasets, pval_thresh, logfc_thresh, adjust_method, fallback_method) {
+  if (!is.list(res) || inherits(res, "try-error")) return(res)
   for (ds_id in names(res)) {
+    if (!is.list(res[[ds_id]]) || inherits(res[[ds_id]], "try-error")) next
     base_id <- get_base_id(ds_id)
     user_id_val <- get_user_id(ds_id)
     if (is.null(user_id_val) || !nzchar(user_id_val)) user_id_val <- get_user_id(base_id)
@@ -1526,7 +1572,7 @@ finalize_fs <- function(
 }
 
 finalize_fs_refit <- function(res, orig_out_path, input_data, selection_method, percentage_val, max_features_val, user_id, module = "fs") {
-  if (!is.null(res$.error)) return(res)
+  if (!is.list(res) || inherits(res, "try-error") || !is.null(res$.error)) return(res)
   
   orig_fs_results <- NULL
   if (!is.null(orig_out_path) && nzchar(orig_out_path) && file.exists(orig_out_path)) {
@@ -1580,12 +1626,12 @@ finalize_fs_refit <- function(res, orig_out_path, input_data, selection_method, 
 }
 
 finalize_cv <- function(res, datasets, cv_method, folds, user_id, module = "fs") {
-  if (!is.null(res$.error)) return(res)
+  if (!is.list(res) || inherits(res, "try-error") || !is.null(res$.error)) return(res)
   
   if (length(datasets) > 0) {
     for (d_id in names(res)) {
       cv_csv <- get_session_path(d_id, "cv_results_%s.csv")
-      save_list_to_csv(res[[d_id]], cv_csv)
+      save_list_to_csv(res[[d_id]]$metrics %||% res[[d_id]], cv_csv)
       saveRDS(res[[d_id]], get_session_path(d_id, "%s_fs_cv_results.rds"))
       register_export_file(user_id, "cv_results", get_base_id(d_id), cv_csv, module, "cv")
     }
@@ -1639,7 +1685,7 @@ finalize_cv <- function(res, datasets, cv_method, folds, user_id, module = "fs")
 }
 
 finalize_testing <- function(res, datasets, models, user_id, module = "fs") {
-  if (!is.null(res$.error)) return(res)
+  if (!is.list(res) || inherits(res, "try-error") || !is.null(res$.error)) return(res)
   
   if (length(datasets) > 0) {
     for (d in datasets) {
@@ -1716,6 +1762,7 @@ get_mime_content_type <- function(ext) {
     "png"  = "image/png",
     "tiff" = "image/tiff",
     "tif"  = "image/tiff",
+    "svg"  = "image/svg+xml",
     "jpeg" = "image/jpeg",
     "jpg"  = "image/jpeg",
     "csv"  = "text/csv",
@@ -1762,12 +1809,23 @@ materialize_manifest_entry <- function(entry, src, ext, uid, base_id, file_type)
   src_ext <- tolower(tools::file_ext(src))
 
   # Direct return if exact matching plot/text format
-  if (src_ext == target_ext && src_ext %in% c("pdf", "png", "tiff", "tif", "jpeg", "jpg", "csv", "txt", "md")) {
+  if (src_ext == target_ext && src_ext %in% c("pdf", "png", "tiff", "tif", "jpeg", "jpg", "csv", "txt", "md", "svg")) {
     return(list(
       file_path      = src,
       clean_filename = clean_filename,
       content_type   = get_mime_content_type(target_ext)
     ))
+  }
+
+  if (target_ext == "svg") {
+    svg_candidate <- sub("\\.[^.]+$", ".svg", src)
+    if (file.exists(svg_candidate)) {
+      return(list(
+        file_path      = svg_candidate,
+        clean_filename = clean_filename,
+        content_type   = get_mime_content_type("svg")
+      ))
+    }
   }
 
   export_dir <- file.path("tmp/user_sessions", uid, "exports")
@@ -1855,6 +1913,8 @@ resolve_zip_dir <- function(entry, target_module) {
   # Normalize module domain by key if needed
   if (k %in% c("de_all_results", "de_sig_results", "de_volcano", "de_ma", "de_heatmap_top10", "meta_results", "forest_plots", "heterogeneity_report")) {
     m <- "de"
+  } else if (k %in% c("qc_mean_variance", "qc_distribution", "qc_pca")) {
+    m <- "dp"
   } else if (grepl("^(ora_|gsea_)", k)) {
     m <- "ea"
   } else if (grepl("^(fs_|all_models_|cv_|testing_|confusion_|roc_|selected_|feature_|pooled_)", k)) {
@@ -1932,13 +1992,15 @@ build_zip_manifest <- function(uid, module = "dp", ds_ids = NULL) {
       }
     }
 
-    # If this dataset has batch correction, exclude generic pca_plots
-    if (identical(e$key, "pca_plots") && nzchar(e_base) && isTRUE(e_base %in% batch_datasets)) {
-      next
-    }
-
     target_dir <- resolve_zip_dir(e, target_module)
     if (is.null(target_dir) || is.na(target_dir) || !nzchar(target_dir)) next
+
+    if (e$key %in% c("gsea_ridgeplot", "gsea_esplot_up", "gsea_esplot_down")) {
+      tryCatch(ensure_gsea_plot(uid, e_base, e$key, e$db), error = function(err) NULL)
+    }
+    if (e$key %in% c("qc_mean_variance", "qc_distribution", "qc_pca")) {
+      tryCatch(ensure_qc_plots(e_base), error = function(err) NULL)
+    }
 
     src_file <- resolve_manifest_src_path(uid, e$path)
     if (!is.null(src_file) && isTRUE(file.exists(src_file))) {
@@ -1958,6 +2020,66 @@ build_zip_manifest <- function(uid, module = "dp", ds_ids = NULL) {
   selected_entries
 }
 
+ensure_gsea_plot <- function(uid, ds_id, file_type, db = NULL) {
+  base_id <- get_base_id(ds_id)
+  db_clean <- gsub("[:/\\\\?*\"<>| ]", "_", safe_str(db, "all"))
+  
+  target_pdf <- file.path("tmp/user_sessions", uid, sprintf("%s_%s_%s.pdf", base_id, file_type, db_clean))
+  if (file.exists(target_pdf)) return(target_pdf)
+  target_pdf_alt <- sprintf("tmp/%s_%s_%s.pdf", base_id, file_type, db_clean)
+  if (file.exists(target_pdf_alt)) return(target_pdf_alt)
+
+  rds_candidates <- list(
+    file.path("tmp/user_sessions", uid, sprintf("%s_gsea_obj_%s.rds", base_id, db_clean)),
+    sprintf("tmp/%s_gsea_obj_%s.rds", base_id, db_clean)
+  )
+  rds_path <- NULL
+  for (p in rds_candidates) {
+    if (file.exists(p)) { rds_path <- p; break }
+  }
+  if (is.null(rds_path)) return(NULL)
+
+  gse_obj <- tryCatch(readRDS(rds_path), error = function(e) NULL)
+  if (is.null(gse_obj)) return(NULL)
+
+  dest_pdf <- file.path("tmp/user_sessions", uid, sprintf("%s_%s_%s.pdf", base_id, file_type, db_clean))
+  dir.create(dirname(dest_pdf), showWarnings = FALSE, recursive = TRUE)
+
+  tryCatch({
+    if (file_type == "gsea_ridgeplot") {
+      pdf(dest_pdf, width = 10, height = 7)
+      print(enrichplot::ridgeplot(gse_obj, showCategory = 10, label_format = 60) + 
+              ggplot2::theme(axis.text.y = ggplot2::element_text(size = 12), aspect.ratio = 1.2))
+      dev.off()
+      return(dest_pdf)
+    } else if (file_type == "gsea_esplot_up") {
+      gse_df <- as.data.frame(gse_obj)
+      up_rows <- gse_df[gse_df$NES > 0, ]
+      if (nrow(up_rows) > 0) {
+        top_up_id <- up_rows$ID[order(up_rows$NES, decreasing = TRUE)[1]]
+        pdf(dest_pdf, width = 9, height = 6)
+        print(enrichplot::gseaplot2(gse_obj, geneSetID = top_up_id, title = gse_df$Description[gse_df$ID == top_up_id]))
+        dev.off()
+        return(dest_pdf)
+      }
+    } else if (file_type == "gsea_esplot_down") {
+      gse_df <- as.data.frame(gse_obj)
+      dn_rows <- gse_df[gse_df$NES < 0, ]
+      if (nrow(dn_rows) > 0) {
+        top_dn_id <- dn_rows$ID[order(dn_rows$NES, decreasing = FALSE)[1]]
+        pdf(dest_pdf, width = 9, height = 6)
+        print(enrichplot::gseaplot2(gse_obj, geneSetID = top_dn_id, title = gse_df$Description[gse_df$ID == top_dn_id]))
+        dev.off()
+        return(dest_pdf)
+      }
+    }
+  }, error = function(e) {
+    if (dev.cur() > 1) dev.off()
+    cat(sprintf("[EA] On-demand GSEA plot failed for %s: %s\n", file_type, conditionMessage(e)))
+  })
+  NULL
+}
+
 resolve_export_file <- function(file_type, ds_id, model = NULL, ext = "csv", user_id = "") {
   uid <- if (!is_empty_str(user_id) && user_id != "user") safe_str(user_id) else get_user_id(ds_id)
   base_id <- get_base_id(ds_id)
@@ -1971,6 +2093,14 @@ resolve_export_file <- function(file_type, ds_id, model = NULL, ext = "csv", use
   if (is.null(entry)) {
     if (file_type %in% c("pca_plots_before_batch", "pca_plots_after_batch", "pca_plots")) {
       tryCatch(generate_pca_plots_for_export(base_id), error = function(e) NULL)
+      manifest <- load_manifest(uid)
+      entry <- find_manifest_entry(manifest, file_type, base_id, model = model, db = model)
+    } else if (file_type %in% c("qc_mean_variance", "qc_distribution", "qc_pca")) {
+      tryCatch(ensure_qc_plots(base_id), error = function(e) NULL)
+      manifest <- load_manifest(uid)
+      entry <- find_manifest_entry(manifest, file_type, base_id, model = model, db = model)
+    } else if (file_type %in% c("gsea_ridgeplot", "gsea_esplot_up", "gsea_esplot_down")) {
+      tryCatch(ensure_gsea_plot(uid, base_id, file_type, model), error = function(e) NULL)
       manifest <- load_manifest(uid)
       entry <- find_manifest_entry(manifest, file_type, base_id, model = model, db = model)
     } else if (file_type %in% c("boxplot_before", "boxplot_after")) {

@@ -1,20 +1,15 @@
-import { useState, useEffect, useMemo } from "react";
+import { useState, useEffect, useMemo, useRef } from "react";
 import { useLocation } from "wouter";
-import { FileText, X, AlertTriangle, CheckCircle, Info, Download } from "lucide-react";
+import { FileText, X, AlertTriangle, CheckCircle, Info, Download, BarChart3, Dna } from "lucide-react";
 import { useAppStore } from "../../store/appStore";
 import { useMicroarrayPlatforms } from "../../hooks/useMicroarrayPlatforms";
 import Spinner from "../Spinner";
 import type { DataType, Platform } from "../../dataObject";
-import { parseExpressionFile, parseClinicalFile, detectGeneIdType, alignSamplesLocal, unparseCSV, getDesktopFilePath } from "../../lib/dataParser";
+import { parseExpressionFile, parseClinicalFile, detectGeneIdType, detectIsNormalized, alignSamplesLocal, unparseCSV, getDesktopFilePath } from "../../lib/dataParser";
 import { uploadFileInChunks } from "../../lib/chunkUploader";
-import { fetchSampleDataAPI, uploadDEDatasetDataAPI, redoStepAPI, clearDownstreamAPI, clearDatasetAPI } from "../../lib/api";
+import { fetchSampleDataAPI, uploadDEDatasetDataAPI, redoStepAPI, clearDownstreamAPI, clearDatasetAPI, cancelComputeJobAPI } from "../../lib/api";
 import WarnSampleModal from "../shared/WarnSampleModal";
 import DiscardWarnModal from "../shared/DiscardWarnModal";
-
-function detectIsNormalized(rows: string[][]): boolean {
-  if (!rows || rows.length === 0) return false;
-  return rows.some(row => row.slice(4).some(cell => cell.trim().includes(".")));
-}
 
 interface Props {
   datasetId: string;
@@ -68,61 +63,49 @@ const filterDatasetForUpload = (dataset: any, choice: "all" | "overlap") => {
   let filteredExpressionRows = dataset.parsedData || [];
   let nSamples = dataset.nSamples || 0;
 
-  const isFsHeaders = dataset.fs_featuresOrientation === "headers";
+  const geneIdCol = dataset.geneIdCol || (dataset.columns && dataset.columns[0]) || "";
+  const geneInfoCols = dataset.geneInfoCols || [];
+  
+  const fsFeatureIdx = dataset.fs_featureIndexValue !== undefined ? (dataset.fs_featureIndexValue - 1) : -1;
+  
+  const exprSampleCols = (dataset.columns || []).filter((c: string, idx: number) => {
+    if (idx === fsFeatureIdx) return false;
+    if (c === geneIdCol || geneInfoCols.includes(c)) return false;
+    return true;
+  });
+  
+  const commonSamples = exprSampleCols.filter((s: string) => validClinicalSamples.includes(s));
 
-  if (isFsHeaders) {
-    const sampleIdColIdx = (dataset.fs_featureIndexValue || 1) - 1;
-    filteredExpressionRows = (dataset.parsedData || []).filter((row: any[]) => {
-      const rowSampleId = row[sampleIdColIdx];
-      return rowSampleId && validClinicalSamples.includes(rowSampleId);
-    });
-    const commonSamples = filteredExpressionRows.map((row: any[]) => row[sampleIdColIdx]);
-    nSamples = commonSamples.length;
-  } else {
-    const geneIdCol = dataset.geneIdCol || (dataset.columns && dataset.columns[0]) || "";
-    const geneInfoCols = dataset.geneInfoCols || [];
-    
-    const fsFeatureIdx = dataset.fs_featureIndexValue !== undefined ? (dataset.fs_featureIndexValue - 1) : -1;
-    
-    const exprSampleCols = (dataset.columns || []).filter((c: string, idx: number) => {
-      if (idx === fsFeatureIdx) return false;
-      if (c === geneIdCol || geneInfoCols.includes(c)) return false;
-      return true;
-    });
-    
-    const commonSamples = exprSampleCols.filter((s: string) => validClinicalSamples.includes(s));
+  keepCols = (dataset.columns || []).filter((c: string, idx: number) => {
+    if (idx === fsFeatureIdx) return true;
+    if (c === geneIdCol || geneInfoCols.includes(c)) return true;
+    return commonSamples.includes(c);
+  });
 
-    keepCols = (dataset.columns || []).filter((c: string, idx: number) => {
-      if (idx === fsFeatureIdx) return true;
-      if (c === geneIdCol || geneInfoCols.includes(c)) return true;
-      return commonSamples.includes(c);
-    });
-
-    const keepIndices = keepCols.map((c: string) => (dataset.columns || []).indexOf(c));
-    
-    if (dataset.uploadDone) {
-      filteredExpressionRows = (dataset.parsedData || []).map((row: any[], rIdx: number) => {
-        if (!row) return row;
-        if (rIdx < 10) {
-          return keepIndices.map(idx => row[idx]);
-        }
-        // Keep it minimized
-        const newRow: any[] = [];
-        const geneIdIdx = dataset.columns ? dataset.columns.indexOf(geneIdCol) : -1;
-        const targetIdx = geneIdIdx !== -1 ? geneIdIdx : 0;
-        const keepGeneIdIdx = keepCols.indexOf(geneIdCol);
-        const newTargetIdx = keepGeneIdIdx !== -1 ? keepGeneIdIdx : 0;
-        newRow[newTargetIdx] = row[targetIdx] !== undefined ? row[targetIdx] : row[0];
-        return newRow;
-      });
-    } else {
-      filteredExpressionRows = (dataset.parsedData || []).map((row: any[]) => {
+  const keepIndices = keepCols.map((c: string) => (dataset.columns || []).indexOf(c));
+  
+  if (dataset.uploadDone) {
+    filteredExpressionRows = (dataset.parsedData || []).map((row: any[], rIdx: number) => {
+      if (!row) return row;
+      if (rIdx < 10) {
         return keepIndices.map(idx => row[idx]);
-      });
-    }
-    
-    nSamples = commonSamples.length;
+      }
+      // Keep it minimized
+      const newRow: any[] = [];
+      const geneIdIdx = dataset.columns ? dataset.columns.indexOf(geneIdCol) : -1;
+      const targetIdx = geneIdIdx !== -1 ? geneIdIdx : 0;
+      const keepGeneIdIdx = keepCols.indexOf(geneIdCol);
+      const newTargetIdx = keepGeneIdIdx !== -1 ? keepGeneIdIdx : 0;
+      newRow[newTargetIdx] = row[targetIdx] !== undefined ? row[targetIdx] : row[0];
+      return newRow;
+    });
+  } else {
+    filteredExpressionRows = (dataset.parsedData || []).map((row: any[]) => {
+      return keepIndices.map(idx => row[idx]);
+    });
   }
+  
+  nSamples = commonSamples.length;
 
   const finalClinicalRows = filteredClinicalRows.filter((row: any[]) => {
     return validClinicalSamples.includes(row[sampleIdx]);
@@ -154,7 +137,20 @@ export default function DEUploadStep({ datasetId }: Props) {
   const [showWarnModal, setShowWarnModal] = useState(false);
   const [showDiscardModal, setShowDiscardModal] = useState(false);
 
-  if (!ds) return null;
+  const abortControllerRef = useRef<AbortController | null>(null);
+  const activeJobIdRef = useRef<string | null>(null);
+
+  const handleCancel = () => {
+    if (activeJobIdRef.current) {
+      cancelComputeJobAPI(activeJobIdRef.current);
+      activeJobIdRef.current = null;
+    }
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort();
+      abortControllerRef.current = null;
+    }
+    setLoading(false);
+  };
 
   const { platforms } = useMicroarrayPlatforms();
 
@@ -166,14 +162,15 @@ export default function DEUploadStep({ datasetId }: Props) {
   };
 
   const microarrayGeneIdOptions = useMemo(() => {
-    if (ds.dataType !== "microarray" || !ds.platform) return [];
+    if (!ds || ds.dataType !== "microarray" || !ds.platform) return [];
     const entries = ds.platform === "affymetrix"
       ? platforms.affymetrix
       : platforms.illumina;
     return entries.map(e => ({ value: e.platform, label: `${e.platform} (Probe ID)` }));
-  }, [ds.dataType, ds.platform, platforms]);
+  }, [ds?.dataType, ds?.platform, platforms]);
 
   const geneIdTypeOptions = useMemo(() => {
+    if (!ds) return [];
     if (ds.dataType === "microarray") {
       return [
         { value: "ensembl", label: "Ensembl ID" },
@@ -200,7 +197,7 @@ export default function DEUploadStep({ datasetId }: Props) {
         { value: "genename", label: "Gene Name" },
       ];
     }
-  }, [ds.dataType, microarrayGeneIdOptions]);
+  }, [ds?.dataType, microarrayGeneIdOptions]);
 
   const multipleDs = state.deDatasets.length > 1;
 
@@ -282,9 +279,9 @@ export default function DEUploadStep({ datasetId }: Props) {
     ds?.clinicalGroupCol,
     ds?.clinicalBatchCol,
     JSON.stringify(ds?.clinicalColumns || []),
-    JSON.stringify(ds?.clinicalParsedData || []),
+    ds?.clinicalParsedData?.length,
     JSON.stringify(ds?.columns || []),
-    JSON.stringify(ds?.parsedData || [])
+    ds?.parsedData?.length
   ]);
 
   useEffect(() => {
@@ -303,12 +300,10 @@ export default function DEUploadStep({ datasetId }: Props) {
     }
   }, [ds?.geneIdCol, JSON.stringify(ds?.geneInfoCols || [])]);
 
-  const handleClear = async (scope: "expression" | "clinical") => {
-    try {
-      await clearDatasetAPI(datasetId, scope);
-    } catch (e) {
-      console.warn("clearDatasetAPI failed (non-fatal):", e);
-    }
+  if (!ds) return null;
+
+  const handleClear = (scope: "expression" | "clinical") => {
+    clearDatasetAPI(datasetId, scope).catch((e) => console.warn("clearDatasetAPI failed (non-fatal):", e));
     dispatch({
       type: "RESET_DOWNSTREAM_STEPS",
       datasetId: datasetId,
@@ -406,6 +401,8 @@ export default function DEUploadStep({ datasetId }: Props) {
   };
 
   const handleExpressionFile = async (file: File) => {
+    const controller = new AbortController();
+    abortControllerRef.current = controller;
     setLoadingMsg(`Parsing ${file.name}…`);
     setLoading(true);
     try {
@@ -424,7 +421,7 @@ export default function DEUploadStep({ datasetId }: Props) {
         setLoadingMsg(`Uploading ${file.name} in chunks…`);
         uploadId = await uploadFileInChunks(file, ds.id, "expression", (pct) => {
           setLoadingMsg(`Uploading ${file.name} (${pct}%)…`);
-        });
+        }, controller.signal);
       }
 
       const issues: string[] = [];
@@ -453,6 +450,9 @@ export default function DEUploadStep({ datasetId }: Props) {
         uploadDone: false,
       });
     } catch (error: any) {
+      if (error?.name === "AbortError" || controller.signal.aborted) {
+        return;
+      }
       updateDs({
         integrityOk: false,
         integrityIssues: [`Error parsing expression file: ${error.message}`],
@@ -463,6 +463,8 @@ export default function DEUploadStep({ datasetId }: Props) {
   };
 
   const handleClinicalFile = async (file: File) => {
+    const controller = new AbortController();
+    abortControllerRef.current = controller;
     setLoadingMsg(`Parsing ${file.name}…`);
     setLoading(true);
     try {
@@ -477,7 +479,7 @@ export default function DEUploadStep({ datasetId }: Props) {
         setLoadingMsg(`Uploading ${file.name} in chunks…`);
         uploadId = await uploadFileInChunks(file, ds.id, "clinical", (pct) => {
           setLoadingMsg(`Uploading ${file.name} (${pct}%)…`);
-        });
+        }, controller.signal);
       }
 
       const issues = ds.integrityIssues.filter(i => !i.includes("Clinical"));
@@ -496,6 +498,9 @@ export default function DEUploadStep({ datasetId }: Props) {
         uploadDone: false,
       });
     } catch (error: any) {
+      if (error?.name === "AbortError" || controller.signal.aborted) {
+        return;
+      }
       updateDs({
         integrityIssues: [`Error parsing clinical file: ${error.message}`],
       });
@@ -557,8 +562,14 @@ export default function DEUploadStep({ datasetId }: Props) {
     if (!ds.uploadDone || hasSettingsChanged) {
       setLoadingMsg("Uploading temporary data to server…");
       setLoading(true);
+      const controller = new AbortController();
+      abortControllerRef.current = controller;
       try {
-        const res = await uploadDEDatasetDataAPI([datasetToUpload]);
+        const res = await uploadDEDatasetDataAPI(
+          [datasetToUpload],
+          ({ jobId }) => { activeJobIdRef.current = jobId; },
+          controller.signal
+        );
         if (res && res.status === "success" && Array.isArray(res.datasets)) {
           const matched = res.datasets.find((d: any) => d.datasetId === ds.id);
           if (matched) {
@@ -586,10 +597,14 @@ export default function DEUploadStep({ datasetId }: Props) {
             }
           }
         }
-      } catch (e) {
+      } catch (e: any) {
+        if (e?.name === "AbortError" || controller.signal.aborted) {
+          return;
+        }
         console.error("Failed to upload temporary data to server:", e);
+      } finally {
+        setLoading(false);
       }
-      setLoading(false);
     }
     
     updateDs({
@@ -675,7 +690,7 @@ export default function DEUploadStep({ datasetId }: Props) {
 
   return (
     <>
-      {loading && <Spinner label={loadingMsg} sublabel="Please wait…" />}
+      {loading && <Spinner label={loadingMsg} sublabel="Please wait…" onCancel={handleCancel} />}
       {showDiscardModal && (
         <DiscardWarnModal
           stepId="upload"
@@ -717,12 +732,20 @@ export default function DEUploadStep({ datasetId }: Props) {
               input.onchange = e => { const f = (e.target as HTMLInputElement).files?.[0]; if (f) handleExpressionFile(f); };
               input.click();
             }}
+            role="button"
+            tabIndex={0}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" || e.key === " ") {
+                e.preventDefault();
+                (e.currentTarget as HTMLElement).click();
+              }
+            }}
             onDragOver={e => { e.preventDefault(); setExpressionDrag(true); }}
             onDragLeave={() => setExpressionDrag(false)}
             onDrop={e => { e.preventDefault(); setExpressionDrag(false); const f = e.dataTransfer.files?.[0]; if (f) handleExpressionFile(f); }}
             data-testid="dropzone-expression"
           >
-            <div className="drop-zone-icon">📊</div>
+            <div className="drop-zone-icon"><BarChart3 size={32} /></div>
             <div className="drop-zone-title">Drop expression file here</div>
             <div className="drop-zone-hint">CSV · TSV · TXT &nbsp;·&nbsp; Max 500 MB</div>
           </div>
@@ -825,7 +848,7 @@ export default function DEUploadStep({ datasetId }: Props) {
             </div>
 
             {/* Dataset Name Input */}
-            <div style={{ display: "flex", flexDirection: "column", width: 280, marginBottom: 14 }}>
+            <div style={{ display: "flex", flexDirection: "column", width: 240, marginBottom: 14 }}>
               <label style={{ fontSize: 13, fontWeight: 500, marginBottom: 6 }}>Dataset name</label>
               <input 
                 type="text" 
@@ -836,15 +859,16 @@ export default function DEUploadStep({ datasetId }: Props) {
               />
             </div>
             
-            <div style={{ display: "flex", gap: 14, flexWrap: "wrap", marginBottom: 14 }}>
+            <div style={{ display: "flex", gap: 16, alignItems: "flex-start", flexWrap: "wrap", marginBottom: 14 }}>
             {/* Data Type */}
-              <div style={{ display: "flex", flexDirection: "column", width: 280, position: "relative" }}>
-                <label style={{ fontSize: 13, fontWeight: 500, color: "var(--foreground)", marginBottom: 8 }}>Data Type</label>
+              <div style={{ display: "flex", flexDirection: "column", width: 240, position: "relative" }}>
+                <label style={{ fontSize: 13, fontWeight: 500, color: "var(--foreground)", marginBottom: 8, display: "flex", alignItems: "center", minHeight: 24 }}>Data Type</label>
                 <details style={{ width: "100%" }} data-testid="details-data-type">
                   <summary style={{
                     display: "flex", justifyContent: "space-between", alignItems: "center",
                     padding: "8px 10px", border: "1px solid var(--border)", borderRadius: 7, fontSize: 13,
-                    background: "#fff", cursor: "pointer", listStyle: "none", userSelect: "none"
+                    background: "#fff", cursor: "pointer", listStyle: "none", userSelect: "none",
+                    height: 38, boxSizing: "border-box"
                   }}>
                     <span>
                       {ds.dataType === "readcounts" && "Read counts"}
@@ -918,12 +942,13 @@ export default function DEUploadStep({ datasetId }: Props) {
               {/* Platform Dropdown */}
               {isMicroarray && (
                 <div style={{ display: "flex", flexDirection: "column", width: 240, position: "relative" }}>
-                  <label style={{ fontSize: 13, fontWeight: 500, color: "var(--foreground)", marginBottom: 8 }}>Platform</label>
+                  <label style={{ fontSize: 13, fontWeight: 500, color: "var(--foreground)", marginBottom: 8, display: "flex", alignItems: "center", minHeight: 24 }}>Platform</label>
                   <details style={{ width: "100%" }} data-testid="details-platform">
                     <summary style={{
                       display: "flex", justifyContent: "space-between", alignItems: "center",
                       padding: "8px 10px", border: "1px solid var(--border)", borderRadius: 7, fontSize: 13,
-                      background: "#fff", cursor: "pointer", listStyle: "none", userSelect: "none"
+                      background: "#fff", cursor: "pointer", listStyle: "none", userSelect: "none",
+                      height: 38, boxSizing: "border-box"
                     }}>
                       <span>
                         {ds.platform === "affymetrix" && "Affymetrix"}
@@ -1229,11 +1254,19 @@ export default function DEUploadStep({ datasetId }: Props) {
               input.onchange = e => { const f = (e.target as HTMLInputElement).files?.[0]; if (f) handleClinicalFile(f); };
               input.click();
             }}
+            role="button"
+            tabIndex={0}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" || e.key === " ") {
+                e.preventDefault();
+                (e.currentTarget as HTMLElement).click();
+              }
+            }}
             onDragOver={e => { e.preventDefault(); setClinicalDrag(true); }}
             onDragLeave={() => setClinicalDrag(false)}
             onDrop={e => { e.preventDefault(); setClinicalDrag(false); const f = e.dataTransfer.files?.[0]; if (f) handleClinicalFile(f); }}
             data-testid="dropzone-clinical">
-            <div className="drop-zone-icon">🧬</div>
+            <div className="drop-zone-icon"><Dna size={32} /></div>
             <div className="drop-zone-title">Drop clinical metadata file here</div>
             <div className="drop-zone-hint">CSV · TSV &nbsp;·&nbsp; SampleID + Group columns required</div>
           </div>

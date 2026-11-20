@@ -1,6 +1,6 @@
 import { useEffect } from "react";
 import { useLocation } from "wouter";
-import { Home, PanelRightClose, PanelRight } from "lucide-react";
+import { Home, PanelRightClose, PanelRight, Layers } from "lucide-react";
 import { useAppStore } from "../store/appStore";
 import PlotFootnote from "../components/shared/PlotFootnote";
 import ReloadButton from "../components/shared/ReloadButton";
@@ -145,16 +145,18 @@ export default function DEAnalysis() {
                     fontSize: 11, padding: "3px 9px", borderRadius: 5,
                     background: "hsl(38 70% 96%)", color: "hsl(38 65% 30%)",
                     border: "1px solid hsl(38 50% 78%)", fontWeight: 500,
+                    display: "inline-flex", alignItems: "center", gap: 5,
                   }}>
-                    ⚡ Multiple datasets — Meta-analysis enabled
+                    <Layers size={12} /> Multiple datasets — Meta-analysis enabled
                   </span>
                 ) : (
                   <span style={{
                     fontSize: 11, padding: "3px 9px", borderRadius: 5,
                     background: "hsl(210 20% 94%)", color: "hsl(210 20% 30%)",
                     border: "1px solid hsl(210 20% 78%)", fontWeight: 500,
+                    display: "inline-flex", alignItems: "center", gap: 5,
                   }}>
-                    ⚡ Multiple datasets — Meta-analysis not available (different tech types)
+                    <Layers size={12} /> Multiple datasets — Meta-analysis not available (different tech types)
                   </span>
                 )}
               </div>

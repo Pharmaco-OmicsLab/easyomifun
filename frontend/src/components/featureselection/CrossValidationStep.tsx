@@ -1,11 +1,12 @@
-import { useState, useEffect, useMemo } from "react";
+import { useState, useEffect, useMemo, useRef } from "react";
 import { useLocation } from "wouter";
+import { CheckCircle2, RotateCcw } from "lucide-react";
 import { useAppStore } from "../../store/appStore";
 import Spinner from "../Spinner";
 import ChangeWarnModal from "../shared/ChangeWarnModal";
 import DiscardWarnModal from "../shared/DiscardWarnModal";
 import { type CVMethod, getHierarchyGroup } from "../../dataObject";
-import { runCrossValidationAPI, redoStepAPI, type CVResult } from "../../lib/api";
+import { runCrossValidationAPI, redoStepAPI, type CVResult, cancelComputeJobAPI } from "../../lib/api";
 import { formatCi } from "../../lib/utils";
 import { toast } from "../../hooks/use-toast";
 
@@ -22,23 +23,23 @@ const CV_METHODS: { id: CVMethod; label: string; desc: string }[] = [
 
 
 
-// Helper to extract feature ids from dataset
+// Helper to extract feature ids from dataset (Features are Rows)
 const getFsDatasetFeatureIds = (d: any): Set<string> => {
-  if (d.dataMode === "metadata_features") {
-    const sampleIdCol = d.clinicalSampleIdCol || d.geneIdCol || "SampleID";
-    const infoCols = d.geneInfoCols || [];
-    const featureCols = (d.columns || []).filter((c: string) => c !== sampleIdCol && !infoCols.includes(c));
-    return new Set(featureCols);
-  }
   if (!d.parsedData || d.parsedData.length === 0) return new Set();
-  const geneIdIdx = d.columns ? d.columns.indexOf(d.geneIdCol) : -1;
-  if (geneIdIdx === -1) return new Set(d.parsedData.map((row: any) => String(row[0])));
-  return new Set(d.parsedData.map((row: any) => String(row[geneIdIdx])));
+  const featIdx = (d.fs_featureIndexValue || 1) - 1;
+  const geneIdCol = d.geneIdCol || (d.columns && d.columns[featIdx >= 0 ? featIdx : 0]) || "Feature";
+  const geneIdIdx = d.columns?.indexOf(geneIdCol);
+  const targetIdx = geneIdIdx !== undefined && geneIdIdx !== -1 ? geneIdIdx : (featIdx >= 0 && featIdx < (d.columns?.length || 0) ? featIdx : 0);
+  return new Set(d.parsedData.map((row: any) => String(row[targetIdx])).filter(Boolean));
 };
 
 // Helper to compute intersection of features in a list of datasets
-const getSharedFeatureCountForGroup = (groupDatasets: any[]): number => {
+const getSharedFeatureCountForGroup = (groupDatasets: any[], backendCounts?: Record<string, number>): number => {
   if (groupDatasets.length <= 1) return 0;
+  if (backendCounts) {
+    const h = getHierarchyGroup(groupDatasets[0]?.dataType || "type1");
+    if (backendCounts[h] !== undefined) return backendCounts[h];
+  }
   if (groupDatasets.some(d => !d.parsedData || d.parsedData.length === 0)) return 0;
   let intersection = getFsDatasetFeatureIds(groupDatasets[0]);
   for (let i = 1; i < groupDatasets.length; i++) {
@@ -53,6 +54,18 @@ export default function CrossValidationStep() {
   const [, navigate] = useLocation();
   const fsConfig = state.fsConfig;
   const [loading, setLoading] = useState(false);
+  const abortControllerRef = useRef<AbortController | null>(null);
+  const activeJobIdRef = useRef<string | null>(null);
+
+  const handleCancel = async () => {
+    abortControllerRef.current?.abort();
+    if (activeJobIdRef.current) {
+      await cancelComputeJobAPI(activeJobIdRef.current);
+    }
+    setLoading(false);
+    activeJobIdRef.current = null;
+  };
+
   const [done, setDone] = useState(state.fsCvResultsCache ? true : false);
   const [showWarnModal, setShowWarnModal] = useState(false);
   // Stable CV results — only updated when Run is clicked
@@ -76,7 +89,7 @@ export default function CrossValidationStep() {
   // Pooling selection card is visible only when we have same-type datasets with >= 10 shared features
   const hasPoolableTypesAndSufficientFeatures = Object.values(typeGroups).some(group => {
     if (group.length < 2) return false;
-    const count = getSharedFeatureCountForGroup(group);
+    const count = getSharedFeatureCountForGroup(group, state.fsSharedFeatureCounts);
     return count >= 10;
   });
 
@@ -95,8 +108,7 @@ export default function CrossValidationStep() {
       !d.fs_datasetPurpose
     );
     const testingDsWithCv = state.fsDatasets.filter(d => 
-      d.fs_datasetPurpose === "test" && 
-      (d.fs_validationStrategy === "cv-only" || d.fs_validationStrategy === "cv-and-test")
+      d.fs_datasetPurpose === "test"
     );
 
     if (isCombinedPool) {
@@ -206,9 +218,21 @@ export default function CrossValidationStep() {
       datasetId: state.fsCurrentDatasetId,
       fromStep: "cross-validation"
     } as any);
+    const controller = new AbortController();
+    abortControllerRef.current = controller;
+    setLoading(true);
     try {
-      await redoStepAPI("cv", state.fsDatasets.map(d => d.id));
-    } catch (e) {
+      await redoStepAPI(
+        "cv",
+        state.fsDatasets.map(d => d.id),
+        (info) => { activeJobIdRef.current = info.jobId; },
+        controller.signal
+      );
+    } catch (e: any) {
+      if (e?.name === "AbortError" || controller.signal.aborted) {
+        setLoading(false);
+        return;
+      }
       console.error(e);
     }
     await triggerRunCV();
@@ -220,12 +244,18 @@ export default function CrossValidationStep() {
   };
 
   const triggerRunCV = async () => {
+    abortControllerRef.current = new AbortController();
     try {
       const results = await runCrossValidationAPI(
         fsConfig.selectedModels,
         fsConfig.cvMethod,
         fsConfig.cvFolds,
-        state.fsDatasets
+        state.fsDatasets,
+        fsConfig.multiDatasetMode ?? "combine",
+        (info) => {
+          activeJobIdRef.current = info.jobId;
+        },
+        abortControllerRef.current.signal
       );
 
       setSubmittedCfg({
@@ -238,6 +268,9 @@ export default function CrossValidationStep() {
       dispatch({ type: "SET_STANDALONE_FS_DONE", done: true });
       setDone(true);
     } catch (err: any) {
+      if (err?.name === "AbortError" || err?.message?.includes("Aborted") || err?.message?.includes("Unknown job id")) {
+        return;
+      }
       console.error("Cross validation error:", err);
       toast({
         title: "Cross-Validation Failed",
@@ -246,6 +279,7 @@ export default function CrossValidationStep() {
       });
     } finally {
       setLoading(false);
+      activeJobIdRef.current = null;
     }
   };
 
@@ -362,7 +396,7 @@ export default function CrossValidationStep() {
            d.fs_datasetPurpose === "train-and-cv" || !d.fs_datasetPurpose
     );
     const testingDs = state.fsDatasets.filter(
-      d => d.fs_datasetPurpose === "test" && (d.fs_validationStrategy === "cv-only" || d.fs_validationStrategy === "cv-and-test")
+      d => d.fs_datasetPurpose === "test"
     );
 
     const mode = state.fsConfig.multiDatasetMode ?? "combine";
@@ -407,7 +441,7 @@ export default function CrossValidationStep() {
 
   return (
     <>
-      {loading && <Spinner label="Running cross-validation…" sublabel="Searching parameter space…" />}
+      {loading && <Spinner label="Running cross-validation…" sublabel="Searching parameter space…" onCancel={handleCancel} />}
 
       {/* CV Method */}
       <div className="card" style={{ marginBottom: 14 }}>
@@ -480,7 +514,10 @@ export default function CrossValidationStep() {
                   Cross-Validation Results - {displayName} {hasSettingsChanged && <span style={{ fontSize: 12, color: "hsl(38 85% 35%)", fontWeight: 400, marginLeft: 8 }}>(Outdated - settings changed)</span>}
                 </div>
 
-                <div className="banner success" style={{ marginBottom: 12 }}>✅ Cross-validation complete.</div>
+                <div className="banner success" style={{ marginBottom: 12, display: "flex", alignItems: "center", gap: 6 }}>
+                  <CheckCircle2 size={15} style={{ flexShrink: 0 }} />
+                  <span>Cross-validation complete.</span>
+                </div>
 
                 {getCVRocPlotForDataset(d.id) && (
                   <div style={{ display: "flex", justifyContent: "center", marginBottom: 14 }}>
@@ -584,8 +621,8 @@ export default function CrossValidationStep() {
 
         <div style={{ display: "flex", gap: 8 }}>
           {done && hasSettingsChanged && (
-            <button className="btn btn-default" style={{ borderColor: "var(--warning-border)", color: "var(--warning-text)", background: "var(--warning-bg)" }} onClick={handleRedo} data-testid="btn-redo-cv">
-              🔄 Redo Cross-Validation
+            <button className="btn btn-default" style={{ borderColor: "var(--warning-border)", color: "var(--warning-text)", background: "var(--warning-bg)", display: "inline-flex", alignItems: "center", gap: 6 }} onClick={handleRedo} data-testid="btn-redo-cv">
+              <RotateCcw size={14} /> Redo Cross-Validation
             </button>
           )}
 

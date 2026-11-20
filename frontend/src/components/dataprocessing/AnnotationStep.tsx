@@ -1,12 +1,12 @@
-import { useState, useEffect } from "react";
-import { Download, Check, Loader2 } from "lucide-react";
+import { useState, useEffect, useRef } from "react";
+import { Download, Check, Loader2, RotateCcw, Info } from "lucide-react";
 import { useAppStore, getSessionUserId } from "../../store/appStore";
 import { computeDPSteps } from "../../dataObject";
 import Spinner from "../Spinner";
 import SkipModal from "../shared/SkipModal";
 import ChangeWarnModal from "../shared/ChangeWarnModal";
 import DiscardWarnModal from "../shared/DiscardWarnModal";
-import { annotateDatasetAPI, SERVER_URL, redoStepAPI } from "../../lib/api";
+import { annotateDatasetAPI, SERVER_URL, redoStepAPI, cancelComputeJobAPI } from "../../lib/api";
 import { useToast } from "../../hooks/use-toast";
 
 
@@ -290,7 +290,7 @@ function AnnotationResultCard({ result }: { result: DatasetAnnotationResult }) {
           fontSize: 12,
           color: "var(--foreground)"
         }}>
-          💡 <strong>Gene Name Input Detected:</strong> Since the input ID type is Gene Name, we queried the database for biotype information. "Mapped" shows the count of input gene names found in the reference database, "Unique" represents genes with a single biotype, and "Multi-mapped" represents genes associated with multiple biotypes.
+          <Info size={14} style={{ display: "inline", marginRight: 6, verticalAlign: "-2px" }} /><strong>Gene Name Input Detected:</strong> Since the input ID type is Gene Name, we queried the database for biotype information. "Mapped" shows the count of input gene names found in the reference database, "Unique" represents genes with a single biotype, and "Multi-mapped" represents genes associated with multiple biotypes.
         </div>
       )}
       <div style={{ marginTop: 12, display: "flex", flexDirection: "column", gap: 6 }}>
@@ -446,15 +446,33 @@ export default function AnnotationStep({ datasetId, mode = "dp" }: Props) {
   if (state.dpInlineEaDone) completedModules.push("Enrichment Analysis");
 
   const downstreamDone = completedModules.length > 0;
+  const abortControllerRef = useRef<AbortController | null>(null);
+  const activeJobIdRef = useRef<string | null>(null);
+
+  const handleCancel = async () => {
+    abortControllerRef.current?.abort();
+    if (activeJobIdRef.current) {
+      await cancelComputeJobAPI(activeJobIdRef.current);
+    }
+    setLoading(false);
+    activeJobIdRef.current = null;
+  };
 
   const handleSubmit = async () => {
+    abortControllerRef.current = new AbortController();
     setLoading(true);
     try {
-      const results = await annotateDatasetAPI(targetDatasets, cfg);
+      const results = await annotateDatasetAPI(
+        targetDatasets,
+        cfg,
+        (info) => { activeJobIdRef.current = info.jobId; },
+        abortControllerRef.current.signal
+      );
       dispatch({ type: "DP_SUBMIT_ANNOTATION" });
 
       if (Array.isArray(results)) {
         results.forEach(res => {
+          if (!res || typeof res !== "object" || !res.datasetId) return;
           dispatch({
             type: mode === "dp" ? "DP_UPDATE_DATASET" : "DE_UPDATE_DATASET",
             id: res.datasetId,
@@ -472,11 +490,16 @@ export default function AnnotationStep({ datasetId, mode = "dp" }: Props) {
               sampleIds: res.sampleIds || undefined,
               geneIdCol: "gene_symbol",
               geneInfoCols: ["entrez_id", "gene_symbol"],
+              qc: res.qc || undefined,
+              normalPca: res.qc?.pca || res.qc?.before?.pca || undefined,
             }
           } as never);
         });
       }
     } catch (err: any) {
+      if (err?.name === "AbortError" || err?.message?.includes("Aborted") || err?.message?.includes("Unknown job id")) {
+        return;
+      }
       console.error("Annotation error:", err);
       toast({
         title: "Annotation Error",
@@ -485,6 +508,7 @@ export default function AnnotationStep({ datasetId, mode = "dp" }: Props) {
       });
     } finally {
       setLoading(false);
+      activeJobIdRef.current = null;
     }
   };
 
@@ -538,7 +562,13 @@ export default function AnnotationStep({ datasetId, mode = "dp" }: Props) {
           }}
         />
       )}
-      {loading && <Spinner label="Running annotation…" sublabel="Mapping gene IDs to reference genome" />}
+      {loading && (
+        <Spinner
+          label="Running annotation…"
+          sublabel="Mapping gene IDs to reference genome"
+          onCancel={handleCancel}
+        />
+      )}
 
       <div className="card">
         <div className="card-title" style={{ marginBottom: 4 }}>
@@ -767,7 +797,7 @@ return (
       <div className="action-row">
         <div style={{ display: "flex", gap: 8 }}>
           <button className="btn btn-default" onClick={() => dispatch({ type: mode === "dp" ? "DP_SET_STEP" : "DE_SET_STEP", step: getNextAndPrevSteps().prev } as never)}>← Back</button>
-          <button className="btn btn-default" onClick={() => setShowSkipModal(true)} data-testid="btn-skip-annotation" style={{ color: "var(--muted-foreground)" }}>Skip</button>
+          <button className="btn btn-default" onClick={() => setShowSkipModal(true)} data-testid="btn-skip-annotation">Skip</button>
         </div>
 
         <div style={{ display: "flex", gap: 8 }}>
@@ -783,8 +813,8 @@ return (
                 }
                 handleSubmit();
               }
-            }} data-testid="btn-redo-annotation">
-              🔄 Redo Annotation
+            }} data-testid="btn-redo-annotation" style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
+              <RotateCcw size={14} /> Redo Annotation
             </button>
           )}
 

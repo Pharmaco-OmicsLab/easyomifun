@@ -18,6 +18,7 @@ export default function Enrichment() {
 
   const enDatasets = state.enDatasets;
   const currentDs = enDatasets.find(d => d.id === state.enCurrentDatasetId) ?? enDatasets[0];
+  const selectedDataset = currentDs;
   const activeDatasetId = currentDs?.id ?? "";
   const isViewingAll = state.enSelectedContext === "all" && enDatasets.length > 1;
   const displayDatasetId = isViewingAll ? "all" : (state.enSelectedContext || activeDatasetId);
@@ -74,7 +75,7 @@ export default function Enrichment() {
           <div className="content-inner">
             <div className="dataset-select-bar">
               <span className="dataset-select-label">Viewing:</span>
-              <span style={{ fontSize: 13, fontWeight: 600 }}>{state.enDatasets[0]?.name || "Dataset"}</span>
+              <span style={{ fontSize: 13, fontWeight: 600 }}>{selectedDataset?.name ?? state.enDatasets[0]?.name}</span>
             </div>
 
             {/* Step content */}

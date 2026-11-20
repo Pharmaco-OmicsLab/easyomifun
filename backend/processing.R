@@ -10,6 +10,147 @@ library(jsonlite)
 # Import shared utility functions
 source("shared_utils.R")
 
+# ---- Illumina probe quality + detection P-val filters (ported from Microarray_processing.R) ----
+
+ILLUMINA_PROBE_QUALITY_PLATFORMS <- c(
+  "illuminaHumanv3", "illuminaHumanv4", "illuminaMousev2", "illuminaRatv1"
+)
+
+filter_probes_by_quality <- function(expr_mat, platform_id) {
+  if (!platform_id %in% ILLUMINA_PROBE_QUALITY_PLATFORMS) return(expr_mat)
+  db_name  <- paste0(platform_id, ".db")
+  map_name <- paste0(platform_id, "PROBEQUALITY")
+
+  # Ensure local R-lib directory is included in library paths
+  local_lib <- if (exists("get_local_r_lib")) get_local_r_lib() else file.path(getwd(), "R-lib")
+  bundled_lib <- file.path(getwd(), "R-lib")
+  search_libs <- unique(c(local_lib, bundled_lib, .libPaths()))
+  search_libs <- search_libs[dir.exists(search_libs)]
+
+  suppressPackageStartupMessages(
+    tryCatch(library(db_name, character.only = TRUE, lib.loc = search_libs), error = function(e) {
+      tryCatch(library(db_name, character.only = TRUE), error = function(e2) NULL)
+    })
+  )
+  if (!exists(map_name)) {
+    cat(sprintf("[PROBE FILTER] '%s' not found — skipping quality filter.\n", map_name))
+    return(expr_mat)
+  }
+  ids       <- rownames(expr_mat)
+  qual_list <- suppressWarnings(AnnotationDbi::mget(ids, get(map_name), ifnotfound = NA))
+  drop_q    <- c("Bad", "No match")
+  keep <- vapply(qual_list, function(x) {
+    x <- as.character(x)
+    if (all(is.na(x))) return(FALSE)
+    !any(x %in% drop_q)
+  }, logical(1))
+  cat(sprintf("[PROBE FILTER] %s: %d -> %d probes (%d Bad/No match removed).\n",
+              platform_id, length(ids), sum(keep), sum(!keep)))
+  expr_mat[keep, , drop = FALSE]
+}
+
+filter_by_detection_pval <- function(expr_mat, det_mat, threshold = 0.05, proportion = 0.5) {
+  if (is.null(det_mat) || is.null(expr_mat)) return(expr_mat)
+  probes <- intersect(rownames(expr_mat), rownames(det_mat))
+  if (!length(probes)) return(expr_mat)
+
+  expr_cols <- colnames(expr_mat)
+  det_cols  <- colnames(det_mat)
+
+  # Match sample columns between expr_mat and det_mat without mutating colnames(expr_mat)
+  common_exact <- intersect(expr_cols, det_cols)
+  if (length(common_exact) > 0) {
+    det <- det_mat[probes, common_exact, drop = FALSE]
+  } else {
+    # Match by stripping common suffixes (e.g. .AVG_Signal vs .Detection Pval)
+    clean_expr <- sub("(?i)[._ -]*(avg[._ -]*signal|signal|expr).*$", "", expr_cols)
+    clean_det  <- sub("(?i)[._ -]*(detection[._ -]*pval|det[._ -]*pval|pval).*$", "", det_cols)
+
+    m_idx <- match(clean_expr, clean_det)
+    valid_m <- which(!is.na(m_idx))
+    if (length(valid_m) > 0) {
+      det <- det_mat[probes, m_idx[valid_m], drop = FALSE]
+    } else if (ncol(det_mat) == ncol(expr_mat)) {
+      # Fallback to column index order if column counts match
+      det <- det_mat[probes, , drop = FALSE]
+    } else {
+      cat("[DETECTION FILTER] Could not match detection columns to sample columns — skipping detection filter.\n")
+      return(expr_mat)
+    }
+  }
+
+  detected <- det < threshold
+  detected[is.na(detected)] <- FALSE
+  n_samples <- ncol(det)
+  if (n_samples == 0) return(expr_mat)
+
+  frac_det <- rowSums(detected) / n_samples
+  keep <- frac_det >= proportion
+  cat(sprintf("[DETECTION FILTER] %d -> %d probes (Pval<%.3g in >=%.0f%% of %d samples; %d removed).\n",
+              length(probes), sum(keep), threshold, proportion * 100, n_samples, sum(!keep)))
+
+  expr_mat[probes[keep], , drop = FALSE]
+}
+
+apply_illumina_probe_filters <- function(expr_mat, ds_id, gene_id_type = NULL, data_type = "microarray") {
+  if (is.null(expr_mat) || nrow(expr_mat) == 0 || ncol(expr_mat) == 0) return(expr_mat)
+  if (!identical(tolower(data_type %||% ""), "microarray")) return(expr_mat)
+
+  # Resolve platform ID
+  if (is.null(gene_id_type) || !nzchar(gene_id_type)) {
+    meta_path <- if (exists("get_session_path")) get_session_path(ds_id, "%s_expr_metadata.rds") else sprintf("tmp/%s_expr_metadata.rds", ds_id)
+    if (file.exists(meta_path)) {
+      meta <- tryCatch(readRDS(meta_path), error = function(e) NULL)
+      gene_id_type <- meta$geneIdType %||% meta$platform %||% ""
+    }
+  }
+
+  clean_platform <- gene_id_type
+  if (!is.null(clean_platform) && !clean_platform %in% ILLUMINA_PROBE_QUALITY_PLATFORMS) {
+    clean_id <- sub("\\.db$", "", clean_platform)
+    if (clean_id %in% ILLUMINA_PROBE_QUALITY_PLATFORMS) {
+      clean_platform <- clean_id
+    } else {
+      platform_map <- c(
+        "HumanHT-12 v3" = "illuminaHumanv3",
+        "HumanHT-12 v4" = "illuminaHumanv4",
+        "MouseRef-8 v2" = "illuminaMousev2",
+        "RatRef-12"     = "illuminaRatv1"
+      )
+      if (clean_platform %in% names(platform_map)) {
+        clean_platform <- platform_map[[clean_platform]]
+      }
+    }
+  }
+
+  if (is.null(clean_platform) || !clean_platform %in% ILLUMINA_PROBE_QUALITY_PLATFORMS) {
+    return(expr_mat)
+  }
+
+  # 1. Quality filter (Bad / No match)
+  expr_mat <- tryCatch(
+    filter_probes_by_quality(expr_mat, clean_platform),
+    error = function(e) { cat("[WARN] Probe quality filter failed:", conditionMessage(e), "\n"); expr_mat }
+  )
+
+  # 2. Detection P-value filter
+  det_path <- if (exists("get_session_path")) get_session_path(ds_id, "%s_detection_pval.rds") else sprintf("tmp/%s_detection_pval.rds", ds_id)
+  if (!file.exists(det_path)) {
+    det_path <- sprintf("tmp/%s_detection_pval.rds", ds_id)
+  }
+  if (file.exists(det_path)) {
+    det_mat <- tryCatch(readRDS(det_path), error = function(e) NULL)
+    if (!is.null(det_mat)) {
+      expr_mat <- tryCatch(
+        filter_by_detection_pval(expr_mat, det_mat),
+        error = function(e) { cat("[WARN] Detection P-val filter failed:", conditionMessage(e), "\n"); expr_mat }
+      )
+    }
+  }
+
+  return(expr_mat)
+}
+
 
 align_and_filter_dataset <- function(ds_id, clin_meta, clin_parsed, clin_cols) {
   # 1. Clean clinical data (remove missing values in Sample ID Column, Batch Column, Group Column)
@@ -73,17 +214,22 @@ align_and_filter_dataset <- function(ds_id, clin_meta, clin_parsed, clin_cols) {
 
   # 2. Get the expression samples from files/stacks.
   # Let's check if the expression file exists
-  expr_file_path <- sprintf("tmp/%s_expression.csv", ds_id)
+  expr_file_path <- get_session_path(ds_id, "%s_expression.csv", fallback = TRUE)
   if (file.exists(expr_file_path)) {
     expr_df <- read_csv_preserve_id(expr_file_path)
+    if (is.na(colnames(expr_df)[1]) || !nzchar(trimws(colnames(expr_df)[1]))) {
+      colnames(expr_df)[1] <- "GeneID"
+    }
     gene_id_col <- colnames(expr_df)[1]
     
-    meta_path <- sprintf("tmp/%s_expr_metadata.rds", ds_id)
+    meta_path <- get_session_path(ds_id, "%s_expr_metadata.rds", fallback = TRUE)
     gene_info_cols <- character(0)
     if (file.exists(meta_path)) {
       meta <- readRDS(meta_path)
       gene_info_cols <- if (!is.null(meta$geneInfoCols)) unlist(meta$geneInfoCols) else character(0)
     }
+    gene_info_cols <- setdiff(as.character(gene_info_cols), gene_id_col)
+    gene_info_cols <- gene_info_cols[nzchar(trimws(gene_info_cols))]
     
     expr_samples <- setdiff(colnames(expr_df), c(gene_id_col, gene_info_cols, "entrez_id", "gene_symbol", "gene_biotype"))
     
@@ -103,13 +249,13 @@ align_and_filter_dataset <- function(ds_id, clin_meta, clin_parsed, clin_cols) {
     }
 
     # 4. Filter expression CSV
-    keep_cols <- c(gene_id_col, gene_info_cols, common_samples)
-    keep_cols <- keep_cols[keep_cols %in% colnames(expr_df)]
+    keep_cols <- unique(c(gene_id_col, gene_info_cols, common_samples))
+    keep_cols <- keep_cols[nzchar(trimws(keep_cols)) & keep_cols %in% colnames(expr_df)]
     expr_df_filtered <- expr_df[, keep_cols, drop = FALSE]
     write.csv(expr_df_filtered, file = expr_file_path, row.names = FALSE)
     
     # 5. Filter main stack
-    main_stack_file <- sprintf("tmp/%s_main_stack.rds", ds_id)
+    main_stack_file <- get_session_path(ds_id, "%s_main_stack.rds", fallback = TRUE)
     if (file.exists(main_stack_file)) {
       stack <- tryCatch(readRDS(main_stack_file), error = function(e) list())
       if (is.list(stack) && length(stack) > 0) {
@@ -125,7 +271,7 @@ align_and_filter_dataset <- function(ds_id, clin_meta, clin_parsed, clin_cols) {
     }
 
     # 6. Filter counts stack
-    counts_stack_file <- sprintf("tmp/%s_counts_stack.rds", ds_id)
+    counts_stack_file <- get_session_path(ds_id, "%s_counts_stack.rds", fallback = TRUE)
     if (file.exists(counts_stack_file)) {
       stack <- tryCatch(readRDS(counts_stack_file), error = function(e) list())
       if (is.list(stack) && length(stack) > 0) {
@@ -939,6 +1085,7 @@ rebuild_parsed_data <- function(expr_mat, anno_df, gene_id_col) {
 
 # Helper to get the most suitable expression matrix for a given step, data type, and normalization status
 get_suitable_expression_matrix <- function(ds_id, step = NULL, data_type = "readcounts", is_norm = FALSE) {
+  is_norm <- isTRUE(is_norm)
   base_id <- get_base_id(ds_id)
   if (is.null(step)) step <- "latest"
   
@@ -998,7 +1145,7 @@ get_suitable_expression_matrix <- function(ds_id, step = NULL, data_type = "read
   } else if (step == "processing") {
     allowed_steps <- c("annotation", "normalization", "upload")
   } else if (step == "annotation") {
-    allowed_steps <- c("normalization", "upload")
+    allowed_steps <- if (identical(tolower(data_type), "microarray")) c("normalization", "upload") else c("upload")
   }
 
   # For raw readcounts (un-normalized): peek latest valid counts_stack entry
@@ -1165,7 +1312,7 @@ get_backend_dataset <- function(dataset_id, original = FALSE, step = NULL) {
   
   # Overwrite parsed_data$expr with the most suitable RDS expression matrix if original is FALSE
   if (!original) {
-    expr_latest <- get_suitable_expression_matrix(dataset_id, step, parsed_data$dataType, parsed_data$isNormalized)
+    expr_latest <- get_suitable_expression_matrix(dataset_id, step, parsed_data$dataType %||% "readcounts", isTRUE(parsed_data$isNormalized))
     if (!is.null(expr_latest)) {
       # Extract attributes set in get_suitable_expression_matrix
       if (!is.null(attr(expr_latest, "source_stack"))) {
@@ -1286,7 +1433,8 @@ annotate_genes <- function(strategy, source, organisms, biotypes, datasets) {
     d_biotype   <- normalise_biotypes(raw_biotype)
 
     # Always load expression matrix and metadata from server-stored files
-    parsed <- get_backend_dataset(ds_id_full, original = FALSE, step = "annotation")
+    is_ma <- identical(tolower(d_data_type), "microarray")
+    parsed <- get_backend_dataset(ds_id_full, original = !is_ma, step = "annotation")
     if (is.null(parsed)) {
       cat(sprintf("  [WARNING] No server-stored expression matrix found for %s, returning zeros.\n", ds_id_full))
       return(list(datasetId = ds_id_full, total = 0, mapped = 0, unmapped = 0, unique = 0, multi = 0, retained = 0))
@@ -1320,6 +1468,16 @@ annotate_genes <- function(strategy, source, organisms, biotypes, datasets) {
     gene_id_col  <- parsed$geneIdCol
     gene_id_type <- parsed$geneIdType
     cat(sprintf("  Dataset %s: geneIdCol='%s', geneIdType='%s'\n", ds_id, gene_id_col, gene_id_type))
+
+    # Apply Illumina probe quality and detection P-val filters if microarray
+    if (identical(tolower(d_data_type %||% parsed$dataType %||% ""), "microarray")) {
+      parsed$expr <- apply_illumina_probe_filters(parsed$expr, ds_id, gene_id_type, d_data_type %||% parsed$dataType)
+      parsed$gene_ids <- rownames(parsed$expr)
+      if (!is.null(parsed$anno) && nrow(parsed$anno) > 0) {
+        anno_idx <- match(rownames(parsed$expr), rownames(parsed$anno))
+        parsed$anno <- parsed$anno[!is.na(anno_idx), , drop = FALSE]
+      }
+    }
 
     cat(sprintf("[CONSOLE] Dataset: %s (annotation)\n", ds_id))
     cat(sprintf("[CONSOLE]   Input features before: %d\n", length(parsed$gene_ids)))
@@ -1379,6 +1537,7 @@ annotate_genes <- function(strategy, source, organisms, biotypes, datasets) {
       cat(sprintf("[CONSOLE]   Missing values after: %d\n", sum(is.na(parsed$expr))))
 
       rebuilt <- rebuild_parsed_data(parsed$expr, parsed$anno, parsed$geneIdCol)
+      pre_qc <- tryCatch(prepare_pre_processing_qc(parsed$expr, ds_id, d_data_type, is_norm, d$name), error = function(e) NULL)
       res <- list(
         datasetId  = ds_id_full,
         total      = n,
@@ -1390,7 +1549,8 @@ annotate_genes <- function(strategy, source, organisms, biotypes, datasets) {
         columns    = rebuilt$columns,
         parsedData = rebuilt$parsedData,
         sampleIds  = colnames(parsed$expr),
-        nSamples   = as.integer(ncol(parsed$expr))
+        nSamples   = as.integer(ncol(parsed$expr)),
+        qc         = if (!is.null(pre_qc)) list(before = pre_qc, meanVariance = pre_qc$meanVariance, distribution = pre_qc$distribution, pca = pre_qc$pca) else NULL
       )
       save_step_cache_meta(ds_id, "annotation", list(
         strategy = d_strategy,
@@ -1413,13 +1573,17 @@ annotate_genes <- function(strategy, source, organisms, biotypes, datasets) {
       if (any(!na_mask)) {
         cat(sprintf("  Removing %d rows with NA/empty gene IDs for dataset %s...\n", sum(!na_mask), ds_id))
         parsed$expr <- parsed$expr[na_mask, , drop = FALSE]
-        parsed$anno <- parsed$anno[na_mask, , drop = FALSE]
+        if (!is.null(parsed$anno) && (is.matrix(parsed$anno) || is.data.frame(parsed$anno))) {
+          parsed$anno <- parsed$anno[na_mask, , drop = FALSE]
+        }
         keys <- keys[na_mask]
         parsed$gene_ids <- keys
       }
       keys <- sub("\\.[0-9]+$", "", keys, perl = TRUE, useBytes = TRUE)
       rownames(parsed$expr) <- keys
-      rownames(parsed$anno) <- keys
+      if (!is.null(parsed$anno) && (is.matrix(parsed$anno) || is.data.frame(parsed$anno))) {
+        rownames(parsed$anno) <- keys
+      }
       parsed$gene_ids <- keys
     }
     
@@ -1427,9 +1591,11 @@ annotate_genes <- function(strategy, source, organisms, biotypes, datasets) {
     if (any(duplicated(keys))) {
       cat(sprintf("  Collapsing duplicate input IDs for dataset %s...\n", ds_id))
       expr_collapsed <- collapse_duplicate_ids_parallel(parsed$expr, keys, d_data_type, is_norm)
-      match_idx <- match(rownames(expr_collapsed), keys)
-      parsed$anno <- parsed$anno[match_idx, , drop = FALSE]
-      rownames(parsed$anno) <- rownames(expr_collapsed)
+      if (!is.null(parsed$anno) && (is.matrix(parsed$anno) || is.data.frame(parsed$anno))) {
+        match_idx <- match(rownames(expr_collapsed), keys)
+        parsed$anno <- parsed$anno[match_idx, , drop = FALSE]
+        rownames(parsed$anno) <- rownames(expr_collapsed)
+      }
       parsed$expr <- expr_collapsed
       keys <- rownames(expr_collapsed)
       parsed$gene_ids <- keys
@@ -1921,6 +2087,7 @@ annotate_genes <- function(strategy, source, organisms, biotypes, datasets) {
     cat(sprintf("[CONSOLE]   Missing values after: %d\n", sum(is.na(expr_filtered))))
     
     rebuilt <- rebuild_parsed_data(expr_filtered, resolved_mapping[, c("entrez_id", "gene_symbol"), drop = FALSE], "gene_symbol")
+    pre_qc <- tryCatch(prepare_pre_processing_qc(expr_filtered, ds_id, d_data_type, is_norm, d$name), error = function(e) NULL)
     res <- list(
       datasetId  = ds_id_full,
       total      = n_total_input,
@@ -1932,7 +2099,8 @@ annotate_genes <- function(strategy, source, organisms, biotypes, datasets) {
       columns    = rebuilt$columns,
       parsedData = rebuilt$parsedData,
       sampleIds  = colnames(expr_filtered),
-      nSamples   = as.integer(ncol(expr_filtered))
+      nSamples   = as.integer(ncol(expr_filtered)),
+      qc         = if (!is.null(pre_qc)) list(before = pre_qc, meanVariance = pre_qc$meanVariance, distribution = pre_qc$distribution, pca = pre_qc$pca) else NULL
     )
     save_step_cache_meta(ds_id, "annotation", list(
       strategy = d_strategy,
@@ -1951,8 +2119,14 @@ annotate_genes <- function(strategy, source, organisms, biotypes, datasets) {
       var_list = c("strategy", "source", "organisms", "biotypes", "process_single_annotation",
                    "get_base_id", "normalise_biotypes", "get_backend_dataset", "get_session_path",
                    "register_export_file", "get_user_id", "push_main_stack", "push_counts_stack",
-                   "collapse_duplicate_ids_parallel", "rebuild_parsed_data", "%||%"),
-      pkg_list = c("jsonlite", "edgeR", "limma")
+                   "collapse_duplicate_ids_parallel", "rebuild_parsed_data", "%||%",
+                   "apply_illumina_probe_filters", "filter_probes_by_quality", "filter_by_detection_pval", "ILLUMINA_PROBE_QUALITY_PLATFORMS",
+                   "get_step_cache_meta", "save_step_cache_meta", "get_matrix_fingerprint", "ensure_sequential_matrices",
+                   "get_local_r_lib", "read_csv_preserve_id", "get_suitable_expression_matrix", "safe_str",
+                   "get_dataset_display_name", "get_sample_clinical_vector", "compute_normal_pca",
+                   "compute_single_qc", "build_hexbin_mv_ggplot", "build_dist_ggplot", "build_pca_ggplot",
+                   "save_plot_formats", "prepare_pre_processing_qc", "get_clinical_path", "get_clin_metadata_path", "parse_clinical_data"),
+      pkg_list = c("jsonlite", "edgeR", "limma", "AnnotationDbi", "ggplot2", "matrixStats")
     )
   } else {
     lapply(datasets, process_single_annotation)
@@ -1961,7 +2135,574 @@ annotate_genes <- function(strategy, source, organisms, biotypes, datasets) {
   return(results)
 }
 
+# ── QC & Two-Entity PCA Helpers ──────────────────────────────────────────────
+
+get_dataset_display_name <- function(ds_id, d_name = NULL) {
+  base_id <- get_base_id(ds_id)
+  if (!is.null(d_name) && nzchar(trimws(as.character(d_name))) &&
+      !identical(as.character(d_name), as.character(ds_id)) &&
+      !identical(as.character(d_name), as.character(base_id))) {
+    return(trimws(as.character(d_name)))
+  }
+  meta_candidates <- c(
+    get_session_path(base_id, "%s_expr_metadata.rds", fallback = TRUE),
+    sprintf("tmp/%s_expr_metadata.rds", base_id),
+    get_session_path(base_id, "%s_upload_expr_metadata.rds", fallback = TRUE),
+    sprintf("tmp/%s_upload_expr_metadata.rds", base_id)
+  )
+  for (mp in unique(meta_candidates)) {
+    if (file.exists(mp)) {
+      meta <- tryCatch(readRDS(mp), error = function(e) NULL)
+      cand <- meta$datasetName %||% meta$name %||% ""
+      if (nzchar(trimws(as.character(cand))) &&
+          !identical(as.character(cand), as.character(ds_id)) &&
+          !identical(as.character(cand), as.character(base_id))) {
+        return(trimws(as.character(cand)))
+      }
+    }
+  }
+  if (grepl("_d([0-9]+)$", base_id)) {
+    return(sub("^.*_d([0-9]+)$", "Dataset \\1", base_id))
+  }
+  return(base_id)
+}
+
+get_sample_clinical_vector <- function(ds_id, samples, col_name = NULL, fallback_cols = character(0), default_val = "Sample") {
+  base_id <- get_base_id(ds_id)
+  out_vec <- rep(as.character(default_val), length(samples))
+  if (length(samples) == 0) return(out_vec)
+
+  clin_path <- get_clinical_path(base_id)
+  if (!file.exists(clin_path)) {
+    clin_path_full <- get_clinical_path(ds_id)
+    if (file.exists(clin_path_full)) clin_path <- clin_path_full
+  }
+  clin_meta_path <- get_clin_metadata_path(base_id)
+  if (!file.exists(clin_meta_path)) {
+    clin_meta_path_full <- get_clin_metadata_path(ds_id)
+    if (file.exists(clin_meta_path_full)) clin_meta_path <- clin_meta_path_full
+  }
+
+  meta <- if (file.exists(clin_meta_path)) tryCatch(readRDS(clin_meta_path), error = function(e) NULL) else NULL
+  sample_id_col <- meta$sampleIdCol %||% ""
+
+  clin_df <- NULL
+  if (file.exists(clin_path)) {
+    raw_clin <- tryCatch(read.csv(clin_path, check.names = FALSE, stringsAsFactors = FALSE), error = function(e) NULL)
+    if (!is.null(raw_clin) && ncol(raw_clin) > 0) {
+      if (!nzchar(sample_id_col)) sample_id_col <- colnames(raw_clin)[1]
+      clin_df <- tryCatch(parse_clinical_data(raw_clin, colnames(raw_clin), sample_id_col), error = function(e) NULL)
+    }
+  }
+  if (is.null(clin_df) || nrow(clin_df) == 0) return(out_vec)
+
+  target_col <- col_name %||% ""
+  if (!nzchar(target_col) || !(target_col %in% colnames(clin_df))) {
+    meta_col <- meta$groupCol %||% ""
+    if (nzchar(meta_col) && (meta_col %in% colnames(clin_df))) {
+      target_col <- meta_col
+    } else if (length(fallback_cols) > 0) {
+      found <- intersect(fallback_cols, colnames(clin_df))
+      if (length(found) > 0) target_col <- found[1]
+    }
+  }
+
+  if (nzchar(target_col) && (target_col %in% colnames(clin_df))) {
+    matched <- match(samples, rownames(clin_df))
+    valid_m <- !is.na(matched)
+    if (any(valid_m)) {
+      vals <- as.character(clin_df[matched[valid_m], target_col])
+      vals[is.na(vals) | !nzchar(trimws(vals))] <- default_val
+      out_vec[valid_m] <- vals
+    }
+  }
+  return(out_vec)
+}
+
+compute_normal_pca <- function(expr_mat, ds_id, is_unnormalized_rc = FALSE, ds_name = NULL, save_latest = TRUE) {
+  if (is.null(expr_mat) || !is.matrix(expr_mat) || nrow(expr_mat) < 2 || ncol(expr_mat) < 2) return(NULL)
+  base_id <- get_base_id(ds_id)
+  disp_name <- get_dataset_display_name(base_id, ds_name)
+
+  # Work strictly on a temporary copy so original expression matrix is never modified
+  expr_pca <- as.matrix(expr_mat)
+  if (any(is.na(expr_pca))) {
+    rm_vals <- rowMeans(expr_pca, na.rm = TRUE)
+    rm_vals[!is.finite(rm_vals)] <- 0
+    na_idx <- which(is.na(expr_pca), arr.ind = TRUE)
+    if (nrow(na_idx) > 0) expr_pca[na_idx] <- rm_vals[na_idx[, 1]]
+  }
+
+  if (isTRUE(is_unnormalized_rc)) {
+    expr_pca <- log2(pmax(expr_pca, 0) + 1)
+  }
+
+  row_vars <- matrixStats::rowVars(expr_pca, na.rm = TRUE)
+  keep <- is.finite(row_vars) & row_vars > 1e-8
+  if (sum(keep) < 2) return(NULL)
+  expr_pca <- expr_pca[keep, , drop = FALSE]
+
+  pca_fit <- tryCatch(prcomp(t(expr_pca), scale. = TRUE), error = function(e) NULL)
+  if (is.null(pca_fit) || ncol(pca_fit$x) < 1) return(NULL)
+
+  coords <- pca_fit$x[, seq_len(min(2L, ncol(pca_fit$x))), drop = FALSE]
+  if (ncol(coords) < 2) {
+    coords <- cbind(coords, rep(0, nrow(coords)))
+  }
+  total_var <- sum(pca_fit$sdev^2)
+  var_exp <- if (total_var > 0) pca_fit$sdev^2 / total_var else c(0, 0)
+  pc1_lbl <- sprintf("PC1 (%.1f%%)", (var_exp[1] %||% 0) * 100)
+  pc2_lbl <- sprintf("PC2 (%.1f%%)", (if (length(var_exp) >= 2) var_exp[2] else 0) * 100)
+
+  samples <- colnames(expr_pca) %||% rownames(coords) %||% paste0("Sample_", seq_len(nrow(coords)))
+  group_vec <- get_sample_clinical_vector(
+    base_id, samples, col_name = NULL,
+    fallback_cols = c("Group", "group", "Condition", "condition", "Status", "Class", "Phenotype"),
+    default_val = "All Samples"
+  )
+
+  pts <- lapply(seq_along(samples), function(i) {
+    list(
+      sample  = as.character(samples[i]),
+      pc1     = round(unname(as.numeric(coords[i, 1])), 4),
+      pc2     = round(unname(as.numeric(coords[i, 2])), 4),
+      group   = as.character(group_vec[i]),
+      dataset = disp_name
+    )
+  })
+
+  pca_obj <- list(
+    pc1Label          = pc1_lbl,
+    pc2Label          = pc2_lbl,
+    title             = disp_name,
+    isLog2Transformed = isTRUE(is_unnormalized_rc),
+    points            = pts
+  )
+
+  if (isTRUE(save_latest)) {
+    tryCatch(saveRDS(pca_obj, get_session_path(base_id, "%s_latest_normal_pca.rds")), error = function(e) NULL)
+  }
+  return(pca_obj)
+}
+
+compute_single_qc <- function(expr_mat, ds_id, is_unnormalized_rc = FALSE, ds_name = NULL, save_latest_pca = TRUE) {
+  if (is.null(expr_mat) || nrow(expr_mat) < 2 || ncol(expr_mat) < 1) return(NULL)
+  base_id <- get_base_id(ds_id)
+  disp_name <- get_dataset_display_name(base_id, ds_name)
+
+  row_means <- rowMeans(expr_mat, na.rm = TRUE)
+  row_vars  <- matrixStats::rowVars(as.matrix(expr_mat), na.rm = TRUE)
+  valid_mv  <- is.finite(row_means) & is.finite(row_vars)
+
+  m_clean <- row_means[valid_mv]
+  v_clean <- row_vars[valid_mv]
+  names_clean <- rownames(expr_mat)[valid_mv] %||% paste0("Feature_", seq_along(m_clean))
+
+  fin_vals <- expr_mat[is.finite(expr_mat)]
+  if (length(fin_vals) > 10) {
+    lo <- as.numeric(quantile(fin_vals, 0.005, na.rm = TRUE))
+    hi <- as.numeric(quantile(fin_vals, 0.995, na.rm = TRUE))
+  } else if (length(fin_vals) > 0) {
+    lo <- min(fin_vals, na.rm = TRUE)
+    hi <- max(fin_vals, na.rm = TRUE)
+  } else {
+    lo <- 0; hi <- 1
+  }
+  if (!is.finite(lo) || !is.finite(hi) || lo >= hi) {
+    lo <- 0; hi <- 1
+  }
+  grid_vals <- seq(lo, hi, length.out = 61)
+
+  sample_densities <- lapply(seq_len(ncol(expr_mat)), function(j) {
+    s_vals <- expr_mat[is.finite(expr_mat[, j]), j]
+    s_name <- colnames(expr_mat)[j] %||% sprintf("Sample_%d", j)
+    if (length(s_vals) > 1 && diff(range(s_vals)) > 0) {
+      d <- density(s_vals, from = lo, to = hi, n = 61)
+      y_pts <- d$y
+    } else {
+      y_pts <- rep(0, 61)
+    }
+    list(name = s_name, y = round(unname(y_pts), 4))
+  })
+
+  pca_res <- compute_normal_pca(expr_mat, base_id, is_unnormalized_rc = is_unnormalized_rc, ds_name = disp_name, save_latest = save_latest_pca)
+
+  return(list(
+    datasetName = disp_name,
+    meanVariance = list(
+      means = round(unname(m_clean), 4),
+      vars  = round(unname(v_clean), 4),
+      names = as.character(names_clean)
+    ),
+    distribution = list(
+      grid    = round(unname(grid_vals), 4),
+      samples = sample_densities
+    ),
+    pca = pca_res
+  ))
+}
+
+build_hexbin_mv_ggplot <- function(mv_data, title_str) {
+  m <- as.numeric(mv_data$means)
+  v <- as.numeric(mv_data$vars)
+  keep <- is.finite(m) & is.finite(v)
+  m <- m[keep]; v <- v[keep]
+  if (length(m) < 2) {
+    return(ggplot2::ggplot() + ggplot2::theme_minimal() + ggplot2::labs(title = title_str, x = "Mean Expression", y = "Variance"))
+  }
+
+  x_min <- min(m); x_max <- max(m)
+  y_min <- min(v); y_max <- max(v)
+  x_span <- if (x_max > x_min) (x_max - x_min) else 1
+  y_span <- if (y_max > y_min) (y_max - y_min) else 1
+
+  nx <- 32
+  ny <- 28
+  dx <- 1 / nx
+  dy <- 1 / ny
+  r_x <- dx / 1.92
+  r_y <- dy / 1.65
+
+  u <- (m - x_min) / x_span
+  w <- (v - y_min) / y_span
+
+  iy <- round(w / dy)
+  ix <- round((u - ifelse(iy %% 2 == 1, 0.5 * dx, 0)) / dx)
+  bin_key <- paste0(ix, "_", iy)
+  counts <- table(bin_key)
+
+  uniq_keys <- names(counts)
+  parts <- do.call(rbind, strsplit(uniq_keys, "_"))
+  b_ix <- as.numeric(parts[, 1])
+  b_iy <- as.numeric(parts[, 2])
+  b_cnt <- as.numeric(counts)
+
+  cx <- (b_ix * dx + ifelse(b_iy %% 2 == 1, 0.5 * dx, 0)) * x_span + x_min
+  cy <- (b_iy * dy) * y_span + y_min
+
+  angles <- seq(pi / 6, 2 * pi, by = pi / 3)
+  cos_a <- cos(angles) * r_x * x_span
+  sin_a <- sin(angles) * r_y * y_span
+
+  n_bins <- length(uniq_keys)
+  poly_df <- data.frame(
+    hex_id = rep(seq_len(n_bins), each = 6),
+    x      = as.vector( outer(cos_a, cx, "+") ),
+    y      = as.vector( outer(sin_a, cy, "+") ),
+    count  = rep(b_cnt, each = 6)
+  )
+  df_mv <- data.frame(Mean = m, Variance = v)
+
+  p <- ggplot2::ggplot() +
+    ggplot2::geom_polygon(
+      data = poly_df,
+      ggplot2::aes(x = x, y = y, group = hex_id, fill = count),
+      color = "#ffffff", linewidth = 0.08
+    ) +
+    ggplot2::scale_fill_viridis_c(trans = "log10", name = "Features", option = "D") +
+    ggplot2::theme_minimal(base_size = 11) +
+    ggplot2::labs(title = title_str, x = "Mean Expression", y = "Variance") +
+    ggplot2::theme(plot.title = ggplot2::element_text(face = "bold", size = 11))
+
+  if (nrow(df_mv) >= 6) {
+    p <- p + tryCatch(
+      ggplot2::geom_smooth(
+        data = df_mv,
+        ggplot2::aes(x = Mean, y = Variance),
+        color = "#ef4444", se = FALSE, linewidth = 0.9
+      ),
+      error = function(e) NULL
+    )
+  }
+  return(p)
+}
+
+build_dist_ggplot <- function(dist_data, title_str) {
+  grid_vals <- as.numeric(dist_data$grid)
+  samples <- dist_data$samples
+  if (is.null(samples) || length(samples) == 0 || length(grid_vals) == 0) {
+    return(ggplot2::ggplot() + ggplot2::theme_minimal() + ggplot2::labs(title = title_str, x = "Expression Value", y = "Density"))
+  }
+  df_list <- lapply(samples, function(sd) {
+    data.frame(
+      x = grid_vals,
+      density = as.numeric(sd$y),
+      sample = as.character(sd$name),
+      stringsAsFactors = FALSE
+    )
+  })
+  df_dist <- do.call(rbind, df_list)
+  ggplot2::ggplot(df_dist, ggplot2::aes(x = x, y = density, color = sample)) +
+    ggplot2::geom_line(alpha = 0.78, linewidth = 0.75) +
+    ggplot2::theme_minimal(base_size = 11) +
+    ggplot2::labs(title = title_str, x = "Expression Value", y = "Density") +
+    ggplot2::theme(
+      legend.position = if (length(samples) <= 15) "bottom" else "none",
+      plot.title = ggplot2::element_text(face = "bold", size = 11)
+    )
+}
+
+build_pca_ggplot <- function(pca_data, color_by = "group", title_str = NULL) {
+  if (is.null(pca_data) || is.null(pca_data$points) || length(pca_data$points) == 0) {
+    return(ggplot2::ggplot() + ggplot2::theme_minimal() + ggplot2::labs(title = title_str, x = "PC1", y = "PC2"))
+  }
+  pts <- pca_data$points
+  df_pca <- data.frame(
+    Sample  = vapply(pts, function(p) as.character(p$sample %||% ""), character(1)),
+    PC1     = vapply(pts, function(p) as.numeric(p$pc1 %||% 0), numeric(1)),
+    PC2     = vapply(pts, function(p) as.numeric(p$pc2 %||% 0), numeric(1)),
+    Group   = vapply(pts, function(p) as.character(p$group %||% "All Samples"), character(1)),
+    Batch   = vapply(pts, function(p) as.character(p$batch %||% p$group %||% "Batch1"), character(1)),
+    Dataset = vapply(pts, function(p) as.character(p$dataset %||% ""), character(1)),
+    stringsAsFactors = FALSE
+  )
+  col_var <- if (identical(tolower(color_by), "batch")) "Batch" else if (identical(tolower(color_by), "dataset")) "Dataset" else "Group"
+  df_pca[[col_var]] <- as.factor(df_pca[[col_var]])
+
+  sub_txt <- if (isTRUE(pca_data$isLog2Transformed)) "Computed on log2(count + 1) temporary copy" else NULL
+
+  ggplot2::ggplot(df_pca, ggplot2::aes(x = PC1, y = PC2, color = .data[[col_var]])) +
+    ggplot2::geom_point(size = 3.2, alpha = 0.86) +
+    ggplot2::theme_minimal(base_size = 11) +
+    ggplot2::labs(
+      title    = title_str,
+      subtitle = sub_txt,
+      x        = pca_data$pc1Label %||% "PC1",
+      y        = pca_data$pc2Label %||% "PC2",
+      color    = col_var
+    ) +
+    ggplot2::theme(
+      legend.position = "bottom",
+      plot.title = ggplot2::element_text(face = "bold", size = 11),
+      plot.subtitle = ggplot2::element_text(size = 9, color = "#64748b")
+    )
+}
+
+save_plot_formats <- function(plot_obj, pdf_path, png_path, svg_path = NULL, tiff_path = NULL, width = 7, height = 5) {
+  tryCatch({
+    ggplot2::ggsave(pdf_path, plot = plot_obj, width = width, height = height, dpi = 300, limitsize = FALSE)
+  }, error = function(e) cat(sprintf("[PLOT] PDF save failed (%s): %s\n", pdf_path, conditionMessage(e))))
+  tryCatch({
+    ggplot2::ggsave(png_path, plot = plot_obj, width = width, height = height, dpi = 300, bg = "white", limitsize = FALSE)
+  }, error = function(e) cat(sprintf("[PLOT] PNG save failed (%s): %s\n", png_path, conditionMessage(e))))
+  if (!is.null(svg_path) && nzchar(svg_path)) {
+    tryCatch({
+      grDevices::svg(svg_path, width = width, height = height)
+      if (inherits(plot_obj, "ggplot")) {
+        print(plot_obj)
+      } else {
+        grid::grid.newpage()
+        grid::grid.draw(plot_obj)
+      }
+      grDevices::dev.off()
+    }, error = function(e) {
+      if (grDevices::dev.cur() > 1) tryCatch(grDevices::dev.off(), error = function(e2) NULL)
+    })
+  }
+  if (!is.null(tiff_path) && nzchar(tiff_path)) {
+    tryCatch({
+      ggplot2::ggsave(tiff_path, plot = plot_obj, width = width, height = height, dpi = 300, bg = "white", limitsize = FALSE)
+    }, error = function(e) NULL)
+  }
+}
+
+prepare_pre_processing_qc <- function(expr_mat, ds_id, data_type = "readcounts", is_normalized = FALSE, ds_name = NULL) {
+  if (is.null(expr_mat) || nrow(expr_mat) < 2 || ncol(expr_mat) < 1) return(NULL)
+  base_id <- get_base_id(ds_id)
+  uid_val <- get_user_id(base_id)
+  if (is.null(uid_val) || !nzchar(uid_val)) uid_val <- "user"
+
+  disp_name <- get_dataset_display_name(base_id, ds_name)
+  is_raw_rc <- identical(tolower(as.character(data_type %||% "readcounts")), "readcounts") && !isTRUE(is_normalized)
+
+  saveRDS(expr_mat, get_session_path(base_id, "%s_pre_processing_expr.rds"))
+  pre_qc <- compute_single_qc(expr_mat, base_id, is_unnormalized_rc = is_raw_rc, ds_name = disp_name, save_latest_pca = TRUE)
+  if (is.null(pre_qc)) return(NULL)
+  saveRDS(pre_qc, get_session_path(base_id, "%s_pre_qc.rds"))
+
+  tryCatch({
+    p_mv   <- build_hexbin_mv_ggplot(pre_qc$meanVariance, sprintf("%s — Before Processing (Mean-Variance)", disp_name))
+    p_dist <- build_dist_ggplot(pre_qc$distribution, sprintf("%s — Before Processing (Sample Distribution)", disp_name))
+    p_pca  <- build_pca_ggplot(pre_qc$pca, color_by = "group", title_str = sprintf("%s — Before Processing (Normal PCA)", disp_name))
+
+    mv_pdf <- get_session_path(base_id, "qc_mean_variance_%s.pdf")
+    mv_png <- get_session_path(base_id, "qc_mean_variance_%s.png")
+    mv_svg <- get_session_path(base_id, "qc_mean_variance_%s.svg")
+    save_plot_formats(p_mv, mv_pdf, mv_png, mv_svg, width = 7, height = 4.8)
+    register_export_file(uid_val, "qc_mean_variance", base_id, mv_pdf, "dp", "processing", ext = "pdf")
+
+    dist_pdf <- get_session_path(base_id, "qc_distribution_%s.pdf")
+    dist_png <- get_session_path(base_id, "qc_distribution_%s.png")
+    dist_svg <- get_session_path(base_id, "qc_distribution_%s.svg")
+    save_plot_formats(p_dist, dist_pdf, dist_png, dist_svg, width = 7, height = 4.8)
+    register_export_file(uid_val, "qc_distribution", base_id, dist_pdf, "dp", "processing", ext = "pdf")
+
+    qcpca_pdf <- get_session_path(base_id, "qc_pca_%s.pdf")
+    qcpca_png <- get_session_path(base_id, "qc_pca_%s.png")
+    qcpca_svg <- get_session_path(base_id, "qc_pca_%s.svg")
+    save_plot_formats(p_pca, qcpca_pdf, qcpca_png, qcpca_svg, width = 7, height = 4.8)
+    register_export_file(uid_val, "qc_pca", base_id, qcpca_pdf, "dp", "processing", ext = "pdf")
+
+    pca_pdf <- get_session_path(base_id, "pca_plots_%s.pdf")
+    pca_png <- get_session_path(base_id, "pca_plots_%s.png")
+    pca_svg <- get_session_path(base_id, "pca_plots_%s.svg")
+    save_plot_formats(p_pca, pca_pdf, pca_png, pca_svg, width = 6.5, height = 4.8)
+    register_export_file(uid_val, "pca_plots", base_id, pca_pdf, "dp", "processing", ext = "pdf")
+  }, error = function(e) {
+    cat(sprintf("[QC] Pre-processing plot file generation warning: %s\n", conditionMessage(e)))
+  })
+
+  return(pre_qc)
+}
+
+run_pre_processing_qc <- function(datasets) {
+  results <- list()
+  for (d in datasets) {
+    ds_id_full <- d$datasetId %||% d$id
+    base_id <- get_base_id(ds_id_full)
+    pre_qc_path <- get_session_path(base_id, "%s_pre_qc.rds")
+    pre_qc <- if (file.exists(pre_qc_path)) tryCatch(readRDS(pre_qc_path), error = function(e) NULL) else NULL
+    if (is.null(pre_qc)) {
+      expr_in <- get_latest_step_matrix(base_id, "processing")
+      if (is.null(expr_in)) {
+        parsed <- get_backend_dataset(ds_id_full, step = "processing")
+        expr_in <- parsed$expr
+      }
+      meta_info <- tryCatch(readRDS(get_session_path(base_id, "%s_expr_metadata.rds", fallback = TRUE)), error = function(e) NULL)
+      dtype <- d$dataType %||% meta_info$dataType %||% "readcounts"
+      is_n  <- if (!is.null(d$isNormalized)) isTRUE(d$isNormalized) else isTRUE(meta_info$isNormalized)
+      pre_qc <- prepare_pre_processing_qc(expr_in, base_id, dtype, is_n, d$name)
+    }
+    results[[length(results) + 1]] <- list(
+      datasetId = ds_id_full,
+      qc = if (!is.null(pre_qc)) list(
+        before       = pre_qc,
+        meanVariance = pre_qc$meanVariance,
+        distribution = pre_qc$distribution,
+        pca          = pre_qc$pca
+      ) else NULL
+    )
+  }
+  return(results)
+}
+
 # 2. Data Filtering and Imputation Handler
+generate_qc_plots <- function(expr, ds_id, uid_val = NULL, ds_name = NULL, before_expr = NULL, is_unnormalized_rc = NULL) {
+  if (is.null(expr) || nrow(expr) < 2 || ncol(expr) < 1) return(NULL)
+  base_id <- get_base_id(ds_id)
+  if (is.null(uid_val) || !nzchar(uid_val)) uid_val <- get_user_id(base_id)
+  if (is.null(uid_val) || !nzchar(uid_val)) uid_val <- "user"
+
+  disp_name <- get_dataset_display_name(base_id, ds_name)
+  if (is.null(is_unnormalized_rc)) {
+    meta_info <- tryCatch(readRDS(get_session_path(base_id, "%s_expr_metadata.rds", fallback = TRUE)), error = function(e) NULL)
+    dtype <- meta_info$dataType %||% "readcounts"
+    is_n  <- isTRUE(meta_info$isNormalized)
+    is_unnormalized_rc <- identical(tolower(as.character(dtype)), "readcounts") && !is_n
+  }
+
+  # 1. Retrieve already-stored Before-Processing QC (or compute from before_expr if missing)
+  pre_qc_path <- get_session_path(base_id, "%s_pre_qc.rds")
+  before_qc <- if (file.exists(pre_qc_path)) tryCatch(readRDS(pre_qc_path), error = function(e) NULL) else NULL
+  if (is.null(before_qc)) {
+    b_mat <- before_expr
+    if (is.null(b_mat)) {
+      pre_mat_path <- get_session_path(base_id, "%s_pre_processing_expr.rds")
+      if (file.exists(pre_mat_path)) b_mat <- tryCatch(readRDS(pre_mat_path), error = function(e) NULL)
+    }
+    if (is.null(b_mat)) b_mat <- expr
+    before_qc <- compute_single_qc(b_mat, base_id, is_unnormalized_rc = is_unnormalized_rc, ds_name = disp_name, save_latest_pca = FALSE)
+    if (!is.null(before_qc)) {
+      tryCatch(saveRDS(before_qc, pre_qc_path), error = function(e) NULL)
+    }
+  } else {
+    before_qc$datasetName <- disp_name
+    if (!is.null(before_qc$pca)) before_qc$pca$title <- disp_name
+  }
+
+  # 2. Compute After-Processing QC (and update %s_latest_normal_pca.rds)
+  after_qc <- compute_single_qc(expr, base_id, is_unnormalized_rc = is_unnormalized_rc, ds_name = disp_name, save_latest_pca = TRUE)
+  if (is.null(after_qc)) return(NULL)
+
+  # 3. Render 2-row stacked (Upper = Before, Lower = After) QC plot files & single Normal PCA plot
+  tryCatch({
+    p_mv_before <- build_hexbin_mv_ggplot(before_qc$meanVariance, sprintf("%s — Before Processing (Mean-Variance)", disp_name))
+    p_mv_after  <- build_hexbin_mv_ggplot(after_qc$meanVariance,  sprintf("%s — After Processing (Mean-Variance)", disp_name))
+    g_mv <- gridExtra::arrangeGrob(p_mv_before, p_mv_after, ncol = 1)
+
+    mv_pdf <- get_session_path(base_id, "qc_mean_variance_%s.pdf")
+    mv_png <- get_session_path(base_id, "qc_mean_variance_%s.png")
+    mv_svg <- get_session_path(base_id, "qc_mean_variance_%s.svg")
+    save_plot_formats(g_mv, mv_pdf, mv_png, mv_svg, width = 7.2, height = 8.8)
+    register_export_file(uid_val, "qc_mean_variance", base_id, mv_pdf, "dp", "processing", ext = "pdf")
+
+    p_dist_before <- build_dist_ggplot(before_qc$distribution, sprintf("%s — Before Processing (Sample Distribution)", disp_name))
+    p_dist_after  <- build_dist_ggplot(after_qc$distribution,  sprintf("%s — After Processing (Sample Distribution)", disp_name))
+    g_dist <- gridExtra::arrangeGrob(p_dist_before, p_dist_after, ncol = 1)
+
+    dist_pdf <- get_session_path(base_id, "qc_distribution_%s.pdf")
+    dist_png <- get_session_path(base_id, "qc_distribution_%s.png")
+    dist_svg <- get_session_path(base_id, "qc_distribution_%s.svg")
+    save_plot_formats(g_dist, dist_pdf, dist_png, dist_svg, width = 7.2, height = 8.8)
+    register_export_file(uid_val, "qc_distribution", base_id, dist_pdf, "dp", "processing", ext = "pdf")
+
+    p_pca_before <- build_pca_ggplot(before_qc$pca, color_by = "group", title_str = sprintf("%s — Before Processing (Normal PCA)", disp_name))
+    p_pca_after  <- build_pca_ggplot(after_qc$pca,  color_by = "group", title_str = sprintf("%s — After Processing (Normal PCA)", disp_name))
+    g_pca <- gridExtra::arrangeGrob(p_pca_before, p_pca_after, ncol = 1)
+
+    qcpca_pdf <- get_session_path(base_id, "qc_pca_%s.pdf")
+    qcpca_png <- get_session_path(base_id, "qc_pca_%s.png")
+    qcpca_svg <- get_session_path(base_id, "qc_pca_%s.svg")
+    save_plot_formats(g_pca, qcpca_pdf, qcpca_png, qcpca_svg, width = 7.2, height = 8.8)
+    register_export_file(uid_val, "qc_pca", base_id, qcpca_pdf, "dp", "processing", ext = "pdf")
+
+    # Entity 1: Normal PCA plot (latest processed state, overwritten later only by Normalization Normal PCA)
+    p_normal_latest <- build_pca_ggplot(after_qc$pca, color_by = "group", title_str = sprintf("%s — Normal PCA (Processed)", disp_name))
+    pca_pdf <- get_session_path(base_id, "pca_plots_%s.pdf")
+    pca_png <- get_session_path(base_id, "pca_plots_%s.png")
+    pca_svg <- get_session_path(base_id, "pca_plots_%s.svg")
+    save_plot_formats(p_normal_latest, pca_pdf, pca_png, pca_svg, width = 6.5, height = 4.8)
+    register_export_file(uid_val, "pca_plots", base_id, pca_pdf, "dp", "processing", ext = "pdf")
+  }, error = function(e) {
+    cat(sprintf("[QC] Plot file generation failed: %s\n", conditionMessage(e)))
+  })
+
+  return(list(
+    datasetName  = disp_name,
+    before       = before_qc,
+    after        = after_qc,
+    meanVariance = after_qc$meanVariance,
+    distribution = after_qc$distribution,
+    pca          = after_qc$pca
+  ))
+}
+
+ensure_qc_plots <- function(ds_id) {
+  base_id <- get_base_id(ds_id)
+  mv_pdf <- get_session_path(base_id, "qc_mean_variance_%s.pdf")
+  dist_pdf <- get_session_path(base_id, "qc_distribution_%s.pdf")
+  qcpca_pdf <- get_session_path(base_id, "qc_pca_%s.pdf")
+  if (file.exists(mv_pdf) && file.exists(dist_pdf) && file.exists(qcpca_pdf)) return(invisible(TRUE))
+
+  expr <- NULL
+  candidates <- list(
+    get_session_path(base_id, "%s_processed_expr.rds"),
+    sprintf("tmp/%s_processed.rds", base_id),
+    get_session_path(base_id, "%s_expr_matrix_annotated.rds"),
+    get_session_path(base_id, "%s_expr_matrix.rds")
+  )
+  for (p in candidates) {
+    if (file.exists(p)) {
+      expr <- tryCatch(readRDS(p), error = function(e) NULL)
+      if (!is.null(expr) && is.matrix(expr) && nrow(expr) > 0) break
+      expr <- NULL
+    }
+  }
+  if (is.null(expr)) return(invisible(FALSE))
+  generate_qc_plots(expr, base_id)
+  invisible(TRUE)
+}
+
 process_datasets <- function(payload) {
   cat("[PROCESSING] Filtering and imputing missing data...\n")
 
@@ -1991,6 +2732,7 @@ process_datasets <- function(payload) {
       cat(sprintf("[CONSOLE]   Missing values after: %d\n", sum(is.na(parsed$expr))))
 
       rebuilt <- rebuild_parsed_data(parsed$expr, parsed$anno, parsed$geneIdCol)
+      qc_res <- tryCatch(generate_qc_plots(parsed$expr, ds_id, get_user_id(ds_id), ds_name = d$name, before_expr = parsed$expr), error = function(e) NULL)
 
       return(list(
         datasetId = ds_id_full,
@@ -2001,7 +2743,8 @@ process_datasets <- function(payload) {
         parsedData = rebuilt$parsedData,
         columns = rebuilt$columns,
         sampleIds = colnames(parsed$expr),
-        nSamples = as.integer(ncol(parsed$expr))
+        nSamples = as.integer(ncol(parsed$expr)),
+        qc = qc_res
       ))
     }
     
@@ -2014,6 +2757,7 @@ process_datasets <- function(payload) {
     if (is.null(expr)) {
       expr <- parsed$expr
     }
+    expr_before_proc <- expr
 
     # ── Tier 1 Cache Check ───────────────────────────────────────────────────
     step_cache <- get_step_cache_meta(ds_id, "processing")
@@ -2023,8 +2767,12 @@ process_datasets <- function(payload) {
     if (!is.null(step_cache) &&
         identical(step_cache$filterMethod, d$filterMethod) &&
         identical(step_cache$filterThreshold, d$filterParams$varianceThreshold) &&
-        identical(step_cache$minSumCounts, d$filterParams$countThreshold) &&
+        identical(step_cache$readcountThreshold, d$filterParams$readcountThreshold) &&
+        identical(step_cache$abundanceMethod, d$filterParams$abundanceMethod) &&
+        identical(step_cache$abundanceThreshold, d$filterParams$abundanceThreshold) &&
+        identical(step_cache$abundanceSamplePercent, d$filterParams$abundanceSamplePercent) &&
         identical(step_cache$minCpm, d$filterParams$cpmThreshold) &&
+        identical(step_cache$minSamples, d$filterParams$minSamples) &&
         identical(step_cache$naRemovePercent, d$naRemovePercent) &&
         identical(step_cache$missingMethod, d$missingMethod) &&
         identical(step_cache$kNeighbors, d$missingParams$knnK) &&
@@ -2074,6 +2822,7 @@ process_datasets <- function(payload) {
     should_handle_na <- (isTRUE(d$isNA) || (!is.null(missing_method) && missing_method != "none" && missing_method != "skip")) && any(is.na(expr))
     if (should_handle_na) {
       cat(sprintf("  Imputing missing values using method: %s...\n", missing_method))
+      na_indices <- is.na(expr)
       
       if (missing_method == "knn") {
         expr <- tryCatch({
@@ -2088,11 +2837,11 @@ process_datasets <- function(payload) {
               donor_idx <- if (length(comp_rows) > max_donors) sample(comp_rows, max_donors) else comp_rows
               sub_idx <- c(na_rows, donor_idx)
               sub_mat <- expr[sub_idx, , drop = FALSE]
-              imp_sub <- impute::impute.knn(sub_mat, k = min(k_val, length(donor_idx)), maxp = max(1500L, length(sub_idx)))$data
+              imp_sub <- impute::impute.knn(sub_mat, k = min(k_val, length(donor_idx)), maxp = max(3000L, length(sub_idx)))$data
               expr[na_rows, ] <- imp_sub[seq_along(na_rows), , drop = FALSE]
               expr
             } else {
-              impute::impute.knn(expr, k = k_val, maxp = max(1500L, nrow(expr)))$data
+              impute::impute.knn(expr, k = k_val, maxp = max(3000L, nrow(expr)))$data
             }
           }
         }, error = function(e) {
@@ -2116,6 +2865,17 @@ process_datasets <- function(payload) {
         keep_rows <- rowSums(is.na(expr)) == 0
         expr <- expr[keep_rows, , drop = FALSE]
         anno <- anno[keep_rows, , drop = FALSE]
+      }
+
+      # If raw readcounts, floor imputed values to non-negative integers to preserve discrete count properties
+      meta_info <- tryCatch(readRDS(get_session_path(ds_id, "%s_expr_metadata.rds")), error = function(e) NULL)
+      ds_dtype <- if (!is.null(d$dataType)) d$dataType else if (!is.null(meta_info$dataType)) meta_info$dataType else "readcounts"
+      ds_is_n <- if (!is.null(d$isNormalized)) isTRUE(d$isNormalized) else if (!is.null(meta_info$isNormalized)) isTRUE(meta_info$isNormalized) else FALSE
+      is_raw_rc <- identical(ds_dtype, "readcounts") && !isTRUE(ds_is_n)
+
+      if (is_raw_rc && missing_method != "remove" && any(na_indices)) {
+        cat("  Flooring imputed values to nearest integer for raw readcounts...\n")
+        expr[na_indices] <- floor(pmax(expr[na_indices], 0))
       }
     }
 
@@ -2146,11 +2906,39 @@ process_datasets <- function(payload) {
           keep_indices <- rep(FALSE, nrow(expr))
           keep_indices[final_keep] <- keep_sub
           final_keep <- final_keep & keep_indices
-        } else if (m == "min_count") {
-          min_cnt <- if (!is.null(d$filterParams$countThreshold)) as.numeric(d$filterParams$countThreshold) else 10
-          keep_sub <- rowSums(sub_expr) >= min_cnt
-          keep_sub[is.na(keep_sub)] <- FALSE
-          
+        } else if (m == "abundance") {
+          is_raw_rc <- identical(d$dataType, "readcounts") && !isTRUE(d$isNormalized)
+          if (is_raw_rc) {
+            sample_pct <- if (!is.null(d$filterParams$abundanceSamplePercent)) as.numeric(d$filterParams$abundanceSamplePercent) else 50
+            thresh_val <- if (!is.null(d$filterParams$readcountThreshold)) as.numeric(d$filterParams$readcountThreshold) else 10
+
+            # Logic: filter out feature if value < threshold in at least sample_pct % of samples
+            # Retain if count of samples where value < threshold is strictly LESS THAN (sample_pct / 100 * total_samples)
+            low_sample_count <- rowSums(sub_expr < thresh_val, na.rm = TRUE)
+            low_sample_ratio <- low_sample_count / ncol(sub_expr)
+
+            keep_sub <- (low_sample_ratio < (sample_pct / 100))
+            keep_sub[is.na(keep_sub)] <- FALSE
+          } else {
+            abund_method <- if (!is.null(d$filterParams$abundanceMethod)) as.character(d$filterParams$abundanceMethod) else "mean"
+            raw_thresh <- if (!is.null(d$filterParams$abundanceThreshold)) as.numeric(d$filterParams$abundanceThreshold) else 10
+
+            if (abund_method == "median") {
+              vals <- matrixStats::rowMedians(as.matrix(sub_expr), na.rm = TRUE)
+            } else {
+              vals <- rowMeans(sub_expr, na.rm = TRUE)
+            }
+
+            vals_clean <- vals
+            vals_clean[is.na(vals_clean)] <- -Inf
+            rk <- rank(-vals_clean, ties.method = "random")
+            remain_num <- ceiling(length(vals_clean) * (1 - (raw_thresh / 100)))
+            remain_num <- max(0L, min(length(vals_clean), as.integer(remain_num)))
+
+            keep_sub <- rk <= remain_num
+            keep_sub[is.na(keep_sub)] <- FALSE
+          }
+
           keep_indices <- rep(FALSE, nrow(expr))
           keep_indices[final_keep] <- keep_sub
           final_keep <- final_keep & keep_indices
@@ -2192,6 +2980,8 @@ process_datasets <- function(payload) {
     cat(sprintf("[CONSOLE]   Missing values after: %d\n", sum(is.na(expr))))
 
     rebuilt <- rebuild_parsed_data(expr, anno, parsed$geneIdCol)
+    is_raw_rc_proc <- identical(tolower(as.character(dtype)), "readcounts") && !isTRUE(is_n)
+    qc_res <- tryCatch(generate_qc_plots(expr, ds_id, get_user_id(ds_id), ds_name = d$name, before_expr = expr_before_proc, is_unnormalized_rc = is_raw_rc_proc), error = function(e) NULL)
 
     res <- list(
       datasetId = ds_id_full,
@@ -2202,13 +2992,18 @@ process_datasets <- function(payload) {
       parsedData = rebuilt$parsedData,
       columns = rebuilt$columns,
       sampleIds = colnames(expr),
-      nSamples = as.integer(ncol(expr))
+      nSamples = as.integer(ncol(expr)),
+      qc = qc_res
     )
     save_step_cache_meta(ds_id, "processing", list(
       filterMethod = d$filterMethod,
       filterThreshold = d$filterParams$varianceThreshold,
-      minSumCounts = d$filterParams$countThreshold,
+      readcountThreshold = d$filterParams$readcountThreshold,
+      abundanceMethod = d$filterParams$abundanceMethod,
+      abundanceThreshold = d$filterParams$abundanceThreshold,
+      abundanceSamplePercent = d$filterParams$abundanceSamplePercent,
       minCpm = d$filterParams$cpmThreshold,
+      minSamples = d$filterParams$minSamples,
       naRemovePercent = d$naRemovePercent,
       missingMethod = d$missingMethod,
       kNeighbors = d$missingParams$knnK,
@@ -2224,8 +3019,13 @@ process_datasets <- function(payload) {
       process_single_processing,
       var_list = c("process_single_processing", "get_base_id", "get_backend_dataset", "rebuild_parsed_data",
                    "get_session_path", "get_latest_step_matrix", "push_main_stack", "push_counts_stack",
-                   "register_export_file", "get_user_id", "%||%"),
-      pkg_list = c("jsonlite", "impute", "matrixStats")
+                   "register_export_file", "get_user_id", "%||%", "generate_qc_plots",
+                   "get_step_cache_meta", "save_step_cache_meta", "get_matrix_fingerprint", "ensure_sequential_matrices",
+                   "impute_missing_knn", "get_suitable_expression_matrix", "safe_str",
+                   "get_dataset_display_name", "get_sample_clinical_vector", "compute_normal_pca",
+                   "compute_single_qc", "build_hexbin_mv_ggplot", "build_dist_ggplot", "build_pca_ggplot",
+                   "save_plot_formats", "prepare_pre_processing_qc", "get_clinical_path", "get_clin_metadata_path", "parse_clinical_data"),
+      pkg_list = c("jsonlite", "impute", "matrixStats", "ggplot2", "gridExtra")
     )
   } else {
     lapply(payload, process_single_processing)
@@ -2314,8 +3114,9 @@ ensure_boxplot_before <- function(ds_id) {
   }
 
   tryCatch({
-    write_boxplot_file(expr, png_path, paste0(base_id, " (Sample Distribution)"))
-    write_boxplot_pdf(expr,  pdf_path, paste0(base_id, " (Sample Distribution)"))
+    ds_display_name <- get_dataset_display_name(base_id)
+    write_boxplot_file(expr, png_path, paste0(ds_display_name, " (Sample Distribution)"))
+    write_boxplot_pdf(expr,  pdf_path, paste0(ds_display_name, " (Sample Distribution)"))
     register_export_file(get_user_id(base_id), "boxplot_before", base_id, pdf_path, "dp", "normalization", ext = "pdf")
     cat(sprintf("[INFO] ensure_boxplot_before: generated boxplot files for %s\n", base_id))
     invisible(TRUE)
@@ -2349,12 +3150,15 @@ normalize_datasets <- function(datasets, method, transform_type, prior_count) {
     
     d_prior_count <- if (!is.null(d$priorCount)) as.numeric(d$priorCount) else prior_count
     d_data_type <- if (!is.null(d$dataType)) d$dataType else "readcounts"
+    ds_display_name <- get_dataset_display_name(ds_id, d$name)
 
     # Check if skipped
     if (d_method == "skip" || d_method == "none") {
       cat(sprintf("  Skipping normalization for dataset %s\n", ds_id_full))
       if (file.exists(sprintf("tmp/%s_normalized.rds", ds_id))) file.remove(sprintf("tmp/%s_normalized.rds", ds_id))
       if (file.exists(sprintf("tmp/%s_normalization.csv", ds_id))) file.remove(sprintf("tmp/%s_normalization.csv", ds_id))
+      if (file.exists(sprintf("tmp/%s_norm_config.rds", ds_id))) file.remove(sprintf("tmp/%s_norm_config.rds", ds_id))
+      if (file.exists(get_session_path(ds_id, "%s_norm_config.rds"))) file.remove(get_session_path(ds_id, "%s_norm_config.rds"))
       
       expr <- get_latest_step_matrix(ds_id, "normalization")
       if (!is.null(expr)) {
@@ -2377,7 +3181,6 @@ normalize_datasets <- function(datasets, method, transform_type, prior_count) {
       pdf_before_path <- get_session_path(ds_id, "boxplot_before_%s.pdf")
       pdf_after_path  <- get_session_path(ds_id, "boxplot_after_%s.pdf")
       
-      ds_display_name <- if (!is.null(d$name) && nzchar(d$name)) d$name else ds_id
       write_boxplot_file(parsed$expr, png_before_path, paste0(ds_display_name, " (Before/After - Skipped)"))
       file.copy(png_before_path, png_after_path, overwrite = TRUE)
       write_boxplot_pdf(parsed$expr, pdf_before_path, paste0(ds_display_name, " (Before/After - Skipped)"))
@@ -2388,6 +3191,19 @@ normalize_datasets <- function(datasets, method, transform_type, prior_count) {
       boxplot_before <- if (file.exists(png_before_path)) base64enc::base64encode(png_before_path) else ""
       boxplot_after <- boxplot_before
 
+      is_raw_rc <- identical(tolower(as.character(d_data_type)), "readcounts") && !isTRUE(parsed$isNormalized)
+      norm_pca <- tryCatch(compute_normal_pca(parsed$expr, ds_id, is_unnormalized_rc = is_raw_rc, ds_name = ds_display_name, save_latest = TRUE), error = function(e) NULL)
+      if (!is.null(norm_pca)) {
+        tryCatch({
+          p_norm_pca <- build_pca_ggplot(norm_pca, color_by = "group", title_str = sprintf("%s — Normal PCA", ds_display_name))
+          pca_pdf <- get_session_path(ds_id, "pca_plots_%s.pdf")
+          pca_png <- get_session_path(ds_id, "pca_plots_%s.png")
+          pca_svg <- get_session_path(ds_id, "pca_plots_%s.svg")
+          save_plot_formats(p_norm_pca, pca_pdf, pca_png, pca_svg, width = 6.5, height = 4.8)
+          register_export_file(get_user_id(ds_id), "pca_plots", ds_id, pca_pdf, "dp", "normalization", ext = "pdf")
+        }, error = function(e) NULL)
+      }
+
       return(list(
         datasetId = ds_id_full,
         parsedData = rebuilt$parsedData,
@@ -2395,6 +3211,7 @@ normalize_datasets <- function(datasets, method, transform_type, prior_count) {
         sampleIds = colnames(parsed$expr),
         boxplotBefore = boxplot_before,
         boxplotAfter = boxplot_after,
+        normalPca = norm_pca,
         nFeatures = as.integer(nrow(parsed$expr)),
         nSamples = as.integer(ncol(parsed$expr)),
         retainedFeatures = as.integer(nrow(parsed$expr)),
@@ -2448,7 +3265,14 @@ normalize_datasets <- function(datasets, method, transform_type, prior_count) {
     anno <- anno[!is.na(anno_idx), , drop = FALSE]
 
     norm_expr <- apply_normalization_to_matrix(expr, d_method, d_transform_type, d_prior_count, d_data_type)
-    saveRDS(list(method = d_method, logTransform = d_transform_type != "none", transformationType = d_transform_type, priorCount = d_prior_count, dataType = d_data_type), file = sprintf("tmp/%s_norm_config.rds", ds_id))
+    norm_cfg_obj <- list(method = d_method, logTransform = d_transform_type != "none", transformationType = d_transform_type, priorCount = d_prior_count, dataType = d_data_type)
+    saveRDS(norm_cfg_obj, file = sprintf("tmp/%s_norm_config.rds", ds_id))
+    tryCatch(saveRDS(norm_cfg_obj, file = get_session_path(ds_id, "%s_norm_config.rds")), error = function(e) NULL)
+
+    # Illumina probe quality + detection P-val filter (post-normalization)
+    data_type <- d_data_type %||% parsed$dataType %||% ""
+    gene_id_type <- d$geneIdType %||% parsed$geneIdType %||% d$microarrayPlatformId %||% parsed$platform
+    norm_expr <- apply_illumina_probe_filters(norm_expr, ds_id, gene_id_type, data_type)
 
     # Save sequentially and push to main stack
     push_main_stack(ds_id, norm_expr, step_name = "normalization", metadata = list(method = d_method, logTransform = d_transform_type != "none", transformationType = d_transform_type, priorCount = d_prior_count, dataType = d_data_type))
@@ -2467,7 +3291,6 @@ normalize_datasets <- function(datasets, method, transform_type, prior_count) {
     pdf_before_path <- get_session_path(ds_id, "boxplot_before_%s.pdf")
     pdf_after_path  <- get_session_path(ds_id, "boxplot_after_%s.pdf")
     
-    ds_display_name <- if (!is.null(d$name) && nzchar(d$name)) d$name else ds_id
     write_boxplot_file(expr, png_before_path, paste0(ds_display_name, " — Before Normalization"))
     write_boxplot_file(norm_expr, png_after_path, paste0(ds_display_name, " — After Normalization"))
     write_boxplot_pdf(expr, pdf_before_path, paste0(ds_display_name, " — Before Normalization"))
@@ -2478,6 +3301,24 @@ normalize_datasets <- function(datasets, method, transform_type, prior_count) {
     boxplot_before <- if (file.exists(png_before_path) && requireNamespace("base64enc", quietly = TRUE)) base64enc::base64encode(png_before_path) else ""
     boxplot_after  <- if (file.exists(png_after_path) && requireNamespace("base64enc", quietly = TRUE)) base64enc::base64encode(png_after_path) else ""
 
+    # Compute Entity 1 Normal PCA on normalized expression matrix (and update %s_latest_normal_pca.rds)
+    norm_pca <- tryCatch(compute_normal_pca(norm_expr, ds_id, is_unnormalized_rc = FALSE, ds_name = ds_display_name, save_latest = TRUE), error = function(e) NULL)
+    if (!is.null(norm_pca)) {
+      tryCatch({
+        p_norm_pca <- build_pca_ggplot(norm_pca, color_by = "group", title_str = sprintf("%s — Normal PCA (Normalized)", ds_display_name))
+        pca_pdf <- get_session_path(ds_id, "pca_plots_%s.pdf")
+        pca_png <- get_session_path(ds_id, "pca_plots_%s.png")
+        pca_svg <- get_session_path(ds_id, "pca_plots_%s.svg")
+        save_plot_formats(p_norm_pca, pca_pdf, pca_png, pca_svg, width = 6.5, height = 4.8)
+        register_export_file(get_user_id(ds_id), "pca_plots", ds_id, pca_pdf, "dp", "normalization", ext = "pdf")
+      }, error = function(e) NULL)
+    }
+
+    # For microarray datasets (where Normalization precedes Annotation and Processing), also update pre-processing QC snapshot
+    if (identical(tolower(as.character(d_data_type)), "microarray")) {
+      tryCatch(prepare_pre_processing_qc(norm_expr, ds_id, d_data_type, is_normalized = TRUE, ds_name = ds_display_name), error = function(e) NULL)
+    }
+
     res <- list(
       datasetId = ds_id_full,
       parsedData = rebuilt$parsedData,
@@ -2485,6 +3326,7 @@ normalize_datasets <- function(datasets, method, transform_type, prior_count) {
       sampleIds = colnames(norm_expr),
       boxplotBefore = boxplot_before,
       boxplotAfter = boxplot_after,
+      normalPca = norm_pca,
       nFeatures = as.integer(nrow(norm_expr)),
       nSamples = as.integer(ncol(norm_expr)),
       retainedFeatures = as.integer(nrow(norm_expr)),
@@ -2508,8 +3350,14 @@ normalize_datasets <- function(datasets, method, transform_type, prior_count) {
       var_list = c("method", "transform_type", "prior_count", "process_single_norm",
                    "get_base_id", "get_backend_dataset", "rebuild_parsed_data", "get_session_path",
                    "get_latest_step_matrix", "write_boxplot_file", "write_boxplot_pdf", "register_export_file",
-                   "get_user_id", "apply_normalization_to_matrix", "push_main_stack", "push_counts_stack", "%||%"),
-      pkg_list = c("jsonlite", "edgeR", "limma", "DESeq2", "vsn", "preprocessCore")
+                   "get_user_id", "apply_normalization_to_matrix", "push_main_stack", "push_counts_stack", "%||%",
+                   "ILLUMINA_PROBE_QUALITY_PLATFORMS", "filter_probes_by_quality", "filter_by_detection_pval", "apply_illumina_probe_filters",
+                   "get_step_cache_meta", "save_step_cache_meta", "get_matrix_fingerprint", "ensure_sequential_matrices",
+                   "get_suitable_expression_matrix", "safe_str",
+                   "get_dataset_display_name", "get_sample_clinical_vector", "compute_normal_pca",
+                   "compute_single_qc", "build_hexbin_mv_ggplot", "build_dist_ggplot", "build_pca_ggplot",
+                   "save_plot_formats", "prepare_pre_processing_qc", "get_clinical_path", "get_clin_metadata_path", "parse_clinical_data"),
+      pkg_list = c("jsonlite", "edgeR", "limma", "DESeq2", "vsn", "preprocessCore", "ggplot2", "matrixStats")
     )
   } else {
     lapply(datasets, process_single_norm)
@@ -2569,11 +3417,29 @@ robust_vst <- function(counts_mat) {
   })
 }
 
-# 4. Dimensionality PCA Handler
+attach_batch_to_pca_obj <- function(pca_obj, batch_vec, samples = NULL, ds_name = NULL) {
+  if (is.null(pca_obj) || is.null(pca_obj$points) || length(pca_obj$points) == 0) return(NULL)
+  pts <- pca_obj$points
+  pt_samples <- vapply(pts, function(p) as.character(p$sample %||% ""), character(1))
+  if (!is.null(samples) && length(samples) > 0) {
+    idx <- match(samples, pt_samples)
+    if (any(is.na(idx))) return(NULL)
+    pts <- pts[idx]
+  }
+  for (i in seq_along(pts)) {
+    b_val <- if (i <= length(batch_vec)) as.character(batch_vec[i]) else "Batch1"
+    pts[[i]]$batch <- b_val
+    if (!is.null(ds_name) && nzchar(ds_name)) pts[[i]]$dataset <- ds_name
+  }
+  pca_obj$points <- pts
+  if (!is.null(ds_name) && nzchar(ds_name)) pca_obj$title <- ds_name
+  return(pca_obj)
+}
+
+# 4. Dimensionality PCA Handler (Entity 2 — Batch-Stratified Pre-Batch PCA)
 compute_pca <- function(datasets) {
   cat("[PROCESSING] Computing PCA coordinate projection...\n")
 
-  # Loop over all datasets and get their matrices and clinical info
   expr_list <- list()
   clin_combined <- data.frame()
   datasets_pca <- list()
@@ -2581,15 +3447,18 @@ compute_pca <- function(datasets) {
   for (d in datasets) {
     ds_id_full <- if (!is.null(d$datasetId)) d$datasetId else (if (!is.null(d$id)) d$id else "")
     ds_id <- get_base_id(ds_id_full)
-    # Load active matrix
+    ds_display_name <- get_dataset_display_name(ds_id, d$name)
+
     parsed_expr <- get_backend_dataset(ds_id_full, step = "pca")
     if (is.null(parsed_expr)) next
     expr <- parsed_expr$expr
     cat("Number of rows:", nrow(expr), "\n")
     
     if (any(is.na(expr))) {
-      expr[is.na(expr)] <- rowMeans(expr, na.rm = TRUE)[which(is.na(expr), arr.ind = TRUE)[, 1]]
-      expr[is.na(expr)] <- 0
+      rm_vals <- rowMeans(expr, na.rm = TRUE)
+      rm_vals[!is.finite(rm_vals)] <- 0
+      na_idx <- which(is.na(expr), arr.ind = TRUE)
+      if (nrow(na_idx) > 0) expr[na_idx] <- rm_vals[na_idx[, 1]]
     }
 
     # Load clinical data
@@ -2650,7 +3519,7 @@ compute_pca <- function(datasets) {
         }
       }
       if (nzchar(batch_col) && batch_col %in% colnames(clin_df)) {
-        for (i in 1:length(samples)) {
+        for (i in seq_along(samples)) {
           sample_name <- samples[i]
           if (sample_name %in% rownames(clin_df)) {
             row <- clin_df[sample_name, ]
@@ -2660,58 +3529,57 @@ compute_pca <- function(datasets) {
       }
     }
 
-    # Individual PCA (if normalized then use the normalized data, if havent normalized then use latest data normalized with VST)
-    pca_ind_str <- ""
-    is_normalized_step_done <- file.exists(sprintf("tmp/%s_normalized_expr_actual.rds", ds_id)) || file.exists(sprintf("tmp/%s_normalized.rds", ds_id))
-    
+    # Determine whether Normalization was performed
+    norm_cfg_file <- get_session_path(ds_id, "%s_norm_config.rds")
+    if (!file.exists(norm_cfg_file)) norm_cfg_file <- sprintf("tmp/%s_norm_config.rds", ds_id)
+    norm_cfg <- if (file.exists(norm_cfg_file)) tryCatch(readRDS(norm_cfg_file), error = function(e) NULL) else NULL
+    is_normalized_step_done <- (!is.null(norm_cfg) && !(norm_cfg$method %in% c("skip", "none"))) ||
+                               file.exists(get_session_path(ds_id, "%s_normalized_expr_actual.rds")) ||
+                               file.exists(sprintf("tmp/%s_normalized_expr_actual.rds", ds_id)) ||
+                               file.exists(sprintf("tmp/%s_normalized.rds", ds_id))
+    dtype_val <- tolower(as.character(d$dataType %||% parsed_expr$dataType %||% "readcounts"))
+    is_unnorm_rc <- !is_normalized_step_done && identical(dtype_val, "readcounts") && !isTRUE(parsed_expr$isNormalized)
+
     expr_pca <- expr
-    if (!is_normalized_step_done) {
-      if (identical(parsed_expr$dataType, "readcounts")) {
-        expr_pca <- robust_vst(expr)
-      } else {
-        expr_pca <- log2(pmax(expr, 0) + 1)
-      }
+    if (is_unnorm_rc) {
+      expr_pca <- log2(pmax(expr, 0) + 1)
     }
 
     expr_list[[ds_id]] <- expr_pca
     df_d <- data.frame(
       Sample    = samples,
-      Dataset   = rep(d$name, length(samples)),
+      Dataset   = rep(ds_display_name, length(samples)),
       Batch     = as.factor(batch_vec),
       stringsAsFactors = FALSE
     )
     rownames(df_d) <- paste0(ds_id, "_", samples)
     clin_combined <- rbind(clin_combined, df_d)
 
-    if (ncol(expr_pca) >= 2 && nrow(expr_pca) >= 2) {
-      pca_ind_str <- tryCatch({
-        pca_fit_ind <- prcomp(t(expr_pca), scale. = TRUE)
-        pca_coords_ind <- pca_fit_ind$x[, 1:2, drop = FALSE]
-        var_explained_ind <- pca_fit_ind$sdev^2 / sum(pca_fit_ind$sdev^2)
-        pc1_label_ind <- sprintf("PC1 (%.1f%%)", var_explained_ind[1] * 100)
-        pc2_label_ind <- sprintf("PC2 (%.1f%%)", var_explained_ind[2] * 100)
-        
-        df_ind <- data.frame(
-          PC1 = pca_coords_ind[, 1],
-          PC2 = pca_coords_ind[, 2],
-          Batch = as.factor(batch_vec)
-        )
-        p_ind <- ggplot2::ggplot(df_ind, ggplot2::aes(x = PC1, y = PC2, color = Batch)) +
-          ggplot2::geom_point(size = 3.5, alpha = 0.85) +
-          ggplot2::theme_minimal() +
-          ggplot2::labs(title = NULL, x = pc1_label_ind, y = pc2_label_ind) +
-          ggplot2::theme(legend.position = "bottom")
-          
-        ggplot2::ggsave(get_session_path(ds_id, "pca_plots_%s.pdf"), plot = p_ind, width = 6, height = 4, dpi = 300)
-        ggplot2::ggsave(get_session_path(ds_id, "pca_plots_%s.png"), plot = p_ind, width = 6, height = 4, dpi = 300)
-        ggplot2::ggsave(get_session_path(ds_id, "pca_plots_%s.tiff"), plot = p_ind, width = 6, height = 4, dpi = 300)
-          
-        plot_to_base64(p_ind)
-      }, error = function(e) {
-        ""
-      })
+    # Reuse already-computed Normal PCA coordinates if available, and stratify by Batch
+    latest_pca_path <- get_session_path(ds_id, "%s_latest_normal_pca.rds")
+    latest_pca <- if (file.exists(latest_pca_path)) tryCatch(readRDS(latest_pca_path), error = function(e) NULL) else NULL
+    batch_pca_ind <- attach_batch_to_pca_obj(latest_pca, batch_vec, samples, ds_display_name)
+    if (is.null(batch_pca_ind)) {
+      computed_pca <- compute_normal_pca(expr, ds_id, is_unnormalized_rc = is_unnorm_rc, ds_name = ds_display_name, save_latest = TRUE)
+      batch_pca_ind <- attach_batch_to_pca_obj(computed_pca, batch_vec, samples, ds_display_name)
     }
-    datasets_pca[[ds_id_full]] <- list(plot_batch = pca_ind_str)
+
+    pca_ind_str <- ""
+    if (!is.null(batch_pca_ind)) {
+      pca_ind_str <- tryCatch({
+        p_ind <- build_pca_ggplot(batch_pca_ind, color_by = "batch", title_str = sprintf("%s — PCA Before Batch Correction", ds_display_name))
+        pdf_path <- get_session_path(ds_id, "pca_plots_before_batch_%s.pdf")
+        png_path <- get_session_path(ds_id, "pca_plots_before_batch_%s.png")
+        svg_path <- get_session_path(ds_id, "pca_plots_before_batch_%s.svg")
+        save_plot_formats(p_ind, pdf_path, png_path, svg_path, width = 6.5, height = 4.8)
+        register_export_file(get_user_id(ds_id), "pca_plots_before_batch", ds_id, pdf_path, "dp", "batch", ext = "pdf")
+        base64enc::base64encode(png_path)
+      }, error = function(e) "")
+    }
+    datasets_pca[[ds_id_full]] <- list(
+      plot_batch     = pca_ind_str,
+      pcaInteractive = batch_pca_ind
+    )
   }
 
   if (length(expr_list) == 0) return(list())
@@ -2728,13 +3596,9 @@ compute_pca <- function(datasets) {
   }
 
   if (is.null(common_genes) || length(common_genes) < 2) {
-    # If no common genes or too few, return empty/placeholder
     return(list(plot_batch = "", plot_group = "", plot_covariate = "", combined = list(plot_batch = ""), datasets = datasets_pca))
   }
 
-  # Shrink each dataset to the common genes IN PLACE (frees the non-common rows) before
-  # the cbind, so we never hold the full per-dataset matrices and the combined matrix at
-  # the same time. Then drop expr_list entirely once combined_expr is built.
   for (id in names(expr_list)) {
     m <- expr_list[[id]][common_genes, , drop = FALSE]
     colnames(m) <- paste0(id, "_", colnames(m))
@@ -2743,9 +3607,6 @@ compute_pca <- function(datasets) {
   combined_expr <- do.call(cbind, expr_list)
   rm(expr_list); invisible(gc(FALSE))
 
-  # Drop zero/near-zero-variance genes: prcomp(scale.=TRUE) errors on constant columns
-  # ("cannot rescale a constant/zero column to unit variance"), which would crash the
-  # whole PCA handler instead of returning a plot.
   gene_vars <- apply(combined_expr, 1, var)
   combined_expr <- combined_expr[is.finite(gene_vars) & gene_vars > 0, , drop = FALSE]
   if (nrow(combined_expr) < 2) {
@@ -2760,7 +3621,6 @@ compute_pca <- function(datasets) {
   }
   pca_coords <- pca_fit$x[, 1:2, drop = FALSE]
 
-  # Compute variance explained per PC for axis labels
   var_explained <- pca_fit$sdev^2 / sum(pca_fit$sdev^2)
   pc1_label <- sprintf("PC1 (%.1f%%)", var_explained[1] * 100)
   pc2_label <- sprintf("PC2 (%.1f%%)", var_explained[2] * 100)
@@ -2768,30 +3628,37 @@ compute_pca <- function(datasets) {
   samples_in_pca <- rownames(pca_coords)
   clin_aligned <- clin_combined[samples_in_pca, , drop = FALSE]
 
-  df <- data.frame(
-    PC1     = pca_coords[, 1],
-    PC2     = pca_coords[, 2],
-    Batch   = as.factor(clin_aligned$Batch),
-    Dataset = as.factor(clin_aligned$Dataset)
+  comb_pts <- lapply(seq_len(nrow(pca_coords)), function(i) {
+    list(
+      sample  = as.character(clin_aligned$Sample[i]),
+      pc1     = round(unname(as.numeric(pca_coords[i, 1])), 4),
+      pc2     = round(unname(as.numeric(pca_coords[i, 2])), 4),
+      batch   = as.character(clin_aligned$Batch[i]),
+      group   = as.character(clin_aligned$Batch[i]),
+      dataset = as.character(clin_aligned$Dataset[i])
+    )
+  })
+  comb_pca_obj <- list(
+    pc1Label = pc1_label,
+    pc2Label = pc2_label,
+    title    = "Combined Datasets — Before Batch Correction",
+    points   = comb_pts
   )
 
-  p1 <- ggplot2::ggplot(df, ggplot2::aes(x = PC1, y = PC2, color = Batch)) +
-    ggplot2::geom_point(size = 3, alpha = 0.85) +
-    ggplot2::theme_minimal() +
-    ggplot2::labs(title = NULL, x = pc1_label, y = pc2_label) +
-    ggplot2::theme(legend.position = "bottom")
-
-  p1_export <- p1 + ggplot2::labs(title = "Pre-Correction PCA (Batch Effect)")
+  p1 <- build_pca_ggplot(comb_pca_obj, color_by = "batch", title_str = NULL)
+  p1_export <- build_pca_ggplot(comb_pca_obj, color_by = "batch", title_str = "Combined Datasets — Pre-Correction PCA (Batch Effect)")
   cat("[PCA] Completed PCA computation...\n")
+  b64_p1 <- plot_to_base64(p1)
   return(list(
-    plot_batch            = plot_to_base64(p1),
+    plot_batch            = b64_p1,
     plot_group            = "",
     plot_covariate        = "",
     plot_batch_export     = plot_to_base64(p1_export),
     plot_group_export     = "",
     plot_covariate_export = "",
     combined = list(
-      plot_batch = plot_to_base64(p1)
+      plot_batch     = b64_p1,
+      pcaInteractive = comb_pca_obj
     ),
     datasets = datasets_pca
   ))
@@ -2808,6 +3675,7 @@ correct_batch_effects <- function(method, method_others, datasets) {
   for (d in datasets) {
     ds_id_full <- d$id
     ds_id <- get_base_id(ds_id_full)
+    ds_display_name <- get_dataset_display_name(ds_id, d$name)
     
     # Load expression (for raw readcounts, use the most recent raw count matrix stack)
     dtype <- d$dataType
@@ -2815,10 +3683,25 @@ correct_batch_effects <- function(method, method_others, datasets) {
     is_norm <- isTRUE(d$isNormalized)
     is_raw_readcounts <- (dtype == "readcounts" && !is_norm)
     
+    # Check if user had already run Normalization step before Batch Correction
+    norm_cfg_file <- get_session_path(ds_id, "%s_norm_config.rds")
+    if (!file.exists(norm_cfg_file)) norm_cfg_file <- sprintf("tmp/%s_norm_config.rds", ds_id)
+    norm_cfg <- if (file.exists(norm_cfg_file)) tryCatch(readRDS(norm_cfg_file), error = function(e) NULL) else NULL
+    has_prev_norm <- !is.null(norm_cfg) && !(norm_cfg$method %in% c("skip", "none"))
+    pre_batch_norm_mat <- NULL
+    if (has_prev_norm) {
+      for (np in c(get_session_path(ds_id, "%s_normalized_expr_actual.rds"), sprintf("tmp/%s_normalized_expr_actual.rds", ds_id), sprintf("tmp/%s_normalized.rds", ds_id))) {
+        if (file.exists(np)) {
+          pre_batch_norm_mat <- tryCatch(readRDS(np), error = function(e) NULL)
+          if (!is.null(pre_batch_norm_mat)) break
+        }
+      }
+    }
+
     rds_path <- sprintf("tmp/%s_expr_matrix.rds", ds_id)
     expr <- NULL
     if (is_raw_readcounts) {
-      # Use raw counts stack
+      # Use raw counts stack for ComBat-seq
       expr <- get_latest_raw_count_matrix(ds_id)
     } else {
       # Use normalized/processed matrix stack
@@ -2896,11 +3779,8 @@ correct_batch_effects <- function(method, method_others, datasets) {
     
     corrected_expr <- expr
     curr_method <- if (is_raw_readcounts) method else method_others
+    norm_mat <- NULL
 
-    # Compute batch_vec for the CURRENT dataset up-front, so the before/after per-dataset
-    # PCA colouring works on the skip/none path too. R for-loops don't create a new scope,
-    # so without this, batch_vec would be undefined on the first skipped dataset or hold the
-    # previous dataset's factor (wrong length/labels).
     batch_vec <- if (!is.null(batch_col) && batch_col != "" && (batch_col %in% colnames(clin_df))) {
       as.factor(clin_df[[batch_col]])
     } else {
@@ -2925,7 +3805,14 @@ correct_batch_effects <- function(method, method_others, datasets) {
     if (is_cache_hit) {
       cat(sprintf("[CACHE] Reusing cached batch correction for dataset %s\n", ds_id))
       corrected_expr <- tryCatch(readRDS(out_file), error=function(e) expr)
-      push_main_stack(ds_id, corrected_expr, step_name = "batch", metadata = list(method = curr_method))
+      if (is_raw_readcounts && curr_method == "combat_seq" && has_prev_norm) {
+        norm_transform <- if (!is.null(norm_cfg$transformationType)) norm_cfg$transformationType else (if (isTRUE(norm_cfg$logTransform)) "log2" else "none")
+        norm_data_type <- if (!is.null(norm_cfg$dataType)) norm_cfg$dataType else dtype
+        norm_mat <- apply_normalization_to_matrix(corrected_expr, norm_cfg$method, norm_transform, norm_cfg$priorCount, norm_data_type)
+        push_main_stack(ds_id, norm_mat, step_name = "batch", metadata = list(method = "combat_seq", reNormalized = TRUE, normMethod = norm_cfg$method))
+      } else {
+        push_main_stack(ds_id, corrected_expr, step_name = "batch", metadata = list(method = curr_method))
+      }
       ensure_sequential_matrices(ds_id)
     } else if (curr_method == "skip" || curr_method == "none") {
       cat(sprintf("  Skipping batch correction for dataset %s\n", ds_id))
@@ -2933,7 +3820,6 @@ correct_batch_effects <- function(method, method_others, datasets) {
       if (file.exists(sprintf("tmp/%s_batch.csv", ds_id))) file.remove(sprintf("tmp/%s_batch.csv", ds_id))
       if (file.exists(sprintf("tmp/%s_batch_expr_actual.rds", ds_id))) file.remove(sprintf("tmp/%s_batch_expr_actual.rds", ds_id))
       
-      # Use previous step's data (normalized_expr.rds or processed_expr.rds)
       expr_prev <- get_latest_step_matrix(ds_id, "batch")
       if (!is.null(expr_prev)) {
         saveRDS(expr_prev, file = sprintf("tmp/%s_batch_expr.rds", ds_id))
@@ -2960,20 +3846,13 @@ correct_batch_effects <- function(method, method_others, datasets) {
       saveRDS(corrected_expr, file = rds_path)
       saveRDS(corrected_expr, file = sprintf("tmp/%s_batch_expr.rds", ds_id))
       saveRDS(corrected_expr, file = sprintf("tmp/%s_batch_expr_actual.rds", ds_id))
-      
-      # Save batch correction results
       saveRDS(corrected_expr, file = sprintf("tmp/%s_batch.rds", ds_id))
       
       if (is_raw_readcounts && curr_method == "combat_seq") {
-        # Save batch-corrected raw count stack
         push_counts_stack(ds_id, corrected_expr, step_name = "batch", metadata = list(method = "combat_seq"))
         saveRDS(corrected_expr, file = sprintf("tmp/%s_batch_raw_counts.rds", ds_id))
         
-        # Check if user had already run Normalization step
-        norm_cfg_file <- get_session_path(ds_id, "%s_norm_config.rds")
-        norm_cfg <- if (file.exists(norm_cfg_file)) tryCatch(readRDS(norm_cfg_file), error = function(e) NULL) else NULL
-        
-        if (!is.null(norm_cfg)) {
+        if (has_prev_norm) {
           norm_transform <- if (!is.null(norm_cfg$transformationType)) norm_cfg$transformationType else (if (isTRUE(norm_cfg$logTransform)) "log2" else "none")
           cat(sprintf("[BATCH] Re-normalizing ComBat-seq count data using user's normalization method '%s' (transformationType: %s, priorCount: %g) for %s...\n",
                       norm_cfg$method, norm_transform, norm_cfg$priorCount, ds_id))
@@ -2983,7 +3862,6 @@ correct_batch_effects <- function(method, method_others, datasets) {
           saveRDS(norm_mat, file = sprintf("tmp/%s_normalized_expr.rds", ds_id))
           push_main_stack(ds_id, norm_mat, step_name = "batch", metadata = list(method = "combat_seq", reNormalized = TRUE, normMethod = norm_cfg$method))
           
-          # Replace the existing normalized result in the main stack
           base_id <- get_base_id(ds_id)
           stack_file <- get_session_path(base_id, "%s_main_stack.rds")
           if (file.exists(stack_file)) {
@@ -3014,27 +3892,53 @@ correct_batch_effects <- function(method, method_others, datasets) {
         push_main_stack(ds_id, corrected_expr, step_name = "batch", metadata = list(method = curr_method))
       }
 
-        tryCatch({
-          # Design uses only batch column — group/other covariates are not part of batch correction design
-          if (!is.null(batch_col) && batch_col != "" && (batch_col %in% colnames(clin_df))) {
-            clin_df$Batch <- factor(clin_df[[batch_col]])
-            dds <- DESeq2::DESeqDataSetFromMatrix(countData = round(corrected_expr), colData = clin_df, design = ~ Batch)
-            saveRDS(dds, file = sprintf("tmp/%s_deseq2_obj.rds", ds_id))
-            dge <- edgeR::DGEList(counts = corrected_expr, group = clin_df$Batch)
-            saveRDS(dge, file = sprintf("tmp/%s_edgeR_obj.rds", ds_id))
-          } else {
-            dds <- DESeq2::DESeqDataSetFromMatrix(countData = round(corrected_expr), colData = clin_df, design = ~ 1)
-            saveRDS(dds, file = sprintf("tmp/%s_deseq2_obj.rds", ds_id))
-            dge <- edgeR::DGEList(counts = corrected_expr)
-            saveRDS(dge, file = sprintf("tmp/%s_edgeR_obj.rds", ds_id))
-          }
-        }, error = function(e) {
-          cat("[WARNING] Failed to update DESeq2/edgeR objects:", e$message, "\n")
-        })
-      }
+      tryCatch({
+        if (!is.null(batch_col) && batch_col != "" && (batch_col %in% colnames(clin_df))) {
+          clin_df$Batch <- factor(clin_df[[batch_col]])
+          dds <- DESeq2::DESeqDataSetFromMatrix(countData = round(corrected_expr), colData = clin_df, design = ~ Batch)
+          saveRDS(dds, file = sprintf("tmp/%s_deseq2_obj.rds", ds_id))
+          dge <- edgeR::DGEList(counts = corrected_expr, group = clin_df$Batch)
+          saveRDS(dge, file = sprintf("tmp/%s_edgeR_obj.rds", ds_id))
+        } else {
+          dds <- DESeq2::DESeqDataSetFromMatrix(countData = round(corrected_expr), colData = clin_df, design = ~ 1)
+          saveRDS(dds, file = sprintf("tmp/%s_deseq2_obj.rds", ds_id))
+          dge <- edgeR::DGEList(counts = corrected_expr)
+          saveRDS(dge, file = sprintf("tmp/%s_edgeR_obj.rds", ds_id))
+        }
+      }, error = function(e) {
+        cat("[WARNING] Failed to update DESeq2/edgeR objects:", e$message, "\n")
+      })
+    }
     
-    expr_before_list[[ds_id]] <- expr
-    expr_after_list[[ds_id]]  <- corrected_expr
+    # Determine exact matrices for Before & After Batch Correction PCA
+    # Before: normalized data if normalization was performed, else latest data (log2(x+1) if raw readcounts)
+    before_pca_mat <- if (is_raw_readcounts) {
+      if (has_prev_norm && !is.null(pre_batch_norm_mat) && all(common_samples %in% colnames(pre_batch_norm_mat))) {
+        pre_batch_norm_mat[, common_samples, drop = FALSE]
+      } else {
+        log2(pmax(expr, 0) + 1)
+      }
+    } else {
+      expr
+    }
+
+    # After: for ComBat-seq raw readcounts, use re-normalized norm_mat if normalized previously, else log2(corrected_expr + 1)
+    after_pca_mat <- if (curr_method == "skip" || curr_method == "none") {
+      before_pca_mat
+    } else if (is_raw_readcounts && curr_method == "combat_seq") {
+      if (has_prev_norm && !is.null(norm_mat) && all(common_samples %in% colnames(norm_mat))) {
+        norm_mat[, common_samples, drop = FALSE]
+      } else {
+        log2(pmax(corrected_expr, 0) + 1)
+      }
+    } else if (is_raw_readcounts) {
+      log2(pmax(corrected_expr, 0) + 1)
+    } else {
+      corrected_expr
+    }
+
+    expr_before_list[[ds_id]] <- before_pca_mat
+    expr_after_list[[ds_id]]  <- after_pca_mat
     
     if (!is_cache_hit && curr_method != "skip" && curr_method != "none") {
       save_step_cache_meta(ds_id, "batch", list(
@@ -3053,76 +3957,74 @@ correct_batch_effects <- function(method, method_others, datasets) {
     cat(sprintf("[CONSOLE]   Missing values after: %d\n", sum(is.na(corrected_expr))))
 
     df_d <- data.frame(
-      Sample = common_samples,
-      Dataset = rep(d$name, length(common_samples)),
-      Batch = as.factor(batch_val_vec),
+      Sample  = common_samples,
+      Dataset = rep(ds_display_name, length(common_samples)),
+      Batch   = as.factor(batch_val_vec),
       stringsAsFactors = FALSE
     )
     rownames(df_d) <- paste0(ds_id, "_", common_samples)
     clin_combined <- rbind(clin_combined, df_d)
 
-    # Individual PCA
+    # Individual Before-Batch PCA (reuses %s_latest_normal_pca.rds coordinates stratified by batch)
+    latest_pca_path <- get_session_path(ds_id, "%s_latest_normal_pca.rds")
+    latest_pca <- if (file.exists(latest_pca_path)) tryCatch(readRDS(latest_pca_path), error = function(e) NULL) else NULL
+    pca_before_ind <- attach_batch_to_pca_obj(latest_pca, batch_val_vec, common_samples, ds_display_name)
+    if (is.null(pca_before_ind)) {
+      comp_b <- compute_normal_pca(before_pca_mat, ds_id, is_unnormalized_rc = FALSE, ds_name = ds_display_name, save_latest = FALSE)
+      if (!is.null(comp_b)) comp_b$isLog2Transformed <- (is_raw_readcounts && !has_prev_norm)
+      pca_before_ind <- attach_batch_to_pca_obj(comp_b, batch_val_vec, common_samples, ds_display_name)
+    }
+
+    # Individual After-Batch PCA
+    if (curr_method == "skip" || curr_method == "none") {
+      pca_after_ind <- pca_before_ind
+    } else {
+      comp_a <- compute_normal_pca(after_pca_mat, ds_id, is_unnormalized_rc = FALSE, ds_name = ds_display_name, save_latest = FALSE)
+      if (!is.null(comp_a)) comp_a$isLog2Transformed <- (is_raw_readcounts && !has_prev_norm)
+      pca_after_ind <- attach_batch_to_pca_obj(comp_a, batch_val_vec, common_samples, ds_display_name)
+    }
+
+    tryCatch(saveRDS(list(before = pca_before_ind, after = pca_after_ind), get_session_path(ds_id, "%s_batch_pca.rds")), error = function(e) NULL)
+
     ind_before <- ""
     ind_after  <- ""
-    if (ncol(expr) >= 2 && nrow(expr) >= 2) {
+    uid_val <- get_user_id(ds_id)
+    if (!is.null(pca_before_ind)) {
       ind_before <- tryCatch({
-        expr_pca <- if (dtype == "readcounts" || !isTRUE(parsed$isNormalized)) log2(pmax(expr, 0) + 1) else expr
-        pca_fit_ind <- prcomp(t(expr_pca), scale. = TRUE)
-        pca_coords_ind <- pca_fit_ind$x[, 1:2, drop = FALSE]
-        var_explained_ind <- pca_fit_ind$sdev^2 / sum(pca_fit_ind$sdev^2)
-        pc1_label_ind <- sprintf("PC1 (%.1f%%)", var_explained_ind[1] * 100)
-        pc2_label_ind <- sprintf("PC2 (%.1f%%)", var_explained_ind[2] * 100)
-        
-        df_ind <- data.frame(
-          PC1 = pca_coords_ind[, 1],
-          PC2 = pca_coords_ind[, 2],
-          Batch = as.factor(batch_vec)
-        )
-        p_ind <- ggplot2::ggplot(df_ind, ggplot2::aes(x = PC1, y = PC2, color = Batch)) +
-          ggplot2::geom_point(size = 3.5, alpha = 0.85) +
-          ggplot2::theme_minimal() +
-          ggplot2::labs(title = NULL, x = pc1_label_ind, y = pc2_label_ind) +
-          ggplot2::theme(legend.position = "bottom")
-          
-        plot_to_base64(p_ind)
-      }, error = function(e) {
-        ""
-      })
+        p_b <- build_pca_ggplot(pca_before_ind, color_by = "batch", title_str = sprintf("%s — PCA Before Batch Correction", ds_display_name))
+        pdf_b  <- get_session_path(ds_id, "pca_plots_before_batch_%s.pdf")
+        png_b  <- get_session_path(ds_id, "pca_plots_before_batch_%s.png")
+        svg_b  <- get_session_path(ds_id, "pca_plots_before_batch_%s.svg")
+        tiff_b <- get_session_path(ds_id, "pca_plots_before_batch_%s.tiff")
+        save_plot_formats(p_b, pdf_b, png_b, svg_b, tiff_b, width = 6.5, height = 4.8)
+        register_export_file(uid_val, "pca_plots_before_batch", ds_id, pdf_b, "dp", "batch", ext = "pdf")
+        base64enc::base64encode(png_b)
+      }, error = function(e) "")
     }
-    
-    if (ncol(corrected_expr) >= 2 && nrow(corrected_expr) >= 2) {
+    if (!is.null(pca_after_ind)) {
       ind_after <- tryCatch({
-        corr_pca <- if (dtype == "readcounts" || !isTRUE(parsed$isNormalized)) log2(pmax(corrected_expr, 0) + 1) else corrected_expr
-        pca_fit_ind <- prcomp(t(corr_pca), scale. = TRUE)
-        pca_coords_ind <- pca_fit_ind$x[, 1:2, drop = FALSE]
-        var_explained_ind <- pca_fit_ind$sdev^2 / sum(pca_fit_ind$sdev^2)
-        pc1_label_ind <- sprintf("PC1 (%.1f%%)", var_explained_ind[1] * 100)
-        pc2_label_ind <- sprintf("PC2 (%.1f%%)", var_explained_ind[2] * 100)
-        
-        df_ind <- data.frame(
-          PC1   = pca_coords_ind[, 1],
-          PC2   = pca_coords_ind[, 2],
-          Batch = as.factor(batch_vec)
-        )
-        p_ind <- ggplot2::ggplot(df_ind, ggplot2::aes(x = PC1, y = PC2, color = Batch)) +
-          ggplot2::geom_point(size = 3.5, alpha = 0.85) +
-          ggplot2::theme_minimal() +
-          ggplot2::labs(title = NULL, x = pc1_label_ind, y = pc2_label_ind) +
-          ggplot2::theme(legend.position = "bottom")
-          
-        plot_to_base64(p_ind)
-      }, error = function(e) {
-        ""
-      })
+        p_a <- build_pca_ggplot(pca_after_ind, color_by = "batch", title_str = sprintf("%s — PCA After Batch Correction", ds_display_name))
+        pdf_a  <- get_session_path(ds_id, "pca_plots_after_batch_%s.pdf")
+        png_a  <- get_session_path(ds_id, "pca_plots_after_batch_%s.png")
+        svg_a  <- get_session_path(ds_id, "pca_plots_after_batch_%s.svg")
+        tiff_a <- get_session_path(ds_id, "pca_plots_after_batch_%s.tiff")
+        save_plot_formats(p_a, pdf_a, png_a, svg_a, tiff_a, width = 6.5, height = 4.8)
+        register_export_file(uid_val, "pca_plots_after_batch", ds_id, pdf_a, "dp", "batch", ext = "pdf")
+        base64enc::base64encode(png_a)
+      }, error = function(e) "")
     }
-    datasets_pca[[ds_id_full]] <- list(before_batch = ind_before, after_batch = ind_after)
-    tryCatch(generate_pca_plots_for_export(ds_id_full), error = function(e) NULL)
-    tryCatch(generate_pca_plots_for_export(ds_id), error = function(e) NULL)
+
+    datasets_pca[[ds_id_full]] <- list(
+      before_batch         = ind_before,
+      after_batch          = ind_after,
+      pcaBeforeInteractive = pca_before_ind,
+      pcaAfterInteractive  = pca_after_ind
+    )
   }
 
   common_genes <- NULL
   for (id in names(expr_before_list)) {
-    genes <- rownames(expr_before_list[[id]])
+    genes <- intersect(rownames(expr_before_list[[id]]), rownames(expr_after_list[[id]]))
     if (is.null(common_genes)) {
       common_genes <- genes
     } else {
@@ -3143,10 +4045,11 @@ correct_batch_effects <- function(method, method_others, datasets) {
       mat
     }))
 
-    comb_before_pca <- log2(pmax(combined_before, 0) + 1)
-    comb_after_pca  <- log2(pmax(combined_after,  0) + 1)
-    # Drop genes with zero variance in either matrix — prcomp(scale.=TRUE) errors on
-    # constant columns, which would otherwise crash the whole batch-correction handler.
+    comb_before_pca <- combined_before
+    comb_after_pca  <- combined_after
+    if (any(is.na(comb_before_pca))) comb_before_pca[is.na(comb_before_pca)] <- 0
+    if (any(is.na(comb_after_pca)))  comb_after_pca[is.na(comb_after_pca)]  <- 0
+
     .keep <- {
       vb <- apply(comb_before_pca, 1, var); va <- apply(comb_after_pca, 1, var)
       is.finite(vb) & vb > 0 & is.finite(va) & va > 0
@@ -3168,23 +4071,45 @@ correct_batch_effects <- function(method, method_others, datasets) {
     samples_in_pca <- rownames(pca_before)
     clin_aligned <- clin_combined[samples_in_pca, , drop = FALSE]
 
-    df_before <- data.frame(
-      PC1   = pca_before[, 1],
-      PC2   = pca_before[, 2],
-      Batch = as.factor(clin_aligned$Batch)
+    comb_before_pts <- lapply(seq_len(nrow(pca_before)), function(i) {
+      list(
+        sample  = as.character(clin_aligned$Sample[i]),
+        pc1     = round(unname(as.numeric(pca_before[i, 1])), 4),
+        pc2     = round(unname(as.numeric(pca_before[i, 2])), 4),
+        batch   = as.character(clin_aligned$Batch[i]),
+        group   = as.character(clin_aligned$Batch[i]),
+        dataset = as.character(clin_aligned$Dataset[i])
+      )
+    })
+    comb_after_pts <- lapply(seq_len(nrow(pca_after)), function(i) {
+      list(
+        sample  = as.character(clin_aligned$Sample[i]),
+        pc1     = round(unname(as.numeric(pca_after[i, 1])), 4),
+        pc2     = round(unname(as.numeric(pca_after[i, 2])), 4),
+        batch   = as.character(clin_aligned$Batch[i]),
+        group   = as.character(clin_aligned$Batch[i]),
+        dataset = as.character(clin_aligned$Dataset[i])
+      )
+    })
+
+    comb_before_obj <- list(
+      pc1Label = before_pc1_lbl,
+      pc2Label = before_pc2_lbl,
+      title    = "Combined Datasets — Before Batch Correction",
+      points   = comb_before_pts
+    )
+    comb_after_obj <- list(
+      pc1Label = after_pc1_lbl,
+      pc2Label = after_pc2_lbl,
+      title    = "Combined Datasets — After Batch Correction",
+      points   = comb_after_pts
     )
 
-    df_after <- data.frame(
-      PC1   = pca_after[, 1],
-      PC2   = pca_after[, 2],
-      Batch = as.factor(clin_aligned$Batch)
-    )
+    pb_batch <- build_pca_ggplot(comb_before_obj, color_by = "batch", title_str = NULL)
+    pa_batch <- build_pca_ggplot(comb_after_obj,  color_by = "batch", title_str = NULL)
 
-    pb_batch <- ggplot2::ggplot(df_before, ggplot2::aes(x = PC1, y = PC2, color = Batch)) + ggplot2::geom_point(size = 3.5, alpha = 0.85) + ggplot2::theme_minimal() + ggplot2::labs(title = NULL, x = before_pc1_lbl, y = before_pc2_lbl) + ggplot2::theme(legend.position = "bottom")
-    pa_batch <- ggplot2::ggplot(df_after,  ggplot2::aes(x = PC1, y = PC2, color = Batch)) + ggplot2::geom_point(size = 3.5, alpha = 0.85) + ggplot2::theme_minimal() + ggplot2::labs(title = NULL, x = after_pc1_lbl,  y = after_pc2_lbl)  + ggplot2::theme(legend.position = "bottom")
-
-    pb_batch_exp <- pb_batch + ggplot2::labs(title = "Before Correction (Batch)")
-    pa_batch_exp <- pa_batch + ggplot2::labs(title = "After Correction (Batch)")
+    pb_batch_exp <- build_pca_ggplot(comb_before_obj, color_by = "batch", title_str = "Combined Datasets — Before Correction (Batch)")
+    pa_batch_exp <- build_pca_ggplot(comb_after_obj,  color_by = "batch", title_str = "Combined Datasets — After Correction (Batch)")
 
     return(list(
       before_batch            = plot_to_base64(pb_batch),
@@ -3200,25 +4125,27 @@ correct_batch_effects <- function(method, method_others, datasets) {
       after_group_export      = "",
       after_covariate_export  = "",
       combined = list(
-        before_batch = plot_to_base64(pb_batch),
-        after_batch  = plot_to_base64(pa_batch)
+        before_batch         = plot_to_base64(pb_batch),
+        after_batch          = plot_to_base64(pa_batch),
+        pcaBeforeInteractive = comb_before_obj,
+        pcaAfterInteractive  = comb_after_obj
       ),
       datasets = datasets_pca
     ))
   }
+
+  return(list(
+    before_batch = "",
+    after_batch  = "",
+    combined     = list(before_batch = "", after_batch = ""),
+    datasets     = datasets_pca
+  ))
 }
 
 run_upload_datasets <- function(datasets_list) {
-  find_uploaded_file <- function(upload_id) {
+  find_uploaded_file_local <- function(upload_id, user_id = NULL) {
     if (is.null(upload_id) || !nzchar(upload_id)) return(NULL)
-    cands <- c(
-      file.path("tmp", "uploads", paste0(upload_id, ".csv")),
-      list.files("tmp/user_sessions", pattern = paste0("^", upload_id, "\\.csv$"), recursive = TRUE, full.names = TRUE)
-    )
-    for (c_path in cands) {
-      if (file.exists(c_path)) return(c_path)
-    }
-    return(NULL)
+    find_uploaded_file(upload_id, user_id)
   }
 
   results <- list()
@@ -3273,7 +4200,10 @@ run_upload_datasets <- function(datasets_list) {
     # Always persist metadata to local RDS files (survives when raw data is not sent)
     dir.create("tmp", showWarnings = FALSE, recursive = TRUE)
     saveRDS(expr_meta, file = sprintf("tmp/%s_expr_metadata.rds", ds_id))
+    tryCatch(saveRDS(expr_meta, file = get_session_path(ds_id, "%s_expr_metadata.rds")), error = function(e) NULL)
+    tryCatch(saveRDS(expr_meta, file = get_session_path(ds_id, "%s_upload_expr_metadata.rds")), error = function(e) NULL)
     saveRDS(clin_meta, file = sprintf("tmp/%s_clin_metadata.rds", ds_id))
+    tryCatch(saveRDS(clin_meta, file = get_session_path(ds_id, "%s_clin_metadata.rds")), error = function(e) NULL)
 
     expr_cols   <- ds$expressionColumns
     expr_parsed <- ds$expressionParsedData
@@ -3285,82 +4215,213 @@ run_upload_datasets <- function(datasets_list) {
 
     is_desktop_backend <- identical(get_app_mode(), "desktop")
 
-    # 1. Desktop mode: Direct file path (strictly only in desktop app mode)
-    if (is_desktop_backend && !is.null(expr_file_path_in) && nzchar(expr_file_path_in) && file.exists(expr_file_path_in)) {
-      cat(sprintf("[LOG] run_upload_datasets: reading local file path '%s'\n", expr_file_path_in))
-      file.copy(expr_file_path_in, sprintf("tmp/%s_expression.csv", ds_id), overwrite = TRUE)
-      file.copy(expr_file_path_in, sprintf("tmp/%s_expression_original_backup.csv", ds_id), overwrite = TRUE)
-      expr_df <- read_csv_preserve_id(sprintf("tmp/%s_expression.csv", ds_id))
-      expr_cols <- colnames(expr_df)
-      res_entry$expressionFile <- sprintf("tmp/%s_expression.csv", ds_id)
-    } else if (!is.null(expr_upload_id) && nzchar(expr_upload_id)) {
-      # 2. Web mode: Chunk upload ID
-      chunk_file <- find_uploaded_file(expr_upload_id)
-      if (!is.null(chunk_file) && file.exists(chunk_file)) {
-        cat(sprintf("[LOG] run_upload_datasets: assembling from chunk upload '%s'\n", chunk_file))
-        file.copy(chunk_file, sprintf("tmp/%s_expression.csv", ds_id), overwrite = TRUE)
-        file.copy(chunk_file, sprintf("tmp/%s_expression_original_backup.csv", ds_id), overwrite = TRUE)
-        unlink(chunk_file, force = TRUE)
+    # 0. Desktop mode: CEL folder (Affymetrix only)
+    cel_folder_path <- ds$celFolderPath %||% NULL
+    if (!is.null(cel_folder_path) && nzchar(cel_folder_path)) {
+      cel_folder_path <- path.expand(cel_folder_path)
+    }
+    cel_processed <- FALSE
+    if (is_desktop_backend && !is.null(cel_folder_path) && nzchar(cel_folder_path) && dir.exists(cel_folder_path)) {
+      cat(sprintf("[CEL] Processing folder: %s\n", cel_folder_path))
+      # Ensure server correctly ONLY reads CEL files (.CEL or .CEL.gz, case-insensitive)
+      cel_files <- list.files(cel_folder_path, pattern = "(?i)\\.cel(\\.gz)?$", full.names = TRUE)
+      if (length(cel_files) == 0) {
+        res_entry$error <- "No .CEL files found in folder."
+        cel_processed <- TRUE
+      } else {
+        cat(sprintf("[CEL] Found %d CEL files. Executing ReadAffy and rma()...\n", length(cel_files)))
+        suppressPackageStartupMessages({
+          library(affy, character.only = FALSE)
+          library(Biobase, character.only = FALSE)
+        })
+        raw_data <- affy::ReadAffy(filenames = cel_files)
+        Biobase::sampleNames(raw_data) <- sub("(?i)\\.cel(\\.gz)?$", "", basename(cel_files))
+
+        # Auto-detect chip platform from CEL annotation header
+        raw_annot <- tryCatch(Biobase::annotation(raw_data), error = function(e) "")
+        detected_platform <- NULL
+        platforms_json_path <- "sample_data/microarray_platforms.json"
+        if (file.exists(platforms_json_path)) {
+          platforms_json <- tryCatch(jsonlite::read_json(platforms_json_path), error = function(e) NULL)
+          if (!is.null(platforms_json$affymetrix) && !is.null(raw_annot) && nzchar(raw_annot)) {
+            clean_annot <- tolower(gsub("[^a-z0-9]", "", raw_annot))
+            for (p in platforms_json$affymetrix) {
+              pkg_base <- tolower(gsub("[^a-z0-9]", "", sub("[.]db$", "", p$annotation_package %||% "")))
+              cdf_base <- tolower(gsub("[^a-z0-9]", "", sub("cdf.*$", "", p$cdf %||% "")))
+              plat_base <- tolower(gsub("[^a-z0-9]", "", p$platform %||% ""))
+              if (clean_annot %in% c(pkg_base, cdf_base, plat_base) || grepl(clean_annot, pkg_base) || grepl(clean_annot, cdf_base)) {
+                detected_platform <- p$platform
+                break
+              }
+            }
+          }
+        }
+        chosen_platform <- ds$geneIdType
+        if (is.null(chosen_platform) || !nzchar(chosen_platform) || identical(chosen_platform, "probe_id")) {
+          chosen_platform <- detected_platform %||% "HG-U133 Plus 2.0"
+        }
+        cat(sprintf("[CEL] Platform: '%s' (detected annotation: '%s')\n", chosen_platform, raw_annot %||% "none"))
+
+        norm_eset   <- affy::rma(raw_data, verbose = FALSE); rm(raw_data); gc()
+        expr_matrix <- Biobase::exprs(norm_eset);            rm(norm_eset); gc()
+
+        expr_meta$isNormalized <- TRUE
+        expr_meta$geneIdCol    <- "probe_id"
+        expr_meta$geneInfoCols <- list("probe_id")
+        expr_meta$platform     <- ds$platform %||% "affymetrix"
+        expr_meta$geneIdType   <- chosen_platform
+        expr_meta$microarrayPlatformId <- chosen_platform
+        expr_meta$dataType     <- "microarray"
+
+        df_cel <- data.frame(
+          probe_id = rownames(expr_matrix),
+          as.data.frame(expr_matrix, check.names = FALSE),
+          check.names = FALSE, stringsAsFactors = FALSE
+        )
+
+        expr_csv_path <- get_session_path(ds_id, "%s_expression.csv")
+        fast_write_csv(df_cel, expr_csv_path, row.names = FALSE)
+        if (expr_csv_path != sprintf("tmp/%s_expression.csv", ds_id)) {
+          fast_write_csv(df_cel, sprintf("tmp/%s_expression.csv", ds_id), row.names = FALSE)
+        }
+        backup_csv_path <- get_session_path(ds_id, "%s_expression_original_backup.csv")
+        file.copy(expr_csv_path, backup_csv_path, overwrite = TRUE)
+        if (backup_csv_path != sprintf("tmp/%s_expression_original_backup.csv", ds_id)) {
+          file.copy(expr_csv_path, sprintf("tmp/%s_expression_original_backup.csv", ds_id), overwrite = TRUE)
+        }
+        res_entry$expressionFile <- expr_csv_path
+
+        saveRDS(expr_meta, get_session_path(ds_id, "%s_expr_metadata.rds"))
+        saveRDS(expr_meta, sprintf("tmp/%s_expr_metadata.rds", ds_id))
+        saveRDS(expr_meta, get_session_path(ds_id, "%s_upload_expr_metadata.rds"))
+        saveRDS(expr_meta, sprintf("tmp/%s_upload_expr_metadata.rds", ds_id))
+
+        push_main_stack(ds_id, expr_matrix, step_name = "upload", metadata = expr_meta)
+        main_stack_path <- get_session_path(ds_id, "%s_main_stack.rds")
+        main_stack_backup <- get_session_path(ds_id, "%s_main_stack_original_backup.rds")
+        file.copy(main_stack_path, main_stack_backup, overwrite = TRUE)
+        if (main_stack_path != sprintf("tmp/%s_main_stack.rds", ds_id)) {
+          tryCatch(file.copy(sprintf("tmp/%s_main_stack.rds", ds_id), sprintf("tmp/%s_main_stack_original_backup.rds", ds_id), overwrite = TRUE), error = function(e) NULL)
+        }
+
+        parsed_data_fresh <- list(
+          expr         = expr_matrix,
+          anno         = df_cel[, 1, drop = FALSE],
+          gene_ids     = as.character(rownames(expr_matrix)),
+          samples      = as.character(colnames(expr_matrix)),
+          geneIdCol    = "probe_id",
+          geneInfoCols = "probe_id",
+          isNormalized = TRUE,
+          dataType     = "microarray",
+          platform     = expr_meta$platform %||% "affymetrix",
+          geneIdType   = expr_meta$geneIdType %||% "HG-U133 Plus 2.0"
+        )
+        saveRDS(parsed_data_fresh, file = get_session_path(ds_id, "%s_original_parsed.rds"))
+        saveRDS(parsed_data_fresh, file = sprintf("tmp/%s_original_parsed.rds", ds_id))
+
+        missing_count <- sum(is.na(expr_matrix))
+        res_entry$missingValuesCount <- missing_count
+        expr_meta$missingValuesCount <- missing_count
+
+        parsed_ds_info <- get_backend_datasets(ds_id_full)
+        if (!is.null(parsed_ds_info$module) && parsed_ds_info$module == "de") {
+          push_de_stack(ds_id, expr_matrix, step_name = "upload", metadata = expr_meta)
+        }
+
+        res_entry$total     <- nrow(expr_matrix)
+        res_entry$nFeatures <- nrow(expr_matrix)
+        res_entry$samples   <- ncol(expr_matrix)
+        res_entry$nSamples  <- ncol(expr_matrix)
+        res_entry$columns   <- colnames(df_cel)
+        res_entry$sampleIds <- colnames(expr_matrix)
+        res_entry$geneIdType <- expr_meta$geneIdType
+        res_entry$microarrayPlatformId <- expr_meta$geneIdType
+        expr_df <- NULL  # skip normal CSV loading
+        cel_processed <- TRUE
+      }
+    }
+
+    if (!cel_processed && is.null(expr_df)) {
+      # 1. Desktop mode: Direct file path (strictly only in desktop app mode)
+      if (is_desktop_backend && !is.null(expr_file_path_in) && nzchar(expr_file_path_in) && file.exists(expr_file_path_in)) {
+        cat(sprintf("[LOG] run_upload_datasets: reading local file path '%s'\n", expr_file_path_in))
+        file.copy(expr_file_path_in, sprintf("tmp/%s_expression.csv", ds_id), overwrite = TRUE)
+        file.copy(expr_file_path_in, sprintf("tmp/%s_expression_original_backup.csv", ds_id), overwrite = TRUE)
         expr_df <- read_csv_preserve_id(sprintf("tmp/%s_expression.csv", ds_id))
         expr_cols <- colnames(expr_df)
         res_entry$expressionFile <- sprintf("tmp/%s_expression.csv", ds_id)
-      }
-    } else if (!is.null(expr_raw) && nzchar(expr_raw)) {
-      # 3. Raw text payload
-      delim <- ","
-      if (grepl("\t", expr_raw)) {
-        delim <- "\t"
-      }
-      expr_df <- read.delim(text = expr_raw, sep = delim, check.names = FALSE, stringsAsFactors = FALSE)
-      expr_cols <- colnames(expr_df)
-      file_path <- sprintf("tmp/%s_expression.csv", ds_id)
-      fast_write_csv(expr_df, file = file_path, row.names = FALSE)
-      file.copy(file_path, sprintf("tmp/%s_expression_original_backup.csv", ds_id), overwrite = TRUE)
-      res_entry$expressionFile <- file_path
-    } else if (!is.null(expr_parsed) && length(expr_parsed) > 0 && !is.null(expr_cols)) {
-      # 4. Parsed 2D array payload
-      expr_result <- save_temp_csv(ds_id, "expression", expr_cols, expr_parsed)
-      res_entry$expressionFile <- expr_result$file
-      file.copy(expr_result$file, sprintf("tmp/%s_expression_original_backup.csv", ds_id), overwrite = TRUE)
-
-      if (is.list(expr_parsed) && length(expr_parsed) > 0) {
-        max_len <- max(sapply(expr_parsed, length))
-        rows_padded <- lapply(expr_parsed, function(x) {
-          x_char <- as.character(sapply(x, function(val) if (is.null(val)) "" else val))
-          if (length(x_char) < max_len) c(x_char, rep("", max_len - length(x_char))) else x_char
-        })
-        mat <- matrix(unlist(rows_padded), nrow = length(rows_padded), byrow = TRUE)
-        expr_df <- as.data.frame(mat, stringsAsFactors = FALSE)
-        if (!is.null(expr_cols) && length(expr_cols) == ncol(expr_df)) {
-          colnames(expr_df) <- expr_cols
+      } else if (!is.null(expr_upload_id) && nzchar(expr_upload_id)) {
+        # 2. Web mode: Chunk upload ID
+        chunk_file <- find_uploaded_file_local(expr_upload_id, get_user_id(ds_id_full))
+        if (!is.null(chunk_file) && file.exists(chunk_file)) {
+          cat(sprintf("[LOG] run_upload_datasets: assembling from chunk upload '%s'\n", chunk_file))
+          file.copy(chunk_file, sprintf("tmp/%s_expression.csv", ds_id), overwrite = TRUE)
+          file.copy(chunk_file, sprintf("tmp/%s_expression_original_backup.csv", ds_id), overwrite = TRUE)
+          unlink(chunk_file, force = TRUE)
+          expr_df <- read_csv_preserve_id(sprintf("tmp/%s_expression.csv", ds_id))
+          expr_cols <- colnames(expr_df)
+          res_entry$expressionFile <- sprintf("tmp/%s_expression.csv", ds_id)
         }
-      }
-    } else {
-      # 5. Metadata-only update (or unchanged data): Restore from existing backup
-      backup_file <- sprintf("tmp/%s_expression_original_backup.csv", ds_id)
-      orig_file <- sprintf("tmp/%s_expression.csv", ds_id)
-      if (file.exists(backup_file)) {
-        cat(sprintf("[LOG] run_upload_datasets: restoring expression data from backup '%s' for metadata update\n", backup_file))
-        file.copy(backup_file, orig_file, overwrite = TRUE)
-        expr_df <- read_csv_preserve_id(orig_file)
+      } else if (!is.null(expr_raw) && nzchar(expr_raw)) {
+        # 3. Raw text payload
+        delim <- ","
+        if (grepl("\t", expr_raw)) {
+          delim <- "\t"
+        }
+        expr_df <- read.delim(text = expr_raw, sep = delim, check.names = FALSE, stringsAsFactors = FALSE)
         expr_cols <- colnames(expr_df)
-        res_entry$expressionFile <- orig_file
-        # Invalidate stale intermediate caches
-        unlink(sprintf("tmp/%s_original_parsed.rds", ds_id), force = TRUE)
-        unlink(sprintf("tmp/%s_resolved_mapping.rds", ds_id), force = TRUE)
-        unlink(sprintf("tmp/%s_normalized_expr.rds", ds_id), force = TRUE)
-        unlink(sprintf("tmp/%s_normalized_expr_actual.rds", ds_id), force = TRUE)
-        unlink(sprintf("tmp/%s_batch_corrected.rds", ds_id), force = TRUE)
-        unlink(sprintf("tmp/%s_processed_matrix.rds", ds_id), force = TRUE)
-      } else if (file.exists(orig_file)) {
-        cat(sprintf("[LOG] run_upload_datasets: restoring expression data from '%s' for metadata update\n", orig_file))
-        expr_df <- read_csv_preserve_id(orig_file)
-        expr_cols <- colnames(expr_df)
-        res_entry$expressionFile <- orig_file
+        file_path <- sprintf("tmp/%s_expression.csv", ds_id)
+        fast_write_csv(expr_df, file = file_path, row.names = FALSE)
+        file.copy(file_path, sprintf("tmp/%s_expression_original_backup.csv", ds_id), overwrite = TRUE)
+        res_entry$expressionFile <- file_path
+      } else if (!is.null(expr_parsed) && length(expr_parsed) > 0 && !is.null(expr_cols)) {
+        # 4. Parsed 2D array payload
+        expr_result <- save_temp_csv(ds_id, "expression", expr_cols, expr_parsed)
+        res_entry$expressionFile <- expr_result$file
+        file.copy(expr_result$file, sprintf("tmp/%s_expression_original_backup.csv", ds_id), overwrite = TRUE)
+
+        if (is.list(expr_parsed) && length(expr_parsed) > 0) {
+          max_len <- max(sapply(expr_parsed, length))
+          rows_padded <- lapply(expr_parsed, function(x) {
+            x_char <- as.character(sapply(x, function(val) if (is.null(val)) "" else val))
+            if (length(x_char) < max_len) c(x_char, rep("", max_len - length(x_char))) else x_char
+          })
+          mat <- matrix(unlist(rows_padded), nrow = length(rows_padded), byrow = TRUE)
+          expr_df <- as.data.frame(mat, stringsAsFactors = FALSE)
+          if (!is.null(expr_cols) && length(expr_cols) == ncol(expr_df)) {
+            colnames(expr_df) <- expr_cols
+          }
+        }
+      } else {
+        # 5. Metadata-only update (or unchanged data): Restore from existing backup
+        backup_file <- sprintf("tmp/%s_expression_original_backup.csv", ds_id)
+        orig_file <- sprintf("tmp/%s_expression.csv", ds_id)
+        if (file.exists(backup_file)) {
+          cat(sprintf("[LOG] run_upload_datasets: restoring expression data from backup '%s' for metadata update\n", backup_file))
+          file.copy(backup_file, orig_file, overwrite = TRUE)
+          expr_df <- read_csv_preserve_id(orig_file)
+          expr_cols <- colnames(expr_df)
+          res_entry$expressionFile <- orig_file
+          # Invalidate stale intermediate caches
+          unlink(sprintf("tmp/%s_original_parsed.rds", ds_id), force = TRUE)
+          unlink(sprintf("tmp/%s_resolved_mapping.rds", ds_id), force = TRUE)
+          unlink(sprintf("tmp/%s_normalized_expr.rds", ds_id), force = TRUE)
+          unlink(sprintf("tmp/%s_normalized_expr_actual.rds", ds_id), force = TRUE)
+          unlink(sprintf("tmp/%s_batch_corrected.rds", ds_id), force = TRUE)
+          unlink(sprintf("tmp/%s_processed_matrix.rds", ds_id), force = TRUE)
+        } else if (file.exists(orig_file)) {
+          cat(sprintf("[LOG] run_upload_datasets: restoring expression data from '%s' for metadata update\n", orig_file))
+          expr_df <- read_csv_preserve_id(orig_file)
+          expr_cols <- colnames(expr_df)
+          res_entry$expressionFile <- orig_file
+        }
       }
     }
 
     if (!is.null(expr_df) && ncol(expr_df) > 0) {
+      if (is.na(colnames(expr_df)[1]) || !nzchar(trimws(colnames(expr_df)[1]))) {
+        colnames(expr_df)[1] <- if (!is.null(expr_meta$geneIdCol) && nzchar(trimws(expr_meta$geneIdCol))) expr_meta$geneIdCol else "GeneID"
+      }
       # Invalidate stale intermediate caches for this dataset ID
       sess_user_id <- get_user_id(ds_id_full)
       dirs_to_clean <- unique(c("tmp", if (nzchar(sess_user_id)) file.path("tmp/user_sessions", sess_user_id) else NULL))
@@ -3413,10 +4474,32 @@ run_upload_datasets <- function(datasets_list) {
         }
       }
 
-      gene_id_col   <- if (!is.null(expr_meta$geneIdCol) && expr_meta$geneIdCol != "" && expr_meta$geneIdCol %in% colnames(expr_df)) expr_meta$geneIdCol else colnames(expr_df)[1]
-      gene_info_cols <- if (!is.null(expr_meta$geneInfoCols)) intersect(expr_meta$geneInfoCols, colnames(expr_df)) else character(0)
+      raw_info_cols <- unique(as.character(unlist(expr_meta$geneInfoCols %||% list())))
+      raw_info_cols <- raw_info_cols[nzchar(trimws(raw_info_cols))]
 
-      sample_cols <- setdiff(colnames(expr_df), c(gene_id_col, unlist(gene_info_cols)))
+      gene_id_col   <- if (!is.null(expr_meta$geneIdCol) && nzchar(trimws(expr_meta$geneIdCol)) && expr_meta$geneIdCol %in% colnames(expr_df)) expr_meta$geneIdCol else colnames(expr_df)[1]
+      gene_info_cols <- setdiff(intersect(raw_info_cols, colnames(expr_df)), gene_id_col)
+      expr_meta$geneInfoCols <- as.list(gene_info_cols)
+
+      det_pval_cols <- unique(as.character(unlist(ds$detectionPvalCols %||% list())))
+      if (length(det_pval_cols) == 0 && (identical(tolower(expr_meta$dataType %||% ""), "microarray") || identical(tolower(ds$dataType %||% ""), "microarray"))) {
+        # Safety fallback: auto-detect Detection Pval columns so they never leak into sample columns
+        det_pval_cols <- grep("(?i)detection.*pval", colnames(expr_df), perl = TRUE, value = TRUE)
+      }
+      det_pval_cols <- intersect(det_pval_cols, colnames(expr_df))
+      sample_cols   <- setdiff(colnames(expr_df), c(gene_id_col, unlist(gene_info_cols), det_pval_cols))
+      if (length(det_pval_cols) > 0) {
+        det_rows <- as.character(expr_df[[gene_id_col]])
+        det_mat_save <- tryCatch({
+          m <- data.matrix(expr_df[, det_pval_cols, drop = FALSE])
+          rownames(m) <- det_rows; m
+        }, error = function(e) NULL)
+        if (!is.null(det_mat_save)) {
+          saveRDS(det_mat_save, get_session_path(ds_id, "%s_detection_pval.rds"))
+          saveRDS(det_mat_save, sprintf("tmp/%s_detection_pval.rds", ds_id))
+        }
+      }
+      expr_meta$detectionPvalCols <- as.list(det_pval_cols)
       if (length(sample_cols) > 0) {
         sub_sample_df <- expr_df[, sample_cols, drop = FALSE]
         expr_matrix <- safe_numeric_matrix(sub_sample_df)
@@ -3436,16 +4519,17 @@ run_upload_datasets <- function(datasets_list) {
         }
 
         # Retain the original name of the Gene ID column
-        original_gene_id_col <- if (!is.null(expr_meta$geneIdCol) && expr_meta$geneIdCol != "") expr_meta$geneIdCol else gene_id_col
+        original_gene_id_col <- if (!is.null(expr_meta$geneIdCol) && nzchar(trimws(expr_meta$geneIdCol))) expr_meta$geneIdCol else gene_id_col
         # Ensure any matching column in gene_info_cols is removed to avoid duplicates
-        expr_meta$geneInfoCols <- setdiff(expr_meta$geneInfoCols, original_gene_id_col)
+        expr_meta$geneInfoCols <- setdiff(as.character(unlist(expr_meta$geneInfoCols %||% list())), original_gene_id_col)
+        expr_meta$geneInfoCols <- expr_meta$geneInfoCols[nzchar(trimws(expr_meta$geneInfoCols))]
         gene_info_cols <- expr_meta$geneInfoCols
 
         df_out <- data.frame(gene_ids = as.character(gene_ids), check.names = FALSE, stringsAsFactors = FALSE)
         colnames(df_out)[1] <- as.character(original_gene_id_col)
         if (length(gene_info_cols) > 0) {
           for (info_col in gene_info_cols) {
-            if (info_col %in% colnames(expr_df)) {
+            if (nzchar(trimws(info_col)) && info_col %in% colnames(expr_df) && !is.null(expr_df[[info_col]])) {
               df_out[[info_col]] <- as.character(expr_df[[info_col]])
             }
           }
@@ -3532,7 +4616,7 @@ run_upload_datasets <- function(datasets_list) {
       clin_cols <- colnames(clin_df)
       clin_parsed <- lapply(1:nrow(clin_df), function(r) as.list(clin_df[r, ]))
     } else if (!is.null(clin_upload_id) && nzchar(clin_upload_id)) {
-      chunk_clin <- find_uploaded_file(clin_upload_id)
+      chunk_clin <- find_uploaded_file_local(clin_upload_id, get_user_id(ds_id_full))
       if (!is.null(chunk_clin) && file.exists(chunk_clin)) {
         cat(sprintf("[LOG] run_upload_datasets: reading chunk-uploaded clinical file '%s'\n", chunk_clin))
         clin_df <- read_csv_preserve_id(chunk_clin)
@@ -3592,6 +4676,25 @@ run_upload_datasets <- function(datasets_list) {
     res_entry$groups                 <- group_vals
     res_entry$clinicalColumns        <- if (!is.null(clin_cols)) clin_cols else character(0)
 
+    # Pre-compute initial Pre-Processing QC (Hexbin Mean-Variance, Sample Distribution, Normal PCA)
+    if (identical(ds_module, "dp")) {
+      expr_latest_up <- get_latest_step_matrix(ds_id, "upload")
+      if (!is.null(expr_latest_up) && is.matrix(expr_latest_up) && nrow(expr_latest_up) >= 2 && ncol(expr_latest_up) >= 1) {
+        pre_qc <- tryCatch(
+          prepare_pre_processing_qc(expr_latest_up, ds_id, expr_meta$dataType %||% "readcounts", isTRUE(expr_meta$isNormalized), ds_name),
+          error = function(e) NULL
+        )
+        if (!is.null(pre_qc)) {
+          res_entry$qc <- list(
+            before       = pre_qc,
+            meanVariance = pre_qc$meanVariance,
+            distribution = pre_qc$distribution,
+            pca          = pre_qc$pca
+          )
+        }
+      }
+    }
+
     results[[length(results) + 1]] <- res_entry
   }
   return(results)
@@ -3615,179 +4718,72 @@ generate_pca_plots_for_export <- function(ds_id) {
   base_id <- get_base_id(ds_id)
   user_id_val <- get_user_id(ds_id)
   if (is.null(user_id_val) || !nzchar(user_id_val)) user_id_val <- get_user_id(base_id)
-  
-  # Helper to plot a single PCA matrix to pdf/png
-  plot_pca_helper <- function(expr_mat, is_normalized, pdf_filename, png_filename) {
-    if (is.null(expr_mat) || ncol(expr_mat) < 2 || nrow(expr_mat) < 2) return(FALSE)
-    
-    # Fill NAs
-    if (any(is.na(expr_mat))) {
-      expr_mat[is.na(expr_mat)] <- rowMeans(expr_mat, na.rm = TRUE)[which(is.na(expr_mat), arr.ind = TRUE)[, 1]]
-      expr_mat[is.na(expr_mat)] <- 0
-    }
-    
-    expr_pca <- expr_mat
-    if (!is_normalized) {
-      expr_pca <- log2(pmax(expr_mat, 0) + 1)
-    }
-    
-    # Filter out zero-variance features for PCA stability
-    if (nrow(expr_pca) > 2) {
-      row_vars <- apply(expr_pca, 1, var)
-      keep_rows <- is.finite(row_vars) & row_vars > 1e-8
-      if (sum(keep_rows) >= 2) {
-        expr_pca <- expr_pca[keep_rows, , drop = FALSE]
-      }
-    }
-    
-    tryCatch({
-      clin_path <- get_clinical_path(base_id)
-      if (!file.exists(clin_path)) {
-        clin_path_full <- get_clinical_path(ds_id)
-        if (file.exists(clin_path_full)) clin_path <- clin_path_full
-      }
-      clin_meta_path <- get_clin_metadata_path(base_id)
-      if (!file.exists(clin_meta_path)) {
-        clin_meta_path_full <- get_clin_metadata_path(ds_id)
-        if (file.exists(clin_meta_path_full)) clin_meta_path <- clin_meta_path_full
-      }
-      clin_df <- NULL
-      meta <- NULL
-      if (file.exists(clin_meta_path)) {
-        meta <- tryCatch(readRDS(clin_meta_path), error = function(e) NULL)
-      }
+  disp_name <- get_dataset_display_name(base_id)
 
-      sample_id_col <- if (!is.null(meta$sampleIdCol)) meta$sampleIdCol else ""
+  meta_path <- get_session_path(base_id, "%s_expr_metadata.rds", fallback = TRUE)
+  meta <- if (file.exists(meta_path)) tryCatch(readRDS(meta_path), error = function(e) NULL) else NULL
+  is_norm <- isTRUE(meta$isNormalized)
+  dtype <- tolower(as.character(meta$dataType %||% "readcounts"))
 
-      if (file.exists(clin_path)) {
-        raw_clin <- read.csv(clin_path, check.names = FALSE, stringsAsFactors = FALSE)
-        if (sample_id_col == "" && ncol(raw_clin) > 0) sample_id_col <- colnames(raw_clin)[1]
-        clin_df <- parse_clinical_data(raw_clin, colnames(raw_clin), sample_id_col)
-      }
-      
-      samples <- colnames(expr_pca)
-      batch_vec <- rep("Batch1", length(samples))
-      
-      d_meta <- get_backend_datasets(base_id)
-      batch_col <- if (!is.null(d_meta) && !is.null(d_meta$clinicalBatchCol)) {
-        d_meta$clinicalBatchCol
-      } else if (!is.null(meta$batchCol)) {
-        meta$batchCol
-      } else if (!is.null(meta$groupCol)) {
-        meta$groupCol
-      } else {
-        ""
-      }
+  norm_cfg_file <- get_session_path(base_id, "%s_norm_config.rds", fallback = TRUE)
+  norm_cfg <- if (file.exists(norm_cfg_file)) tryCatch(readRDS(norm_cfg_file), error = function(e) NULL) else NULL
+  has_prev_norm <- (!is.null(norm_cfg) && !(norm_cfg$method %in% c("skip", "none"))) ||
+                   file.exists(get_session_path(base_id, "%s_normalized_expr_actual.rds")) ||
+                   file.exists(sprintf("tmp/%s_normalized_expr_actual.rds", base_id)) ||
+                   file.exists(sprintf("tmp/%s_normalized.rds", base_id))
 
-      if (!is.null(clin_df)) {
-        if (batch_col == "" || !(batch_col %in% colnames(clin_df))) {
-          cand_batch <- c("Batch", "batch", "Center", "Site", "Plate", "Run", "Cohort", "Study")
-          found_batch <- intersect(cand_batch, colnames(clin_df))
-          if (length(found_batch) > 0) {
-            batch_col <- found_batch[1]
-          }
-        }
-        if (nzchar(batch_col) && batch_col %in% colnames(clin_df)) {
-          for (i in seq_along(samples)) {
-            sample_name <- samples[i]
-            if (sample_name %in% rownames(clin_df)) {
-              batch_vec[i] <- as.character(clin_df[sample_name, batch_col])
-            }
-          }
-        }
-      }
-      
-      pca_fit <- prcomp(t(expr_pca), scale. = TRUE)
-      pca_coords <- pca_fit$x[, 1:2, drop = FALSE]
-      var_explained <- pca_fit$sdev^2 / sum(pca_fit$sdev^2)
-      pc1_label <- sprintf("PC1 (%.1f%%)", var_explained[1] * 100)
-      pc2_label <- sprintf("PC2 (%.1f%%)", var_explained[2] * 100)
-      
-      df_pca <- data.frame(
-        PC1 = pca_coords[, 1],
-        PC2 = pca_coords[, 2],
-        Batch = as.factor(batch_vec)
-      )
-      
-      p_pca <- ggplot2::ggplot(df_pca, ggplot2::aes(x = PC1, y = PC2, color = Batch)) +
-        ggplot2::geom_point(size = 3.5, alpha = 0.85) +
-        ggplot2::theme_minimal() +
-        ggplot2::labs(title = NULL, x = pc1_label, y = pc2_label) +
-        ggplot2::theme(legend.position = "bottom")
-      
-      pdf_path <- get_session_path(base_id, pdf_filename)
-      png_path <- get_session_path(base_id, png_filename)
-      tiff_filename <- sub("\\.png$", ".tiff", png_filename)
-      tiff_path <- get_session_path(base_id, tiff_filename)
-      ggplot2::ggsave(pdf_path, plot = p_pca, width = 6, height = 4, dpi = 300)
-      ggplot2::ggsave(png_path, plot = p_pca, width = 6, height = 4, dpi = 300)
-      ggplot2::ggsave(tiff_path, plot = p_pca, width = 6, height = 4, dpi = 300)
-      return(TRUE)
-    }, error = function(e) {
-      cat(sprintf("[EXPORT][WARNING] Failed to generate PCA plot %s for %s: %s\n", pdf_filename, base_id, e$message))
-      return(FALSE)
-    })
+  # 1. Entity 1 — Normal PCA (pca_plots_<base_id>): always ensure it exists and is unstratified by batch
+  pca_pdf <- get_session_path(base_id, "pca_plots_%s.pdf")
+  pca_png <- get_session_path(base_id, "pca_plots_%s.png")
+  pca_svg <- get_session_path(base_id, "pca_plots_%s.svg")
+  if (!file.exists(pca_pdf) || !file.exists(pca_png)) {
+    latest_pca_path <- get_session_path(base_id, "%s_latest_normal_pca.rds")
+    norm_pca_obj <- if (file.exists(latest_pca_path)) tryCatch(readRDS(latest_pca_path), error = function(e) NULL) else NULL
+    if (is.null(norm_pca_obj)) {
+      expr_norm_src <- get_suitable_expression_matrix(base_id, step = "normalization")
+      if (is.null(expr_norm_src)) expr_norm_src <- get_suitable_expression_matrix(base_id, step = "processing")
+      if (is.null(expr_norm_src)) expr_norm_src <- get_suitable_expression_matrix(base_id, step = "upload")
+      is_unnorm_rc <- !is_norm && !has_prev_norm && identical(dtype, "readcounts")
+      norm_pca_obj <- compute_normal_pca(expr_norm_src, base_id, is_unnormalized_rc = is_unnorm_rc, ds_name = disp_name, save_latest = TRUE)
+    }
+    if (!is.null(norm_pca_obj)) {
+      p_norm <- build_pca_ggplot(norm_pca_obj, color_by = "group", title_str = sprintf("%s — Normal PCA", disp_name))
+      save_plot_formats(p_norm, pca_pdf, pca_png, pca_svg, width = 6.5, height = 4.8)
+      register_export_file(user_id_val, "pca_plots", base_id, pca_pdf, "dp", "normalization", ext = "pdf")
+    }
   }
-  
-  # Determine if normalized
-  meta_path <- sprintf("tmp/%s_expr_metadata.rds", base_id)
-  is_norm <- FALSE
-  if (file.exists(meta_path)) {
-    meta <- tryCatch(readRDS(meta_path), error = function(e) NULL)
-    is_norm <- if (!is.null(meta$isNormalized)) isTRUE(meta$isNormalized) else is_norm
-  }
-  
-  # If batch correction has been performed
+
+  # 2. Entity 2 — Batch-Stratified PCA (pca_plots_before_batch & pca_plots_after_batch)
   has_batch <- file.exists(sprintf("tmp/%s_batch_expr_actual.rds", base_id)) ||
                file.exists(get_session_path(base_id, "%s_batch_expr_actual.rds")) ||
                file.exists(sprintf("tmp/%s_batch_expr.rds", base_id)) ||
                file.exists(get_session_path(base_id, "%s_batch_expr.rds")) ||
                file.exists(sprintf("tmp/%s_batch.rds", base_id)) ||
                file.exists(sprintf("tmp/%s_batch_corrected_expr.rds", base_id))
-  
+
   if (has_batch) {
-    # 1. Before batch corrected PCA (normalization / processing step)
-    expr_before <- get_suitable_expression_matrix(base_id, step = "normalization")
-    if (is.null(expr_before)) expr_before <- get_suitable_expression_matrix(base_id, step = "processing")
-    if (is.null(expr_before)) expr_before <- get_suitable_expression_matrix(base_id, step = "upload")
-    is_normalized_before <- is_norm || 
-                            file.exists(sprintf("tmp/%s_normalized_expr_actual.rds", base_id)) || 
-                            file.exists(sprintf("tmp/%s_normalized.rds", base_id))
-    ok_before <- plot_pca_helper(expr_before, is_normalized_before, "pca_plots_before_batch_%s.pdf", "pca_plots_before_batch_%s.png")
-    if (isTRUE(ok_before)) {
-      register_export_file(user_id_val, "pca_plots_before_batch", base_id, get_session_path(base_id, "pca_plots_before_batch_%s.pdf"), "dp", "batch", ext = "pdf")
+    pdf_b  <- get_session_path(base_id, "pca_plots_before_batch_%s.pdf")
+    png_b  <- get_session_path(base_id, "pca_plots_before_batch_%s.png")
+    svg_b  <- get_session_path(base_id, "pca_plots_before_batch_%s.svg")
+    tiff_b <- get_session_path(base_id, "pca_plots_before_batch_%s.tiff")
+
+    pdf_a  <- get_session_path(base_id, "pca_plots_after_batch_%s.pdf")
+    png_a  <- get_session_path(base_id, "pca_plots_after_batch_%s.png")
+    svg_a  <- get_session_path(base_id, "pca_plots_after_batch_%s.svg")
+    tiff_a <- get_session_path(base_id, "pca_plots_after_batch_%s.tiff")
+
+    batch_pca_rds <- get_session_path(base_id, "%s_batch_pca.rds")
+    saved_batch_pca <- if (file.exists(batch_pca_rds)) tryCatch(readRDS(batch_pca_rds), error = function(e) NULL) else NULL
+
+    if (!file.exists(pdf_b) && !is.null(saved_batch_pca$before)) {
+      p_b <- build_pca_ggplot(saved_batch_pca$before, color_by = "batch", title_str = sprintf("%s — PCA Before Batch Correction", disp_name))
+      save_plot_formats(p_b, pdf_b, png_b, svg_b, tiff_b, width = 6.5, height = 4.8)
+      register_export_file(user_id_val, "pca_plots_before_batch", base_id, pdf_b, "dp", "batch", ext = "pdf")
     }
-    
-    # 2. After batch corrected PCA (batch step)
-    expr_after <- get_suitable_expression_matrix(base_id, step = "batch")
-    if (is.null(expr_after) && file.exists(sprintf("tmp/%s_batch_expr_actual.rds", base_id))) {
-      expr_after <- tryCatch(readRDS(sprintf("tmp/%s_batch_expr_actual.rds", base_id)), error = function(e) NULL)
-    }
-    if (is.null(expr_after) && file.exists(get_session_path(base_id, "%s_batch_expr_actual.rds"))) {
-      expr_after <- tryCatch(readRDS(get_session_path(base_id, "%s_batch_expr_actual.rds")), error = function(e) NULL)
-    }
-    if (is.null(expr_after) && file.exists(sprintf("tmp/%s_batch_expr.rds", base_id))) {
-      expr_after <- tryCatch(readRDS(sprintf("tmp/%s_batch_expr.rds", base_id)), error = function(e) NULL)
-    }
-    if (is.null(expr_after) && file.exists(get_session_path(base_id, "%s_batch_expr.rds"))) {
-      expr_after <- tryCatch(readRDS(get_session_path(base_id, "%s_batch_expr.rds")), error = function(e) NULL)
-    }
-    is_normalized_after <- is_normalized_before
-    ok_after <- plot_pca_helper(expr_after, is_normalized_after, "pca_plots_after_batch_%s.pdf", "pca_plots_after_batch_%s.png")
-    if (isTRUE(ok_after)) {
-      register_export_file(user_id_val, "pca_plots_after_batch", base_id, get_session_path(base_id, "pca_plots_after_batch_%s.pdf"), "dp", "batch", ext = "pdf")
-    }
-  } else {
-    # If no batch correction, generate standard latest PCA plot
-    latest_parsed <- get_backend_dataset(base_id, original = FALSE)
-    if (!is.null(latest_parsed) && !is.null(latest_parsed$expr)) {
-      is_normalized_latest <- is_norm || 
-                              file.exists(sprintf("tmp/%s_normalized_expr_actual.rds", base_id)) || 
-                              file.exists(sprintf("tmp/%s_normalized.rds", base_id))
-      ok_pca <- plot_pca_helper(latest_parsed$expr, is_normalized_latest, "pca_plots_%s.pdf", "pca_plots_%s.png")
-      if (isTRUE(ok_pca)) {
-        register_export_file(user_id_val, "pca_plots", base_id, get_session_path(base_id, "pca_plots_%s.pdf"), "dp", "pca", ext = "pdf")
-      }
+    if (!file.exists(pdf_a) && !is.null(saved_batch_pca$after)) {
+      p_a <- build_pca_ggplot(saved_batch_pca$after, color_by = "batch", title_str = sprintf("%s — PCA After Batch Correction", disp_name))
+      save_plot_formats(p_a, pdf_a, png_a, svg_a, tiff_a, width = 6.5, height = 4.8)
+      register_export_file(user_id_val, "pca_plots_after_batch", base_id, pdf_a, "dp", "batch", ext = "pdf")
     }
   }
 }

@@ -1,10 +1,11 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import { useLocation } from "wouter";
+import { TrendingUp, Microscope, Check, AlertTriangle, RotateCcw } from "lucide-react";
 import { useAppStore } from "../../store/appStore";
 import Spinner from "../Spinner";
 import ChangeWarnModal from "../shared/ChangeWarnModal";
 import type { EnrichmentDb, GSEADb, EnrichmentMethod } from "../../dataObject";
-import { runEnrichmentAnalysisAPI, redoStepAPI } from "../../lib/api";
+import { runEnrichmentAnalysisAPI, redoStepAPI, cancelComputeJobAPI } from "../../lib/api";
 import { useToast } from "../../hooks/use-toast";
 
 const ORGS = [
@@ -59,6 +60,18 @@ export default function EnrichmentAnalysisStep() {
   const enConfig = state.enConfig; 
   const [loading, setLoading] = useState(false);
   const [loadingMsg, setLoadingMsg] = useState("");
+  const abortControllerRef = useRef<AbortController | null>(null);
+  const activeJobIdRef = useRef<string | null>(null);
+
+  const handleCancel = async () => {
+    abortControllerRef.current?.abort();
+    if (activeJobIdRef.current) {
+      await cancelComputeJobAPI(activeJobIdRef.current);
+    }
+    setLoading(false);
+    activeJobIdRef.current = null;
+  };
+
   const done = state.standaloneEnDone;
   const submittedCfg = state.enSubmittedConfig;
 
@@ -149,18 +162,35 @@ export default function EnrichmentAnalysisStep() {
 
   const handleRun = async () => {
     if (isInvalidConfig) return; 
+    abortControllerRef.current = new AbortController();
     setLoading(true);
     setLoadingMsg(`Running ${selectedMethods.map(m => m.toUpperCase()).join(" + ")} analysis…`);
     if (done) {
       try {
-        await redoStepAPI("ea", state.enDatasets.map(d => d.id));
-      } catch (e) {
+        await redoStepAPI(
+          "ea",
+          state.enDatasets.map(d => d.id),
+          (info) => { activeJobIdRef.current = info.jobId; },
+          abortControllerRef.current.signal
+        );
+      } catch (e: any) {
+        if (e?.name === "AbortError" || abortControllerRef.current?.signal.aborted) {
+          setLoading(false);
+          return;
+        }
         console.error(e);
       }
     }
     try {
       const datasetId = state.enDatasets[0]?.id;
-      const results = await runEnrichmentAnalysisAPI(enConfig, datasetId);
+      const results = await runEnrichmentAnalysisAPI(
+        enConfig,
+        datasetId,
+        (info) => {
+          activeJobIdRef.current = info.jobId;
+        },
+        abortControllerRef.current.signal
+      );
       setSnapshotOraRows(results.oraResults || []);
       setSnapshotGseaRows(results.gseaResults || []);
       setSnapshotMethods([...selectedMethods]);
@@ -169,6 +199,9 @@ export default function EnrichmentAnalysisStep() {
       dispatch({ type: "SET_STANDALONE_EN_DONE", done: true });
       setShowWarnModal(false);
     } catch (err: any) {
+      if (err?.name === "AbortError" || err?.message?.includes("Aborted") || err?.message?.includes("Unknown job id")) {
+        return;
+      }
       console.error("Enrichment analysis error:", err);
       toast({
         title: "Enrichment Analysis Error",
@@ -177,6 +210,7 @@ export default function EnrichmentAnalysisStep() {
       });
     } finally {
       setLoading(false);
+      activeJobIdRef.current = null;
     }
   };
 
@@ -252,7 +286,7 @@ export default function EnrichmentAnalysisStep() {
 
   return (
     <>
-      {loading && <Spinner label={loadingMsg} sublabel="Please wait…" />}
+      {loading && <Spinner label={loadingMsg} sublabel="Please wait…" onCancel={handleCancel} />}
 
       {showWarnModal && (
         <ChangeWarnModal 
@@ -266,8 +300,8 @@ export default function EnrichmentAnalysisStep() {
         <div className="card-title" style={{ marginBottom: 12 }}>Enrichment Methods (Select multiple)</div>
         <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, marginBottom: 14 }}>
           {[
-            { id: "gsea" as const, icon: "📈", label: "GSEA", desc: "Gene Set Enrichment Analysis — ranked-based enrichment using all genes" },
-            { id: "ora" as const, icon: "🔬", label: "ORA", desc: "Over-Representation Analysis — tests if gene sets are enriched in a list of significant genes" },
+            { id: "gsea" as const, icon: <TrendingUp size={20} />, label: "GSEA", desc: "Gene Set Enrichment Analysis — ranked-based enrichment using all genes" },
+            { id: "ora" as const, icon: <Microscope size={20} />, label: "ORA", desc: "Over-Representation Analysis — tests if gene sets are enriched in a list of significant genes" },
           ].map(m => {
             const isChosen = selectedMethods.includes(m.id);
             return (
@@ -284,9 +318,9 @@ export default function EnrichmentAnalysisStep() {
                 data-testid={`card-enmethod-${m.id}`}
               >
                 {isChosen && (
-                  <span style={{ position: "absolute", top: 8, right: 8, fontSize: 12, color: "var(--primary)", fontWeight: 700 }}>✓</span>
+                  <span style={{ position: "absolute", top: 8, right: 8, color: "var(--primary)" }}><Check size={14} /></span>
                 )}
-                <div style={{ fontSize: 18, marginBottom: 6 }}>{m.icon}</div>
+                <div style={{ marginBottom: 6 }}>{m.icon}</div>
                 <div style={{ fontSize: 13, fontWeight: 600, color: "var(--foreground)", marginBottom: 4 }}>{m.label}</div>
                 <div style={{ fontSize: 11, color: "var(--muted-foreground)", lineHeight: 1.5 }}>{m.desc}</div>
               </div>
@@ -381,8 +415,8 @@ export default function EnrichmentAnalysisStep() {
                 </div>
               </details>
               {isGseaMissingRankCol && (
-                <div style={{ fontSize: 11, color: "hsl(0 84% 60%)", marginTop: 4, fontWeight: 500 }}>
-                  ⚠️ Rank column is required for GSEA
+                <div style={{ fontSize: 11, color: "hsl(0 84% 60%)", marginTop: 4, fontWeight: 500, display: "flex", alignItems: "center", gap: 4 }}>
+                  <AlertTriangle size={12} /> Rank column is required for GSEA
                 </div>
               )}
             </div>
@@ -390,8 +424,9 @@ export default function EnrichmentAnalysisStep() {
         </div>
 
         {isNoMethodSelected && (
-          <div className="banner warning" style={{ background: "hsl(38 90% 95%)", color: "hsl(38 80% 25%)", border: "1px solid hsl(38 70% 80%)", padding: 10, borderRadius: 6, marginTop: 12, fontSize: 12 }}>
-            ⚠️ Please select at least one analysis method.
+          <div className="banner warning" style={{ background: "hsl(38 90% 95%)", color: "hsl(38 80% 25%)", border: "1px solid hsl(38 70% 80%)", padding: 10, borderRadius: 6, marginTop: 12, fontSize: 12, display: "flex", alignItems: "center", gap: 6 }}>
+            <AlertTriangle size={14} style={{ flexShrink: 0 }} />
+            <span>Please select at least one analysis method.</span>
           </div>
         )}
       </div>
@@ -424,8 +459,9 @@ export default function EnrichmentAnalysisStep() {
                 })}
               </div>
               {isGseaSelected && currentGseaDbSelection.length === 0 && (
-                <div className="banner warning" style={{ background: "hsl(38 90% 95%)", color: "hsl(38 80% 25%)", border: "1px solid hsl(38 70% 80%)", padding: 10, borderRadius: 6, marginTop: 8, fontSize: 12 }}>
-                  ⚠️ Please select at least one GSEA database.
+                <div className="banner warning" style={{ background: "hsl(38 90% 95%)", color: "hsl(38 80% 25%)", border: "1px solid hsl(38 70% 80%)", padding: 10, borderRadius: 6, marginTop: 8, fontSize: 12, display: "flex", alignItems: "center", gap: 6 }}>
+                  <AlertTriangle size={14} style={{ flexShrink: 0 }} />
+                  <span>Please select at least one GSEA database.</span>
                 </div>
               )}
             </div>
@@ -453,8 +489,9 @@ export default function EnrichmentAnalysisStep() {
                 })}
               </div>
               {isOraSelected && currentOraDbSelection.length === 0 && (
-                <div className="banner warning" style={{ background: "hsl(38 90% 95%)", color: "hsl(38 80% 25%)", border: "1px solid hsl(38 70% 80%)", padding: 10, borderRadius: 6, marginTop: 8, fontSize: 12 }}>
-                  ⚠️ Please select at least one ORA database.
+                <div className="banner warning" style={{ background: "hsl(38 90% 95%)", color: "hsl(38 80% 25%)", border: "1px solid hsl(38 70% 80%)", padding: 10, borderRadius: 6, marginTop: 8, fontSize: 12, display: "flex", alignItems: "center", gap: 6 }}>
+                  <AlertTriangle size={14} style={{ flexShrink: 0 }} />
+                  <span>Please select at least one ORA database.</span>
                 </div>
               )}
             </div>
@@ -665,10 +702,13 @@ export default function EnrichmentAnalysisStep() {
                 fontWeight: 600,
                 cursor: isInvalidConfig ? "not-allowed" : "pointer",
                 opacity: isInvalidConfig ? 0.6 : 1,
+                display: "inline-flex",
+                alignItems: "center",
+                gap: 6,
               }}
               data-testid="btn-en-rerun"
             >
-              🔄 Re-run Analysis
+              <RotateCcw size={14} /> Re-run Analysis
             </button>
             <button
               className="btn btn-primary"

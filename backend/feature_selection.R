@@ -122,6 +122,7 @@ get_dataset_data_type <- function(d) {
 # Helper to classify data type into higher hierarchy group
 # transcriptomics: readcounts, microarray
 # proteomics: proteomics
+# general: type1, type2 (Standalone Feature Selection general-purpose types)
 # others: others
 get_hierarchy_group <- function(data_type) {
   if (is.null(data_type) || is.na(data_type) || data_type == "") return("others")
@@ -130,66 +131,62 @@ get_hierarchy_group <- function(data_type) {
     return("transcriptomics")
   } else if (dt == "proteomics") {
     return("proteomics")
+  } else if (dt %in% c("type1", "type2")) {
+    return("general")
   } else {
     return("others")
   }
 }
 
 # Helper to determine if a dataset is standalone FS vs inline FS submodule
-get_ds_is_standalone_fs <- function(ds_id_full) {
+get_ds_is_standalone_fs <- function(d_or_id) {
+  if (is.list(d_or_id)) {
+    if (!is.null(d_or_id$isInline)) return(!isTRUE(d_or_id$isInline))
+    if (!is.null(d_or_id$parentModule)) return(identical(d_or_id$parentModule, "fs"))
+    if (!is.null(d_or_id$module)) return(identical(d_or_id$module, "fs"))
+    ds_id_full <- d_or_id$id %||% ""
+  } else {
+    ds_id_full <- as.character(d_or_id)
+  }
+  base_id <- get_base_id(ds_id_full)
+  meta_path <- get_session_path(base_id, "%s_upload_expr_metadata.rds")
+  if (!file.exists(meta_path)) meta_path <- get_session_path(base_id, "%s_expr_metadata.rds")
+  if (file.exists(meta_path)) {
+    meta <- tryCatch(readRDS(meta_path), error = function(e) NULL)
+    if (!is.null(meta$isInline)) return(!isTRUE(meta$isInline))
+    if (!is.null(meta$parentModule)) return(identical(meta$parentModule, "fs"))
+    if (!is.null(meta$module)) return(identical(meta$module, "fs"))
+  }
   parsed <- get_backend_datasets(ds_id_full)
-  if (!is.null(parsed$isInline)) {
-    return(!isTRUE(parsed$isInline))
-  }
-  if (!is.null(parsed$module) && !is.null(parsed$parentModule)) {
-    return(parsed$module == "fs" && parsed$parentModule == "fs")
-  }
-  return(grepl("_fs", ds_id_full))
+  if (!is.null(parsed$isInline)) return(!isTRUE(parsed$isInline))
+  if (!is.null(parsed$parentModule)) return(identical(parsed$parentModule, "fs"))
+  return(identical(parsed$module, "fs"))
 }
 
-# Helper to extract feature names from a parsed expression dataset according to its orientation
+# Helper to extract feature names from a parsed expression dataset (Features are Rows)
 get_dataset_features <- function(parsed_expr, ds_id_full) {
   if (is.null(parsed_expr) || is.null(parsed_expr$expr)) return(character(0))
   expr <- parsed_expr$expr
   
-  # Check metadata orientation if available
-  base_id <- get_base_id(ds_id_full)
-  meta_path <- get_session_path(base_id, "%s_upload_expr_metadata.rds")
-  if (!file.exists(meta_path)) meta_path <- get_session_path(base_id, "%s_expr_metadata.rds")
-  orientation <- "column"
-  if (file.exists(meta_path)) {
-    meta <- tryCatch(readRDS(meta_path), error = function(e) NULL)
-    if (!is.null(meta$featureOrientation)) orientation <- meta$featureOrientation
+  # Standard Omics orientation: Features are Rows, Columns are Samples
+  feats <- rownames(expr)
+  if (!is.null(feats) && length(feats) > 0 && !identical(feats, as.character(seq_len(nrow(expr))))) {
+    return(as.character(feats))
   }
   
-  # Load clinical sample IDs to disambiguate rows vs columns
-  clin_path <- get_clinical_path(ds_id_full)
-  clin_meta_path <- get_clin_metadata_path(ds_id_full)
-  clin_samples <- character(0)
-  if (file.exists(clin_path) && file.exists(clin_meta_path)) {
-    raw_clin <- tryCatch(read_csv_preserve_id(clin_path), error = function(e) NULL)
-    meta_c <- tryCatch(readRDS(clin_meta_path), error = function(e) NULL)
-    if (!is.null(raw_clin) && !is.null(meta_c)) {
-      clin_df <- parse_clinical_data(raw_clin, colnames(raw_clin), meta_c$sampleIdCol)
-      if (!is.null(clin_df)) clin_samples <- rownames(clin_df)
-    }
+  if (!is.null(parsed_expr$gene_ids) && length(parsed_expr$gene_ids) == nrow(expr)) {
+    return(as.character(parsed_expr$gene_ids))
   }
   
-  if (length(clin_samples) > 0) {
-    if (length(intersect(rownames(expr), clin_samples)) > length(intersect(colnames(expr), clin_samples))) {
-      # Rows are samples -> Columns are features (features as headers)
-      return(as.character(colnames(expr)))
-    } else {
-      # Columns are samples -> Rows are features (features in a single column)
-      return(as.character(rownames(expr)))
-    }
+  if (!is.null(parsed_expr$anno) && ncol(parsed_expr$anno) >= 1 && nrow(parsed_expr$anno) == nrow(expr)) {
+    return(as.character(parsed_expr$anno[[1]]))
   }
   
-  if (orientation == "headers" || orientation == "row") {
-    return(as.character(colnames(expr)))
-  } else {
-    return(as.character(rownames(expr)))
+  if (!is.null(feats) && length(feats) > 0) {
+    return(as.character(feats))
   }
+  
+  return(character(0))
 }
 
 # Helper to retrieve shared features across multiple datasets
@@ -199,11 +196,16 @@ get_shared_features_from_datasets <- function(datasets) {
   all_feature_sets <- list()
   for (d in datasets) {
     ds_id_val <- d$id %||% d$datasetId
-    is_standalone <- get_ds_is_standalone_fs(ds_id_val)
     parsed_expr <- tryCatch(
-      get_backend_dataset(ds_id_val, original = is_standalone, step = "fs"),
+      get_backend_dataset(ds_id_val, original = FALSE, step = "fs"),
       error = function(e) NULL
     )
+    if (is.null(parsed_expr) || is.null(parsed_expr$expr)) {
+      parsed_expr <- tryCatch(
+        get_backend_dataset(ds_id_val, original = TRUE, step = "fs"),
+        error = function(e) NULL
+      )
+    }
     feats <- get_dataset_features(parsed_expr, ds_id_val)
     if (length(feats) > 0) {
       all_feature_sets[[ds_id_val]] <- as.character(feats)
@@ -217,7 +219,41 @@ get_shared_features_from_datasets <- function(datasets) {
 }
 
 # Helper to merge expression and clinical data for ML tasks
+# Helper to impute missing values using KNN imputation with median fallback
+impute_missing_knn <- function(mat, k = 10L) {
+  if (!any(is.na(mat))) return(mat)
+  cat(sprintf("[FS] Matrix contains %d missing values. Imputing with KNN...\n", sum(is.na(mat))))
+  tryCatch({
+    k_val <- min(as.integer(k), max(1L, ncol(mat) - 1L))
+    na_rows <- which(rowSums(is.na(mat)) > 0)
+    if (length(na_rows) == 0) return(mat)
+    
+    comp_rows <- which(rowSums(is.na(mat)) == 0)
+    if (length(na_rows) < nrow(mat) && length(comp_rows) > 0) {
+      max_donors <- min(length(comp_rows), 3000L)
+      donor_idx <- if (length(comp_rows) > max_donors) sample(comp_rows, max_donors) else comp_rows
+      sub_idx <- c(na_rows, donor_idx)
+      sub_mat <- mat[sub_idx, , drop = FALSE]
+      imp_sub <- impute::impute.knn(sub_mat, k = min(k_val, length(donor_idx)), maxp = max(1500L, length(sub_idx)))$data
+      mat[na_rows, ] <- imp_sub[seq_along(na_rows), , drop = FALSE]
+      mat
+    } else {
+      impute::impute.knn(mat, k = k_val, maxp = max(1500L, nrow(mat)))$data
+    }
+  }, error = function(e) {
+    cat("[WARNING] KNN imputation failed, using median fallback:", e$message, "\n")
+    for (i in which(rowSums(is.na(mat)) > 0)) {
+      m <- median(mat[i, ], na.rm = TRUE)
+      mat[i, is.na(mat[i, ])] <- if (is.finite(m)) m else 0
+    }
+    mat
+  })
+}
+
 prepare_ml_data <- function(d, max_features = NULL, shared_features = NULL) {
+  if (is.list(shared_features)) {
+    shared_features <- shared_features[[get_hierarchy_group(get_dataset_data_type(d))]]
+  }
   ds_id_full <- d$id
   cat(sprintf("[DEBUG] prepare_ml_data: ds_id_full = %s\n", ds_id_full))
   parsed_id <- get_backend_datasets(ds_id_full)
@@ -239,9 +275,22 @@ prepare_ml_data <- function(d, max_features = NULL, shared_features = NULL) {
   
   # Inline FS uses processed main stack data from DP (original = FALSE)
   # Standalone FS also prioritizes clean uploaded/processed matrix (original = FALSE), falling back to raw cache
-  is_standalone_fs <- get_ds_is_standalone_fs(ds_id_full)
+  is_standalone_fs <- get_ds_is_standalone_fs(d)
   cat(sprintf("[DEBUG] prepare_ml_data: is_standalone_fs = %s (from metadata)\n", is_standalone_fs))
-  parsed_expr <- get_backend_dataset(ds_id_full, original = FALSE, step = "fs")
+  parsed_expr <- NULL
+  if (!is_standalone_fs) {
+    mat <- get_latest_normalized_matrix(ds_id_full)
+    if (!is.null(mat)) {
+      parsed_expr <- list(
+        expr = mat,
+        dataType = get_dataset_data_type(d),
+        isNormalized = TRUE
+      )
+    }
+  }
+  if (is.null(parsed_expr) || is.null(parsed_expr$expr)) {
+    parsed_expr <- get_backend_dataset(ds_id_full, original = FALSE, step = "fs")
+  }
   if (is.null(parsed_expr) || is.null(parsed_expr$expr)) {
     parsed_expr <- get_backend_dataset(ds_id_full, original = TRUE)
   }
@@ -357,6 +406,10 @@ prepare_ml_data <- function(d, max_features = NULL, shared_features = NULL) {
     }
     common_samples <- intersect(colnames(expr), rownames(clin_df))
     expr_sub <- expr[, common_samples, drop = FALSE]
+    if (any(is.na(expr_sub))) {
+      expr_sub <- impute_missing_knn(expr_sub)
+      tryCatch(push_main_stack(ds_id_full, expr_sub, step_name = "imputation_fallback"), error = function(e) NULL)
+    }
     clin_df <- clin_df[common_samples, , drop = FALSE]
     groups <- create_ordered_factor(clin_df[[group_col]])
     if (length(levels(groups)) != 2) {
@@ -391,6 +444,10 @@ prepare_ml_data <- function(d, max_features = NULL, shared_features = NULL) {
     }
     common_samples <- intersect(rownames(expr), rownames(clin_df))
     expr_sub <- expr[common_samples, , drop = FALSE]
+    if (any(is.na(expr_sub))) {
+      expr_sub <- t(impute_missing_knn(t(expr_sub)))
+      tryCatch(push_main_stack(ds_id_full, expr_sub, step_name = "imputation_fallback"), error = function(e) NULL)
+    }
     clin_df <- clin_df[common_samples, , drop = FALSE]
     groups <- create_ordered_factor(clin_df[[group_col]])
     if (length(levels(groups)) != 2) {
@@ -426,6 +483,18 @@ evaluate_predictions <- function(predictions, true_labels, probabilities = NULL,
   true_str <- as.character(true_labels)
 
   orig_lvls <- levels(true_labels)
+
+  # Defensive: align sanitized vs original factor levels if they differ only by make.names
+  u_pred <- unique(pred_str[!is.na(pred_str) & pred_str != ""])
+  u_true <- unique(true_str[!is.na(true_str) & true_str != ""])
+  if (length(u_pred) > 0 && length(u_true) > 0 &&
+      !identical(sort(u_pred), sort(u_true)) &&
+      identical(sort(make.names(u_pred, unique = TRUE)), sort(make.names(u_true, unique = TRUE)))) {
+    pred_str <- make.names(pred_str)
+    true_str <- make.names(true_str)
+    if (!is.null(orig_lvls)) orig_lvls <- make.names(orig_lvls, unique = TRUE)
+  }
+
   lvls <- unique(c(orig_lvls, true_str, pred_str))
   lvls <- lvls[!is.na(lvls) & lvls != ""]
   if (length(lvls) < 2) lvls <- c("Class1", "Class2")
@@ -572,9 +641,8 @@ stabl_select <- function(train_df, params, ds_id = NULL, n_threads = NULL) {
   ret_py    <- Sys.getenv("RETICULATE_PYTHON", "")
   env_conda <- Sys.getenv("RETICULATE_MINICONDA_PATH", "")
 
+  resolved_py <- ""
   tryCatch({
-    resolved_py <- ""
-    
     # 1. STABL_PYTHON
     if (nzchar(stabl_py)) {
       norm_p <- tryCatch(normalizePath(stabl_py, winslash = "/", mustWork = FALSE), error = function(e) stabl_py)
@@ -634,15 +702,19 @@ stabl_select <- function(train_df, params, ds_id = NULL, n_threads = NULL) {
     # 7. Fallback candidate search (Electron bundled miniconda, conda env: easyomifun)
     if (!nzchar(resolved_py) && !nzchar(stabl_env)) {
       appdata <- Sys.getenv("APPDATA", "")
+      localappdata <- Sys.getenv("LOCALAPPDATA", "")
       home <- Sys.getenv("HOME", "")
       candidates <- c()
-      if (.Platform$OS.type == "windows" && nzchar(appdata)) {
-        candidates <- c(
-          file.path(appdata, "easyomifun", "miniconda", "python.exe"),
-          file.path(appdata, "EasyOmiFun", "miniconda", "python.exe"),
+      if (.Platform$OS.type == "windows") {
+        candidates <- Filter(nzchar, c(
+          if (nzchar(appdata)) file.path(appdata, "EasyOmiFun", "miniconda", "python.exe") else "",
+          if (nzchar(appdata)) file.path(appdata, "easyomifun", "miniconda", "python.exe") else "",
+          if (nzchar(Sys.getenv("USERPROFILE"))) file.path(Sys.getenv("USERPROFILE"), ".easyomifun", "miniconda", "python.exe") else "",
+          "C:/EasyOmiFun/miniconda/python.exe",
           file.path(getwd(), "miniconda", "python.exe"),
+          if (nzchar(localappdata)) file.path(localappdata, "Programs", "EasyOmiFun", "resources", "backend", "miniconda", "python.exe") else "",
           "C:/miniconda3/envs/easyomifun/python.exe"
-        )
+        ))
       } else if (nzchar(home)) {
         candidates <- c(
           file.path(getwd(), "miniconda", "bin", "python"),
@@ -665,7 +737,7 @@ stabl_select <- function(train_df, params, ds_id = NULL, n_threads = NULL) {
       }
       for (c in candidates) {
         if (file.exists(c)) {
-          resolved_py <- c
+          resolved_py <- tryCatch(normalizePath(c, winslash = "/", mustWork = FALSE), error = function(e) c)
           cat(sprintf("[STABL] Falling back to known app/conda env Python: %s\n", resolved_py))
           break
         }
@@ -683,6 +755,11 @@ stabl_select <- function(train_df, params, ds_id = NULL, n_threads = NULL) {
   }, error = function(e) {
     cat("[STABL] Python env setup error:", conditionMessage(e), "\n")
   })
+
+  if (identical(Sys.getenv("EASYOMIFUN_APP_MODE"), "desktop") && !nzchar(resolved_py) && !nzchar(stabl_env)) {
+    cat("[STABL] Desktop mode: EasyOmiFun Miniconda Python not found; refusing to fall back to unrelated system Python.\n")
+    return(NULL)
+  }
 
   # Fail fast if Python or the `stabl` package is missing.
   stabl_ok <- tryCatch(
@@ -1157,7 +1234,7 @@ fit_model_and_importance <- function(model_name, train_df, gene_mapping, params 
 
         # 2. Retrain a Random Forest with those Boruta-selected features to get the final model using ranger
         boruta_train_df <- train_df[, c(selected_feats, "Group"), drop = FALSE]
-        boruta_train_df$Group <- factor(boruta_train_df$Group)
+        boruta_train_df$Group <- factor(boruta_train_df$Group, levels = levels(train_df$Group))
         
         mtry_val <- max(1, floor(sqrt(ncol(boruta_train_df) - 1)))
         max_depth_val <- get_param(params, "boruta", "max_depth", 10)
@@ -1481,8 +1558,17 @@ resolve_and_preprocess_datasets <- function(datasets, split_ratio, multi_dataset
         
         for (d_id in names(group_dss)) {
           d <- group_dss[[d_id]]
-          is_standalone_fs <- get_ds_is_standalone_fs(d$id)
-          parsed_expr <- get_backend_dataset(d$id, original = FALSE, step = "fs")
+          is_standalone_fs <- get_ds_is_standalone_fs(d)
+          parsed_expr <- NULL
+          if (!is_standalone_fs) {
+            mat <- get_latest_normalized_matrix(d$id)
+            if (!is.null(mat)) {
+              parsed_expr <- list(expr = mat, dataType = dt, isNormalized = TRUE)
+            }
+          }
+          if (is.null(parsed_expr) || is.null(parsed_expr$expr)) {
+            parsed_expr <- get_backend_dataset(d$id, original = FALSE, step = "fs")
+          }
           if (is.null(parsed_expr) || is.null(parsed_expr$expr)) {
             parsed_expr <- get_backend_dataset(d$id, original = TRUE)
           }
@@ -1566,6 +1652,9 @@ resolve_and_preprocess_datasets <- function(datasets, split_ratio, multi_dataset
           rm(expr_list); invisible(gc(FALSE))
 
           merged_expr <- do.call(cbind, merged_expr_list)
+          if (any(is.na(merged_expr))) {
+            merged_expr <- impute_missing_knn(merged_expr)
+          }
           merged_clin <- do.call(rbind, merged_clin_list)
           merged_batch <- unlist(batch_vec_list)
           rm(merged_expr_list); invisible(gc(FALSE))
@@ -1676,20 +1765,32 @@ resolve_and_preprocess_datasets <- function(datasets, split_ratio, multi_dataset
 # ---------------------------------------------------------------
 # 2. Main Feature Selection endpoint
 # ---------------------------------------------------------------
-# Compute the shared (intersection) feature set across all datasets in-memory.
-# Returns NULL when there is only one dataset (no filtering needed).
+# Compute the shared (intersection) feature set within each hierarchy group in-memory.
+# Returns NULL when no hierarchy group has >= 2 datasets.
 # Does NOT write to any disk file.
 compute_shared_features <- function(datasets) {
   if (length(datasets) <= 1) return(NULL)
   
-  cat("[ML] Multiple datasets detected. Computing shared feature set in-memory with orientation awareness...\n")
-  shared_features <- get_shared_features_from_datasets(datasets)
-  
-  if (is.null(shared_features) || length(shared_features) == 0) {
-    stop("No shared features found across the selected datasets. Cannot proceed with feature selection.")
+  cat("[ML] Multiple datasets detected. Computing shared feature set per hierarchy in-memory...\n")
+  hier_groups <- list()
+  for (d in datasets) {
+    h <- get_hierarchy_group(get_dataset_data_type(d))
+    hier_groups[[h]] <- c(hier_groups[[h]], list(d))
   }
-  cat(sprintf("[ML] Shared features intersection: %d features across %d datasets.\n", length(shared_features), length(datasets)))
-  return(shared_features)
+  
+  shared_by_hier <- list()
+  for (h in names(hier_groups)) {
+    group_dss <- hier_groups[[h]]
+    if (length(group_dss) <= 1) next
+    sf <- get_shared_features_from_datasets(group_dss)
+    if (is.null(sf) || length(sf) == 0) {
+      stop(sprintf("No shared features found across the datasets in hierarchy '%s'. Cannot proceed with feature selection.", h))
+    }
+    cat(sprintf("[ML] Shared features intersection (%s): %d features across %d datasets.\n", h, length(sf), length(group_dss)))
+    shared_by_hier[[h]] <- sf
+  }
+  if (length(shared_by_hier) == 0) return(NULL)
+  return(shared_by_hier)
 }
 
 run_feature_selection <- function(datasets, models, split_ratio, parameters, max_features_select = 10, progress_file = NULL, multi_dataset_mode = "combine") {
@@ -1915,10 +2016,6 @@ run_feature_selection <- function(datasets, models, split_ratio, parameters, max
               list(acc = 0.0, fpr = numeric(0), tpr = numeric(0), auc = 0.0, ppv = 0.0, npv = 0.0, prec = 0.0, rec = 0.0)
             } else {
               train_m_eval <- train_m
-              lvls_orig <- levels(train_m_eval$Group)
-              safe_lvls <- make.names(lvls_orig, unique = TRUE)
-              levels(train_m_eval$Group) <- safe_lvls
-
               pred_res <- predict_ml(m, fit, train_m_eval)
               ev <- evaluate_predictions(pred_res$predictions, train_m_eval$Group, pred_res$probabilities, target_prevalence = d$targetPrevalence)
 
@@ -1984,6 +2081,17 @@ run_feature_selection <- function(datasets, models, split_ratio, parameters, max
 
       # Save full importances for refit
       saveRDS(model_feats, get_session_path(base_id, sprintf("%%s_fs_full_importances_%s.rds", m)))
+
+      # Save top features and final fitted model (crucial for CV and independent testing)
+      if (m %in% c("boruta", "stabl") || length(model_feats) > 0) {
+        top_genes_orig <- as.character(sapply(model_feats, function(f) f$gene))
+        if (length(top_genes_orig) > 0) {
+          saveRDS(top_genes_orig, get_session_path(base_id, sprintf("%%s_fs_top_features_%s.rds", m)))
+        }
+        if (exists("fit", inherits = FALSE) && !is.null(fit)) {
+          saveRDS(fit, get_session_path(base_id, sprintf("%%s_fs_final_model_%s.rds", m)))
+        }
+      }
 
       # Save discovery cache sidecar (internal only — never register_export_file)
       tryCatch(
@@ -2208,7 +2316,54 @@ run_feature_selection <- function(datasets, models, split_ratio, parameters, max
     )
   }
 
+  # Refit Models B on external validation/test datasets using features selected on same-hierarchy training datasets
+  if (length(test_dss) > 0) {
+    results <- refit_external_test_datasets(
+      test_dss = test_dss,
+      train_dss = train_dss,
+      models = models,
+      parameters = parameters,
+      shared_features = shared_features,
+      results = results,
+      stage_name = "training"
+    )
+  }
+
   return(results)
+}
+
+# Helper to load top features for a model with graceful fallbacks
+load_fs_top_features <- function(base_id, model_name) {
+  # 1. Stored top features RDS
+  top_path <- get_session_path(base_id, sprintf("%%s_fs_top_features_%s.rds", model_name))
+  if (file.exists(top_path)) {
+    feats <- tryCatch(readRDS(top_path), error = function(e) NULL)
+    if (!is.null(feats) && length(feats) > 0) return(as.character(feats))
+  }
+
+  # 2. Fallback: selected_features CSV
+  sel_csv <- get_session_path(base_id, sprintf("%%s_selected_features_%s.csv", model_name))
+  if (file.exists(sel_csv)) {
+    df_sel <- tryCatch(read.csv(sel_csv, stringsAsFactors = FALSE), error = function(e) NULL)
+    if (!is.null(df_sel) && "Gene" %in% colnames(df_sel)) {
+      genes <- as.character(df_sel$Gene)
+      if (length(genes) > 0) return(genes)
+    }
+  }
+
+  # 3. Fallback: full importances RDS
+  imp_path <- get_session_path(base_id, sprintf("%%s_fs_full_importances_%s.rds", model_name))
+  if (file.exists(imp_path)) {
+    m_feats <- tryCatch(readRDS(imp_path), error = function(e) NULL)
+    if (!is.null(m_feats) && length(m_feats) > 0) {
+      if (model_name %in% c("boruta", "stabl")) {
+        pos_feats <- Filter(function(f) (f$importance %||% 0) > 0, m_feats)
+        if (length(pos_feats) > 0) return(as.character(sapply(pos_feats, function(f) f$gene)))
+      }
+    }
+  }
+
+  character(0)
 }
 
 # ---------------------------------------------------------------
@@ -2231,11 +2386,7 @@ run_cross_validation <- function(models, cv_method, folds, datasets, multi_datas
     cv_dss[[d_id]] <- train_dss[[d_id]]
   }
   for (t_id in names(test_dss)) {
-    t <- test_dss[[t_id]]
-    val_strat <- t$fs_validationStrategy %||% t$validationStrategy %||% "train-test-split"
-    if (val_strat == "cv-only" || val_strat == "cv-and-test") {
-      cv_dss[[t_id]] <- t
-    }
+    cv_dss[[t_id]] <- test_dss[[t_id]]
   }
 
   # Compute shared feature set in-memory for multi-dataset runs (no disk writes)
@@ -2312,9 +2463,17 @@ run_cross_validation <- function(models, cv_method, folds, datasets, multi_datas
       cat(sprintf("  Cross-validating model: %s (%s)...\n", m, cv_method_str))
 
       cv_model_result <- tryCatch({
-        top_feats_path <- get_session_path(base_id, sprintf("%%s_fs_top_features_%s.rds", m))
-        if (file.exists(top_feats_path)) {
-          top_genes_orig  <- readRDS(top_feats_path)
+        top_genes_orig <- load_fs_top_features(base_id, m)
+        if (length(top_genes_orig) == 0 && (d_id %in% names(test_dss))) {
+          t_hier <- get_hierarchy_group(get_dataset_data_type(d))
+          for (tr_id in names(train_dss)) {
+            if (get_hierarchy_group(get_dataset_data_type(train_dss[[tr_id]])) == t_hier) {
+              top_genes_orig <- load_fs_top_features(get_base_id(train_dss[[tr_id]]$id), m)
+              if (length(top_genes_orig) > 0) break
+            }
+          }
+        }
+        if (length(top_genes_orig) > 0) {
           top_genes_clean <- make.names(top_genes_orig)
           sel_cols <- top_genes_clean[top_genes_clean %in% colnames(df)]
           df_cv <- df[, c(sel_cols, "Group"), drop = FALSE]
@@ -2598,8 +2757,9 @@ run_cross_validation <- function(models, cv_method, folds, datasets, multi_datas
     }
   }
 
-  # Copy cv_curves and roc_cv files from merged to individual dataset paths
-  for (d_id in input_ids) {
+  # Copy cv_curves and roc_cv files from merged to individual training dataset paths
+  test_ids <- sapply(test_dss, function(x) x$id)
+  for (d_id in setdiff(input_ids, test_ids)) {
     for (res_id in names(results)) {
       if (grepl("merged_", res_id) && grepl("_training", res_id) && res_id != d_id) {
         for (ext in c("pdf", "png", "tiff")) {
@@ -2734,31 +2894,36 @@ run_testing <- function(models, datasets, multi_dataset_mode = "combine") {
         # Subset to top features if they were selected and saved
         train_df_cv <- train_df
         val_df_cv   <- val_df
-        top_feats_path <- get_session_path(base_id, sprintf("%%s_fs_top_features_%s.rds", m))
+        top_genes_orig <- load_fs_top_features(base_id, m)
         fit <- NULL
-        top_genes_orig <- character(0)
-        if (file.exists(top_feats_path)) {
-          top_genes_orig  <- readRDS(top_feats_path)
+
+        final_model_path <- get_session_path(base_id, sprintf("%%s_fs_final_model_%s.rds", m))
+        if (file.exists(final_model_path)) {
+          cat(sprintf("  Model %s: Loading pre-fit final model for testing.\n", m))
+          fit <- readRDS(final_model_path)
+        }
+
+        if (length(top_genes_orig) > 0) {
           top_genes_clean <- make.names(top_genes_orig)
-          if (length(top_genes_orig) > 0) {
-            sel_cols <- top_genes_clean[top_genes_clean %in% colnames(train_df)]
-            train_df_cv <- train_df[, c(sel_cols, "Group"), drop = FALSE]
-            if (!is.null(val_df)) {
-              val_sel_cols <- top_genes_clean[top_genes_clean %in% colnames(val_df)]
-              val_df_cv <- val_df[, c(val_sel_cols, "Group"), drop = FALSE]
-            }
-            cat(sprintf("  Model %s: Using top %d selected features for independent training/validation.\n", m, length(top_genes_orig)))
-            
-            final_model_path <- get_session_path(base_id, sprintf("%%s_fs_final_model_%s.rds", m))
-            if (file.exists(final_model_path)) {
-              cat(sprintf("  Model %s: Loading pre-fit final model for testing.\n", m))
-              fit <- readRDS(final_model_path)
-            } else {
-              retrain_model_name <- if (m == "boruta") "boruta_refit" else (if (m == "stabl") "stabl_refit" else m)
-              fit_res <- fit_model_and_importance(retrain_model_name, train_df_cv, ml_data$original_genes, params, n_threads = eff_cores)
-              fit     <- fit_res$model
+          sel_cols <- top_genes_clean[top_genes_clean %in% colnames(train_df)]
+          train_df_cv <- train_df[, c(sel_cols, "Group"), drop = FALSE]
+          if (!is.null(val_df)) {
+            val_sel_cols <- top_genes_clean[top_genes_clean %in% colnames(val_df)]
+            val_df_cv <- val_df[, c(val_sel_cols, "Group"), drop = FALSE]
+          }
+          cat(sprintf("  Model %s: Using top %d selected features for independent training/validation.\n", m, length(top_genes_orig)))
+          
+          if (is.null(fit)) {
+            retrain_model_name <- if (m == "boruta") "boruta_refit" else (if (m == "stabl") "stabl_refit" else m)
+            fit_res <- fit_model_and_importance(retrain_model_name, train_df_cv, ml_data$original_genes, params, n_threads = eff_cores)
+            fit     <- fit_res$model
+            if (!is.null(fit)) {
+              saveRDS(fit, final_model_path)
             }
           }
+        } else if (is.null(fit) && !m %in% c("boruta", "stabl")) {
+          fit_res <- fit_model_and_importance(m, train_df_cv, ml_data$original_genes, params, n_threads = eff_cores)
+          fit     <- fit_res$model
         }
 
         if (is.null(fit)) {
@@ -2910,16 +3075,25 @@ run_testing <- function(models, datasets, multi_dataset_mode = "combine") {
       t_train_df <- NULL
       t_test_df  <- test_df
     } else {
-      # Split test dataset into train (e.g. 70%) and test (e.g. 30%) for refitting & evaluating
-      set.seed(42)
-      if (n_samples_t >= 4 && length(unique(test_df$Group)) > 1) {
-        t_train_idx <- tryCatch(caret::createDataPartition(test_df$Group, p = t_train_ratio, list = FALSE), error = function(e) seq_len(n_samples_t))
-        t_train_df <- test_df[t_train_idx, , drop = FALSE]
-        t_test_df  <- test_df[-t_train_idx, , drop = FALSE]
+      t_base_id <- get_base_id(t$id)
+      t_train_split_path <- get_session_path(t_base_id, "%s_fs_train_split.rds")
+      t_test_split_path  <- get_session_path(t_base_id, "%s_fs_test_split.rds")
+      if (file.exists(t_train_split_path) && file.exists(t_test_split_path)) {
+        t_train_df <- readRDS(t_train_split_path)
+        t_test_df  <- readRDS(t_test_split_path)
         if (nrow(t_test_df) == 0) t_test_df <- t_train_df
       } else {
-        t_train_df <- test_df
-        t_test_df  <- test_df
+        # Split test dataset into train (e.g. 70%) and test (e.g. 30%) for refitting & evaluating
+        set.seed(42)
+        if (n_samples_t >= 4 && length(unique(test_df$Group)) > 1) {
+          t_train_idx <- tryCatch(caret::createDataPartition(test_df$Group, p = t_train_ratio, list = FALSE), error = function(e) seq_len(n_samples_t))
+          t_train_df <- test_df[t_train_idx, , drop = FALSE]
+          t_test_df  <- test_df[-t_train_idx, , drop = FALSE]
+          if (nrow(t_test_df) == 0) t_test_df <- t_train_df
+        } else {
+          t_train_df <- test_df
+          t_test_df  <- test_df
+        }
       }
     }
     
@@ -2944,23 +3118,21 @@ run_testing <- function(models, datasets, multi_dataset_mode = "combine") {
           }
 
           base_id_train   <- get_base_id(d_train$id)
-          top_feats_path  <- get_session_path(base_id_train, sprintf("%%s_fs_top_features_%s.rds", m))
+          top_genes_orig  <- load_fs_top_features(base_id_train, m)
           params_path_t   <- get_session_path(base_id_train, "%s_fs_parameters.rds")
           params          <- if (file.exists(params_path_t)) readRDS(params_path_t) else NULL
           
-          if (file.exists(top_feats_path)) {
-            top_genes_orig  <- readRDS(top_feats_path)
+          if (length(top_genes_orig) > 0) {
             top_genes_clean <- make.names(top_genes_orig)
             
             # Use test_df columns for intersection check
             sel_cols <- top_genes_clean[top_genes_clean %in% colnames(test_df)]
             
             if (length(sel_cols) > 0) {
+              eff_c <- get_effective_cores()
               if (is_test_cv) {
                 # Run Cross-Validation refitting on test_df in parallel
                 all_probs_t <- numeric(n_samples_t)
-                
-                eff_c <- get_effective_cores()
                 process_fold_t <- function(f_idx) {
                   val_idx <- cv_folds_t[[f_idx]]
                   cv_train_t <- test_df[-val_idx, , drop = FALSE]
@@ -3344,6 +3516,275 @@ select_by_percentage <- function(importances, pct) {
   return(idx)
 }
 
+refit_external_test_datasets <- function(test_dss, train_dss, models, parameters, shared_features = NULL, results = list(), stage_name = "refit") {
+  if (length(test_dss) == 0) return(results)
+  eff_cores <- get_effective_cores()
+  for (t_id in names(test_dss)) {
+    t <- test_dss[[t_id]]
+    base_id <- get_base_id(t$id)
+    t_type <- get_dataset_data_type(t)
+    t_hier <- get_hierarchy_group(t_type)
+    
+    # Find compatible training dataset (same hierarchy group)
+    comp_train_id <- NULL
+    for (d_id in names(train_dss)) {
+      d_train <- train_dss[[d_id]]
+      d_train_type <- get_dataset_data_type(d_train)
+      d_train_hier <- get_hierarchy_group(d_train_type)
+      if (d_train_hier == t_hier) {
+        comp_train_id <- d_id
+        break
+      }
+    }
+    
+    if (is.null(comp_train_id)) {
+      cat(sprintf("  No compatible training dataset found for external test dataset %s. Skipping refit.\n", t$name))
+      next
+    }
+    
+    comp_base_id <- get_base_id(comp_train_id)
+    
+    # Load splits for the test dataset
+    train_split_path <- get_session_path(base_id, "%s_fs_train_split.rds")
+    test_split_path  <- get_session_path(base_id, "%s_fs_test_split.rds")
+    if (!file.exists(train_split_path)) {
+      cat(sprintf("  Train split for %s not found. Skipping refit.\n", t$name))
+      next
+    }
+    
+    train_df <- readRDS(train_split_path)
+    test_df  <- readRDS(test_split_path)
+    saveRDS(parameters, get_session_path(base_id, "%s_fs_parameters.rds"))
+    
+    accuracies            <- list()
+    loss_histories        <- list()
+    roc_data              <- list()
+    roc_raw_data          <- list()
+    performance_metrics   <- list()
+    job_warnings          <- character(0)
+    selected_features_out <- list()
+    model_features_out    <- list()
+    
+    # Prepare test dataset data object to access gene names mapping (in shared feature space)
+    test_ml <- tryCatch({
+      prepare_ml_data(t, max_features = NULL, shared_features = shared_features)
+    }, error = function(e) NULL)
+    if (is.null(test_ml)) next
+    
+    for (m in models) {
+      # Load training dataset's top features signature
+      comp_top_feats_path <- get_session_path(comp_base_id, sprintf("%%s_fs_top_features_%s.rds", m))
+      if (!file.exists(comp_top_feats_path)) next
+      
+      top_genes_orig <- readRDS(comp_top_feats_path)
+      comp_importances_path <- get_session_path(comp_base_id, sprintf("%%s_fs_full_importances_%s.rds", m))
+      comp_model_feats <- if (file.exists(comp_importances_path)) readRDS(comp_importances_path) else NULL
+      if (!is.null(comp_model_feats)) {
+        file.copy(comp_importances_path, get_session_path(base_id, sprintf("%%s_fs_full_importances_%s.rds", m)), overwrite = TRUE)
+      }
+      
+      # During initial "training" stage, rank models store all >0 importance features in top_features;
+      # apply breakoff (elbow) for initial test refit until user explicitly runs run_refit_features.
+      if (identical(stage_name, "training") && !(m %in% c("boruta", "stabl")) && !is.null(comp_model_feats) && length(comp_model_feats) > 0) {
+        imps_tr <- sapply(comp_model_feats, function(f) f$importance)
+        genes_tr <- sapply(comp_model_feats, function(f) f$gene)
+        n_el <- max(1, find_elbow_point(imps_tr))
+        top_genes_orig <- genes_tr[seq_len(min(n_el, length(genes_tr)))]
+      }
+      top_genes_clean <- make.names(top_genes_orig)
+      
+      # Save top features for this test dataset too
+      saveRDS(top_genes_orig, get_session_path(base_id, sprintf("%%s_fs_top_features_%s.rds", m)))
+      
+      if (length(top_genes_orig) == 0) {
+        accuracies[[m]]     <- 0.0
+        roc_data[[m]]       <- list(fpr = numeric(0), tpr = numeric(0), auc = 0.0)
+        performance_metrics[[m]] <- list(
+          auc = 0.0, acc = 0.0, ppv = 0.0, npv = 0.0,
+          prec = 0.0, rec = 0.0, fpr = numeric(0), tpr = numeric(0),
+          tp = 0, fp = 0, fn = 0, tn = 0
+        )
+        model_features_out[[m]] <- list()
+        next
+      }
+      
+      sel_cols_tr   <- top_genes_clean[top_genes_clean %in% colnames(train_df)]
+      sel_cols_te   <- top_genes_clean[top_genes_clean %in% colnames(test_df)]
+      if (length(sel_cols_tr) == 0) next
+      train_df_eval <- train_df[, c(sel_cols_tr, "Group"), drop = FALSE]
+      test_df_eval  <- test_df[, c(sel_cols_te, "Group"), drop = FALSE]
+      
+      gene_mapping <- top_genes_orig
+      names(gene_mapping) <- top_genes_clean
+      
+      # Boruta and STABL refit using Random Forest (ranger) to construct the final model
+      retrain_model_name <- if (m == "boruta") "boruta_refit" else (if (m == "stabl") "stabl_refit" else m)
+      
+      res_retrain <- tryCatch({
+        fit_model_and_importance(retrain_model_name, train_df_eval, gene_mapping, parameters, n_threads = eff_cores)
+      }, error = function(e) {
+        cat(sprintf("  Re-training model %s on test dataset %s failed: %s\n", m, t$name, e$message))
+        NULL
+      })
+      
+      if (is.null(res_retrain) || is.null(res_retrain$model)) next
+      fit <- res_retrain$model
+      
+      # Save final fit model for test dataset (Model B)
+      saveRDS(fit, get_session_path(base_id, sprintf("%%s_fs_final_model_%s.rds", m)))
+      
+      # Predict & Evaluate on the test dataset's train split
+      pred_res <- predict_ml(retrain_model_name, fit, train_df_eval)
+      eval_res <- evaluate_predictions(pred_res$predictions, train_df_eval$Group, pred_res$probabilities, target_prevalence = t$targetPrevalence)
+      
+      # CV folds score
+      fold_scores <- tryCatch({
+        k_folds  <- min(5, nrow(train_df_eval))
+        fold_idx <- split(sample(seq_len(nrow(train_df_eval))), rep(1:k_folds, length.out = nrow(train_df_eval)))
+        sapply(fold_idx, function(vi) {
+          tryCatch({
+            cv_train <- train_df_eval[-vi, , drop = FALSE]
+            cv_val   <- train_df_eval[vi, , drop = FALSE]
+            if (nrow(cv_train) < 2 || nrow(cv_val) < 1) return(eval_res$acc)
+            cv_res  <- fit_model_and_importance(retrain_model_name, cv_train, gene_mapping, parameters, n_threads = eff_cores)
+            cv_pred <- predict_ml(retrain_model_name, cv_res$model, cv_val)
+            cv_eval <- evaluate_predictions(cv_pred$predictions, cv_val$Group, cv_pred$probabilities, target_prevalence = t$targetPrevalence)
+            cv_eval$bacc
+          }, error = function(e) eval_res$bacc)
+        })
+      }, error = function(e) rep(eval_res$bacc, 5))
+      
+      accuracies[[m]]     <- round(eval_res$bacc, 3)
+      roc_data[[m]]       <- list(fpr = as.numeric(eval_res$fpr), tpr = as.numeric(eval_res$tpr), auc = round(eval_res$auc, 3))
+      
+      roc_obj_tmp <- tryCatch({
+        pROC::roc(response = train_df_eval$Group, predictor = pred_res$probabilities, quiet = TRUE)
+      }, error = function(e) NULL)
+
+      b_res <- if (!is.null(roc_obj_tmp)) {
+        tryCatch(compute_bootstrap_roc(roc_obj_tmp, n_boot = 150, conf.level = 0.95), error = function(e) NULL)
+      } else NULL
+
+      ci_auc <- if (!is.null(b_res)) b_res$ci_auc else c(NA_real_, NA_real_)
+      if (!is.null(roc_obj_tmp) && !is.null(b_res)) {
+        roc_obj_tmp$ci_auc  <- b_res$ci_auc
+        roc_obj_tmp$band_df <- b_res$band_df
+      }
+      roc_raw_data[[m]] <- roc_obj_tmp
+      ci_str <- if (!any(is.na(ci_auc))) sprintf("[%.3f, %.3f]", ci_auc[1], ci_auc[2]) else "N/A"
+      
+      performance_metrics[[m]] <- list(
+        auc      = round(eval_res$auc, 3),
+        ci       = ci_str,
+        ci_lower = if (!is.na(ci_auc[1])) round(ci_auc[1], 3) else NA,
+        ci_upper = if (!is.na(ci_auc[2])) round(ci_auc[2], 3) else NA,
+        acc      = round(eval_res$bacc, 3),
+        ppv      = round(eval_res$ppv %||% eval_res$prec, 3),
+        npv      = round(eval_res$npv %||% eval_res$rec, 3),
+        prec     = round(eval_res$ppv %||% eval_res$prec, 3),
+        rec      = round(eval_res$npv %||% eval_res$rec, 3),
+        fpr      = as.numeric(eval_res$fpr),
+        tpr      = as.numeric(eval_res$tpr),
+        tp       = eval_res$tp,
+        fp       = eval_res$fp,
+        fn       = eval_res$fn,
+        tn       = eval_res$tn
+      )
+      
+      loss_histories[[m]] <- as.numeric(fold_scores)
+      
+      if (!is.null(comp_model_feats) && length(comp_model_feats) > 0) {
+        selected_feats_model <- Filter(function(f) f$gene %in% top_genes_orig, comp_model_feats)
+        for (i in seq_along(selected_feats_model)) selected_feats_model[[i]]$rank <- i
+      } else {
+        selected_feats_model <- lapply(seq_along(top_genes_orig), function(i) list(gene = top_genes_orig[i], importance = 1.0, rank = i))
+      }
+      model_features_out[[m]] <- selected_feats_model
+      if (length(selected_features_out) == 0) {
+        selected_features_out <- selected_feats_model
+      }
+    }
+    
+    # Generate ROC plot for test dataset training/validation
+    roc_plot_base64 <- ""
+    standard_order <- c("stabl", "boruta", "gbm", "randomforest", "logistic", "svm")
+    valid_raw_models <- intersect(standard_order, intersect(names(roc_raw_data), models))
+    valid_raw_models <- Filter(function(m) !is.null(roc_raw_data[[m]]), valid_raw_models)
+    if (length(valid_raw_models) > 0) {
+      roc_raw_data_mapped <- roc_raw_data[valid_raw_models]
+      names(roc_raw_data_mapped) <- sapply(names(roc_raw_data_mapped), function(m) MODEL_LABELS_MAP[[m]] %||% m)
+      p_roc <- plot_roc_multi(roc_raw_data_mapped, title = NULL, show_auc_in_legend = FALSE, bands = TRUE, band = "ci", n_boot = 150) +
+        ggplot2::theme(legend.position = "right", legend.direction = "vertical", legend.key.spacing.y = grid::unit(0.5, "cm")) +
+        ggplot2::guides(colour = ggplot2::guide_legend(ncol = 1))
+        
+      tryCatch({
+        t_roc_pdf <- get_session_path(t$id, "roc_train_%s.pdf")
+        ggplot2::ggsave(filename = t_roc_pdf, plot = p_roc, width = 10, height = 7)
+        ggplot2::ggsave(filename = get_session_path(t$id, "roc_train_%s.png"), plot = p_roc, width = 10, height = 7, dpi = 300)
+        ggplot2::ggsave(filename = get_session_path(t$id, "roc_train_%s.tiff"), plot = p_roc, width = 10, height = 7, dpi = 300)
+        register_export_file(get_user_id(t$id), "roc_all_models_train", t$id, t_roc_pdf, "fs", stage_name, ext = "pdf")
+      }, error = function(e) {
+        cat("[WARNING] Failed to save testing ROC plot:", e$message, "\n")
+      })
+      
+      roc_plot_base64 <- tryCatch(plot_to_base64(p_roc, width = 930, height = 650), error = function(e) "")
+      rm(roc_raw_data_mapped, p_roc)
+      invisible(gc(verbose = FALSE))
+    }
+
+    # Save and register all_models_performance_train and selected_features for test refit
+    tryCatch({
+      test_base_id <- get_base_id(t$id)
+      uid_val <- get_user_id(t$id) %||% get_user_id(base_id)
+      if (length(performance_metrics) > 0) {
+        p_models <- names(performance_metrics)
+        perf_df <- data.frame(
+          Model = sapply(p_models, function(m) MODEL_LABELS_MAP[[m]] %||% toupper(m)),
+          AUC = sapply(p_models, function(m) performance_metrics[[m]]$auc %||% NA),
+          AUC_95_CI = sapply(p_models, function(m) performance_metrics[[m]]$ci %||% NA),
+          Balanced_Accuracy = sapply(p_models, function(m) performance_metrics[[m]]$acc %||% NA),
+          PPV = sapply(p_models, function(m) performance_metrics[[m]]$ppv %||% NA),
+          NPV = sapply(p_models, function(m) performance_metrics[[m]]$npv %||% NA),
+          check.names = FALSE, stringsAsFactors = FALSE
+        )
+        colnames(perf_df) <- c("Model", "AUC", "95% CI (AUC)", "Accuracy", "PPV", "NPV")
+        perf_train_path <- get_session_path(test_base_id, "%s_all_models_performance_train.csv")
+        write.csv(perf_df, perf_train_path, row.names = FALSE)
+        register_export_file(uid_val, "all_models_performance_train", test_base_id, perf_train_path, "fs", stage_name)
+      }
+
+      for (m in models) {
+        top_path <- get_session_path(test_base_id, sprintf("%%s_fs_top_features_%s.rds", m))
+        if (file.exists(top_path)) {
+          top_genes <- as.character(readRDS(top_path))
+          if (m %in% c("stabl", "boruta")) {
+            sf_df <- data.frame(Gene = as.character(top_genes), stringsAsFactors = FALSE)
+          } else {
+            sf_df <- data.frame(Rank = seq_along(top_genes), Gene = as.character(top_genes), stringsAsFactors = FALSE)
+          }
+          sf_path <- get_session_path(test_base_id, sprintf("%%s_selected_features_%s.csv", m))
+          write.csv(sf_df, sf_path, row.names = FALSE)
+          register_export_file(uid_val, "selected_features", test_base_id, sf_path, "fs", stage_name, model = m)
+        }
+      }
+    }, error = function(e) {
+      cat(sprintf("[WARNING] Failed to save test refit performance/feature tables for %s: %s\n", t$id, e$message))
+    })
+    
+    results[[t_id]] <- list(
+      features            = selected_features_out,
+      model_features      = model_features_out,
+      accuracies          = accuracies,
+      loss_histories      = loss_histories,
+      roc_data            = roc_data,
+      performance_metrics = performance_metrics,
+      roc_plot            = roc_plot_base64,
+      warnings            = as.list(job_warnings)
+    )
+  }
+  return(results)
+}
+
 run_refit_features <- function(datasets, models, split_ratio, parameters, selection_method, percentage_val = NULL, max_features_val = NULL) {
   load_packages_globally(c("caret", "Boruta", "randomForest", "e1071", "glmnet", "MASS", "class", "ranger", "gbm", "pROC", "reticulate", "ggplot2"))
   
@@ -3360,6 +3801,7 @@ run_refit_features <- function(datasets, models, split_ratio, parameters, select
   models <- parsed_ml$models
   parameters <- parsed_ml$parameters
   
+  shared_features <- compute_shared_features(datasets)
   resolved <- resolve_and_preprocess_datasets(datasets, split_ratio)
   train_dss <- resolved$train
   test_dss  <- resolved$test
@@ -3407,6 +3849,7 @@ run_refit_features <- function(datasets, models, split_ratio, parameters, select
     performance_metrics <- list()
     job_warnings        <- character(0)
     selected_features_out <- list()
+    model_features_out    <- list()
     
     # ── Parallel per-model refit ──────────────────────────────────────────────
     # Each model's refit is deterministic and independent: fit_model_and_importance()
@@ -3577,10 +4020,11 @@ run_refit_features <- function(datasets, models, split_ratio, parameters, select
       loss_histories[[m]] <- as.numeric(fold_scores)
 
       # Keep subset features list for response
-      selected_feats_model <- model_feats[1:n_features]
+      selected_feats_model <- Filter(function(f) f$gene %in% top_genes_orig, model_feats)
       for (i in seq_along(selected_feats_model)) {
         selected_feats_model[[i]]$rank <- i
       }
+      model_features_out[[m]] <- selected_feats_model
       if (length(selected_features_out) == 0) {
         selected_features_out <- selected_feats_model
       }
@@ -3677,6 +4121,8 @@ run_refit_features <- function(datasets, models, split_ratio, parameters, select
     
     results[[d_id]] <- list(
       features            = selected_features_out,
+      model_features      = model_features_out,
+      overlap_count       = length(overlap_genes_all),
       accuracies          = accuracies,
       loss_histories      = loss_histories,
       roc_data            = roc_data,
@@ -3686,251 +4132,16 @@ run_refit_features <- function(datasets, models, split_ratio, parameters, select
     )
   }
 
-  # Also refit models for external test datasets using features selected on compatible training datasets
-  for (t_id in names(test_dss)) {
-    t <- test_dss[[t_id]]
-    base_id <- get_base_id(t$id)
-    t_type <- get_dataset_data_type(t)
-    t_hier <- get_hierarchy_group(t_type)
-    
-    # Find compatible training dataset (same hierarchy group)
-    comp_train_id <- NULL
-    for (d_id in names(train_dss)) {
-      d_train <- train_dss[[d_id]]
-      d_train_type <- get_dataset_data_type(d_train)
-      d_train_hier <- get_hierarchy_group(d_train_type)
-      if (d_train_hier == t_hier) {
-        comp_train_id <- d_id
-        break
-      }
-    }
-    
-    if (is.null(comp_train_id)) {
-      cat(sprintf("  No compatible training dataset found for external test dataset %s. Skipping refit.\n", t$name))
-      next
-    }
-    
-    comp_base_id <- get_base_id(comp_train_id)
-    
-    # Load splits for the test dataset
-    train_split_path <- get_session_path(base_id, "%s_fs_train_split.rds")
-    test_split_path  <- get_session_path(base_id, "%s_fs_test_split.rds")
-    if (!file.exists(train_split_path)) {
-      cat(sprintf("  Train split for %s not found. Skipping refit.\n", t$name))
-      next
-    }
-    
-    train_df <- readRDS(train_split_path)
-    test_df  <- readRDS(test_split_path)
-    saveRDS(parameters, get_session_path(base_id, "%s_fs_parameters.rds"))
-    
-    accuracies          <- list()
-    loss_histories      <- list()
-    roc_data            <- list()
-    roc_raw_data        <- list()
-    performance_metrics <- list()
-    job_warnings        <- character(0)
-    selected_features_out <- list()
-    
-    # Prepare test dataset data object to access gene names mapping
-    test_ml <- tryCatch({
-      prepare_ml_data(t, max_features = NULL)
-    }, error = function(e) NULL)
-    if (is.null(test_ml)) next
-    
-    for (m in models) {
-      # Load training dataset's top features signature
-      comp_top_feats_path <- get_session_path(comp_base_id, sprintf("%%s_fs_top_features_%s.rds", m))
-      if (!file.exists(comp_top_feats_path)) next
-      
-      top_genes_orig <- readRDS(comp_top_feats_path)
-      top_genes_clean <- make.names(top_genes_orig)
-      
-      # Save top features for this test dataset too
-      saveRDS(top_genes_orig, get_session_path(base_id, sprintf("%%s_fs_top_features_%s.rds", m)))
-      
-      # Copy full importances
-      comp_importances_path <- get_session_path(comp_base_id, sprintf("%%s_fs_full_importances_%s.rds", m))
-      if (file.exists(comp_importances_path)) {
-        file.copy(comp_importances_path, get_session_path(base_id, sprintf("%%s_fs_full_importances_%s.rds", m)), overwrite = TRUE)
-      }
-      
-      if (length(top_genes_orig) == 0) {
-        accuracies[[m]]     <- 0.0
-        roc_data[[m]]       <- list(fpr = numeric(0), tpr = numeric(0), auc = 0.0)
-        performance_metrics[[m]] <- list(
-          auc = 0.0, acc = 0.0, ppv = 0.0, npv = 0.0,
-          prec = 0.0, rec = 0.0, fpr = numeric(0), tpr = numeric(0),
-          tp = 0, fp = 0, fn = 0, tn = 0
-        )
-        selected_features_out[[m]] <- list()
-        next
-      }
-      
-      sel_cols_tr   <- top_genes_clean[top_genes_clean %in% colnames(train_df)]
-      sel_cols_te   <- top_genes_clean[top_genes_clean %in% colnames(test_df)]
-      train_df_eval <- train_df[, c(sel_cols_tr, "Group"), drop = FALSE]
-      test_df_eval  <- test_df[, c(sel_cols_te, "Group"), drop = FALSE]
-      
-      gene_mapping <- top_genes_orig
-      names(gene_mapping) <- top_genes_clean
-      
-      retrain_model_name <- if (m == "boruta") "boruta_refit" else (if (m == "stabl") "stabl_refit" else m)
-      
-      res_retrain <- tryCatch({
-        fit_model_and_importance(retrain_model_name, train_df_eval, gene_mapping, parameters, n_threads = eff_cores)
-      }, error = function(e) {
-        cat(sprintf("  Re-training model %s on test dataset %s failed: %s\n", m, t$name, e$message))
-        NULL
-      })
-      
-      if (is.null(res_retrain) || is.null(res_retrain$model)) next
-      fit <- res_retrain$model
-      
-      # Save final fit model for test dataset
-      saveRDS(fit, get_session_path(base_id, sprintf("%%s_fs_final_model_%s.rds", m)))
-      
-      # Predict & Evaluate on the test dataset's train split
-      pred_res <- predict_ml(retrain_model_name, fit, train_df_eval)
-      eval_res <- evaluate_predictions(pred_res$predictions, train_df_eval$Group, pred_res$probabilities, target_prevalence = t$targetPrevalence)
-      
-      # CV folds score
-      fold_scores <- tryCatch({
-        k_folds  <- min(5, nrow(train_df_eval))
-        fold_idx <- split(sample(seq_len(nrow(train_df_eval))), rep(1:k_folds, length.out = nrow(train_df_eval)))
-        sapply(fold_idx, function(vi) {
-          tryCatch({
-            cv_train <- train_df_eval[-vi, , drop = FALSE]
-            cv_val   <- train_df_eval[vi, , drop = FALSE]
-            if (nrow(cv_train) < 2 || nrow(cv_val) < 1) return(eval_res$acc)
-            cv_res  <- fit_model_and_importance(retrain_model_name, cv_train, gene_mapping, parameters, n_threads = eff_cores)
-            cv_pred <- predict_ml(retrain_model_name, cv_res$model, cv_val)
-            cv_eval <- evaluate_predictions(cv_pred$predictions, cv_val$Group, cv_pred$probabilities, target_prevalence = t$targetPrevalence)
-            cv_eval$bacc
-          }, error = function(e) eval_res$bacc)
-        })
-      }, error = function(e) rep(eval_res$bacc, 5))
-      
-      accuracies[[m]]     <- round(eval_res$bacc, 3)
-      roc_data[[m]]       <- list(fpr = as.numeric(eval_res$fpr), tpr = as.numeric(eval_res$tpr), auc = round(eval_res$auc, 3))
-      
-      roc_obj_tmp <- tryCatch({
-        pROC::roc(response = train_df_eval$Group, predictor = pred_res$probabilities, quiet = TRUE)
-      }, error = function(e) NULL)
-
-      b_res <- if (!is.null(roc_obj_tmp)) {
-        tryCatch(compute_bootstrap_roc(roc_obj_tmp, n_boot = 150, conf.level = 0.95), error = function(e) NULL)
-      } else NULL
-
-      ci_auc <- if (!is.null(b_res)) b_res$ci_auc else c(NA_real_, NA_real_)
-      if (!is.null(roc_obj_tmp) && !is.null(b_res)) {
-        roc_obj_tmp$ci_auc  <- b_res$ci_auc
-        roc_obj_tmp$band_df <- b_res$band_df
-      }
-      roc_raw_data[[m]] <- roc_obj_tmp
-      ci_str <- if (!any(is.na(ci_auc))) sprintf("[%.3f, %.3f]", ci_auc[1], ci_auc[2]) else "N/A"
-      
-      performance_metrics[[m]] <- list(
-        auc      = round(eval_res$auc, 3),
-        ci       = ci_str,
-        ci_lower = if (!is.na(ci_auc[1])) round(ci_auc[1], 3) else NA,
-        ci_upper = if (!is.na(ci_auc[2])) round(ci_auc[2], 3) else NA,
-        acc      = round(eval_res$bacc, 3),
-        ppv      = round(eval_res$ppv %||% eval_res$prec, 3),
-        npv      = round(eval_res$npv %||% eval_res$rec, 3),
-        prec     = round(eval_res$ppv %||% eval_res$prec, 3),
-        rec      = round(eval_res$npv %||% eval_res$rec, 3),
-        fpr      = as.numeric(eval_res$fpr),
-        tpr      = as.numeric(eval_res$tpr),
-        tp       = eval_res$tp,
-        fp       = eval_res$fp,
-        fn       = eval_res$fn,
-        tn       = eval_res$tn
-      )
-      
-      loss_histories[[m]] <- as.numeric(fold_scores)
-      
-      # Keep subset features list for response
-      selected_feats_model <- top_genes_orig
-      selected_features_out[[m]] <- selected_feats_model
-    }
-    
-    # Generate ROC plot for test dataset training/validation
-    roc_plot_base64 <- ""
-    standard_order <- c("stabl", "boruta", "gbm", "randomforest", "logistic", "svm")
-    valid_raw_models <- intersect(standard_order, intersect(names(roc_raw_data), models))
-    valid_raw_models <- Filter(function(m) !is.null(roc_raw_data[[m]]), valid_raw_models)
-    if (length(valid_raw_models) > 0) {
-      roc_raw_data_mapped <- roc_raw_data[valid_raw_models]
-      names(roc_raw_data_mapped) <- sapply(names(roc_raw_data_mapped), function(m) MODEL_LABELS_MAP[[m]] %||% m)
-      p_roc <- plot_roc_multi(roc_raw_data_mapped, title = NULL, show_auc_in_legend = FALSE, bands = TRUE, band = "ci", n_boot = 150) +
-        ggplot2::theme(legend.position = "right", legend.direction = "vertical", legend.key.spacing.y = grid::unit(0.5, "cm")) +
-        ggplot2::guides(colour = ggplot2::guide_legend(ncol = 1))
-        
-      tryCatch({
-        t_roc_pdf <- get_session_path(t$id, "roc_train_%s.pdf")
-        ggplot2::ggsave(filename = t_roc_pdf, plot = p_roc, width = 10, height = 7)
-        ggplot2::ggsave(filename = get_session_path(t$id, "roc_train_%s.png"), plot = p_roc, width = 10, height = 7, dpi = 300)
-        ggplot2::ggsave(filename = get_session_path(t$id, "roc_train_%s.tiff"), plot = p_roc, width = 10, height = 7, dpi = 300)
-        register_export_file(get_user_id(t$id), "roc_all_models_train", t$id, t_roc_pdf, "fs", "refit", ext = "pdf")
-      }, error = function(e) {
-        cat("[WARNING] Failed to save testing ROC plot:", e$message, "\n")
-      })
-      
-      roc_plot_base64 <- tryCatch(plot_to_base64(p_roc, width = 930, height = 650), error = function(e) "")
-      rm(roc_raw_data_mapped, p_roc)
-      invisible(gc(verbose = FALSE))
-    }
-
-    # Save and register all_models_performance_train and selected_features for test refit
-    tryCatch({
-      test_base_id <- get_base_id(t$id)
-      uid_val <- get_user_id(t$id) %||% get_user_id(base_id)
-      if (length(performance_metrics) > 0) {
-        p_models <- names(performance_metrics)
-        perf_df <- data.frame(
-          Model = sapply(p_models, function(m) MODEL_LABELS_MAP[[m]] %||% toupper(m)),
-          AUC = sapply(p_models, function(m) performance_metrics[[m]]$auc %||% NA),
-          AUC_95_CI = sapply(p_models, function(m) performance_metrics[[m]]$ci %||% NA),
-          Balanced_Accuracy = sapply(p_models, function(m) performance_metrics[[m]]$acc %||% NA),
-          PPV = sapply(p_models, function(m) performance_metrics[[m]]$ppv %||% NA),
-          NPV = sapply(p_models, function(m) performance_metrics[[m]]$npv %||% NA),
-          check.names = FALSE, stringsAsFactors = FALSE
-        )
-        colnames(perf_df) <- c("Model", "AUC", "95% CI (AUC)", "Accuracy", "PPV", "NPV")
-        perf_train_path <- get_session_path(test_base_id, "%s_all_models_performance_train.csv")
-        write.csv(perf_df, perf_train_path, row.names = FALSE)
-        register_export_file(uid_val, "all_models_performance_train", test_base_id, perf_train_path, "fs", "refit")
-      }
-
-      for (m in models) {
-        top_path <- get_session_path(test_base_id, sprintf("%%s_fs_top_features_%s.rds", m))
-        if (file.exists(top_path)) {
-          top_genes <- as.character(readRDS(top_path))
-          if (m %in% c("stabl", "boruta")) {
-            sf_df <- data.frame(Gene = as.character(top_genes), stringsAsFactors = FALSE)
-          } else {
-            sf_df <- data.frame(Rank = seq_along(top_genes), Gene = as.character(top_genes), stringsAsFactors = FALSE)
-          }
-          sf_path <- get_session_path(test_base_id, sprintf("%%s_selected_features_%s.csv", m))
-          write.csv(sf_df, sf_path, row.names = FALSE)
-          register_export_file(uid_val, "selected_features", test_base_id, sf_path, "fs", "refit", model = m)
-        }
-      }
-    }, error = function(e) {
-      cat(sprintf("[WARNING] Failed to save test refit performance/feature tables for %s: %s\n", t$id, e$message))
-    })
-    
-    results[[t_id]] <- list(
-      features            = selected_features_out,
-      accuracies          = accuracies,
-      loss_histories      = loss_histories,
-      roc_data            = roc_data,
-      performance_metrics = performance_metrics,
-      roc_plot            = roc_plot_base64,
-      warnings            = as.list(job_warnings)
-    )
-  }
+  # Also refit models for external test datasets (Models B) using features selected on compatible training datasets
+  results <- refit_external_test_datasets(
+    test_dss        = test_dss,
+    train_dss       = train_dss,
+    models          = models,
+    parameters      = parameters,
+    shared_features = shared_features,
+    results         = results,
+    stage_name      = "refit"
+  )
   
   # Map merged training dataset results back to original input dataset IDs
   input_ids <- sapply(datasets, function(x) x$id)

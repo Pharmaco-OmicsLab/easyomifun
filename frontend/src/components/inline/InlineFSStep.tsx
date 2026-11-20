@@ -1,18 +1,18 @@
-import { useState, useEffect, useMemo } from "react";
-import { ChevronDown, ChevronRight, FileText, X, AlertTriangle, CheckCircle, Layers } from "lucide-react";
+import { useState, useEffect, useMemo, useRef } from "react";
+import { ChevronDown, ChevronRight, FileText, X, AlertTriangle, AlertCircle, CheckCircle, CheckCircle2, Check, RotateCcw, Layers, FileSpreadsheet, Info } from "lucide-react";
 import { useAppStore } from "../../store/appStore";
 import { toast } from "../../hooks/use-toast";
 import Spinner from "../Spinner";
 import ChangeWarnModal from "../shared/ChangeWarnModal";
 import DiscardWarnModal from "../shared/DiscardWarnModal";
 import WarnSampleModal from "../shared/WarnSampleModal";
-import { type MLModel, type CVMethod, getHierarchyGroup } from "../../dataObject";
+import { type MLModel, type CVMethod, getHierarchyGroup, formatDataTypeLabel } from "../../dataObject";
 import { fetchSampleDataAPI } from "../../lib/api";
 import { parseClinicalFile, getExpressionSampleColumns } from "../../lib/dataParser";
 import TestingStep from "../featureselection/TestingStep";
 import InlineUploadStep from "./InlineUploadStep";
 import AllDatasetsUploadView from "../shared/AllDatasetsUploadView";
-import { runInlineFSAPI, runCrossValidationAPI, redoStepAPI, clearDatasetAPI, type CVResult, refitFeaturesAPI, fetchDatasetInfoAPI } from "../../lib/api";
+import { runInlineFSAPI, runCrossValidationAPI, redoStepAPI, clearDatasetAPI, type CVResult, refitFeaturesAPI, fetchDatasetInfoAPI, cancelFSJobAPI, cancelComputeJobAPI } from "../../lib/api";
 import { formatMetric, formatCi } from "../../lib/utils";
 
 const MODEL_COLORS: Record<string, string> = {
@@ -152,35 +152,49 @@ export default function InlineFSStep() {
   const lowSampleDs = sorted.find(d => (d.nSamples || 0) < 30);
   const lowGroupDs = sorted.find(d => d.minGroupSampleSize !== undefined && d.minGroupSampleSize < 10);
 
-  // Compute shared (intersection) feature count across all datasets for the Upload Summary check.
-  // Aware of feature orientation: when features are column names (headers) vs in a single column (rows).
-  const getDatasetFeatureIds = (d: typeof sorted[0]): Set<string> => {
-    if (d.fs_featuresOrientation === "headers") {
-      const sampleIdCol = d.clinicalSampleIdCol || d.geneIdCol || "SampleID";
-      const infoCols = d.geneInfoCols || [];
-      const featureCols = (d.columns || []).filter(c => c !== sampleIdCol && !infoCols.includes(c));
-      return new Set(featureCols);
-    }
-    if (!d.parsedData || d.parsedData.length === 0) return new Set();
-    const geneIdIdx = d.columns ? d.columns.indexOf(d.geneIdCol) : -1;
-    if (geneIdIdx === -1) return new Set(d.parsedData.map(row => String(row[0])));
-    return new Set(d.parsedData.map(row => String(row[geneIdIdx])));
-  };
+  // Authoritative per-hierarchy shared feature counts from backend for the Upload Summary check
+  const [summarySharedByHier, setSummarySharedByHier] = useState<Record<string, number>>({});
+  useEffect(() => {
+    if (!multipleDs) return;
+    let cancelled = false;
+    fetchDatasetInfoAPI(sorted.map(d => d.id), "dp")
+      .then(res => {
+        if (!cancelled && res?.sharedFeaturesByHierarchy) {
+          setSummarySharedByHier(res.sharedFeaturesByHierarchy);
+          dispatch({ type: "SET_FS_SHARED_COUNTS", counts: res.sharedFeaturesByHierarchy });
+        }
+      })
+      .catch(() => { /* fallback to preview */ });
+    return () => { cancelled = true; };
+  }, [multipleDs, sorted]);
 
-  const sharedFeatureCount: number = (() => {
-    if (!multipleDs) return 0;
-    if (sorted.some(d => !d.parsedData || d.parsedData.length === 0)) return 0;
-    let intersection = getDatasetFeatureIds(sorted[0]);
-    for (let i = 1; i < sorted.length; i++) {
-      const next = getDatasetFeatureIds(sorted[i]);
-      intersection = new Set([...intersection].filter(x => next.has(x)));
+  const summaryHierGroups: Record<string, typeof sorted> = {};
+  sorted.forEach(d => {
+    const h = getHierarchyGroup(d.dataType || "readcounts");
+    if (h !== "others") {
+      if (!summaryHierGroups[h]) summaryHierGroups[h] = [];
+      summaryHierGroups[h].push(d);
     }
-    return intersection.size;
-  })();
+  });
+  const multiHierKeys = Object.keys(summaryHierGroups).filter(h => summaryHierGroups[h].length >= 2);
+  const hierLabelMap: Record<string, string> = {
+    transcriptomics: "Transcriptomics",
+    proteomics: "Proteomics",
+    general: "General (Type 1 / Type 2)",
+  };
+  const getSummaryHierCount = (h: string): number | undefined => {
+    if (summarySharedByHier[h] !== undefined) return summarySharedByHier[h];
+    const local = getSharedFeatureCountForGroup(summaryHierGroups[h] || []);
+    return local > 0 ? local : undefined;
+  };
+  const failingHier = multiHierKeys.find(h => {
+    const cnt = getSummaryHierCount(h);
+    return cnt !== undefined && cnt <= 10;
+  });
 
   const sharedFeatureError: string | null =
-    multipleDs && sorted.every(d => d.parsedData && d.parsedData.length > 0) && sharedFeatureCount <= 10
-      ? `Only ${sharedFeatureCount} shared feature(s) found across datasets. At least 11 shared features are required to proceed.`
+    multipleDs && failingHier
+      ? `Only ${getSummaryHierCount(failingHier)} shared feature(s) found within ${hierLabelMap[failingHier] || failingHier} datasets. At least 11 shared features within the same hierarchy are required to proceed.`
       : null;
 
   const summaryGateError: string | null =
@@ -203,8 +217,8 @@ export default function InlineFSStep() {
 
   // Sync state if databases update externally (e.g. clinical data cleared)
   useEffect(() => {
-    const hasIncomplete = allDs.some(isIncomplete);
-    if (hasIncomplete && state.inlineFsUploadReviewed) {
+    const allCleared = allDs.length > 0 && allDs.every(d => !d.clinicalFileName);
+    if (allCleared && state.inlineFsUploadReviewed) {
       dispatch({ type: "SET_INLINE_FS_UPLOAD_REVIEWED", reviewed: false });
     }
     if (!sorted.some(d => d.id === activeUploadDatasetId)) {
@@ -275,34 +289,42 @@ export default function InlineFSStep() {
             }
           }}
         />
-        {multipleDs && sorted.every(d => d.parsedData && d.parsedData.length > 0) && (
+        {multipleDs && multiHierKeys.length > 0 && (
           <div className="card" style={{ marginTop: 12 }}>
             <div className="card-title" style={{ marginBottom: 6 }}>Shared Feature Space</div>
             <div className="card-sub" style={{ marginBottom: 10 }}>
-              Intersection of features (genes/proteins) across all datasets. At least 11 are required to proceed.
+              Intersection of features (genes/proteins) within each hierarchy group across datasets. At least 11 are required to proceed.
             </div>
-            <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
-              <div className="stat-chip">
-                <div className="stat-chip-val" style={{ color: sharedFeatureCount > 10 ? "hsl(150 60% 32%)" : "hsl(0 72% 50%)" }}>
-                  {sharedFeatureCount.toLocaleString()}
-                </div>
-                <div className="stat-chip-lbl">Shared Features</div>
-              </div>
+            <div style={{ display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
+              {multiHierKeys.map(h => {
+                const cnt = getSummaryHierCount(h);
+                return (
+                  <div key={h} className="stat-chip">
+                    <div className="stat-chip-val" style={{ color: cnt > 10 ? "hsl(150 60% 32%)" : "hsl(0 72% 50%)" }}>
+                      {cnt.toLocaleString()}
+                    </div>
+                    <div className="stat-chip-lbl">Shared Features ({hierLabelMap[h] || h})</div>
+                  </div>
+                );
+              })}
             </div>
-            {sharedFeatureCount > 10 ? (
-              <div className="banner success" style={{ marginTop: 10, marginBottom: 0 }}>
-                ✓ {sharedFeatureCount.toLocaleString()} shared features detected across all datasets. Feature space is sufficient.
+            {!failingHier ? (
+              <div className="banner success" style={{ marginTop: 10, marginBottom: 0, display: "flex", alignItems: "center", gap: 6 }}>
+                <Check size={14} style={{ flexShrink: 0 }} />
+                <span>Shared feature space within each hierarchy group is sufficient.</span>
               </div>
             ) : (
-              <div className="banner danger" style={{ marginTop: 10, marginBottom: 0 }}>
-                ⛔ Only {sharedFeatureCount} shared feature(s) across datasets. At least 11 are required to run feature selection.
+              <div className="banner danger" style={{ marginTop: 10, marginBottom: 0, display: "flex", alignItems: "center", gap: 6 }}>
+                <AlertCircle size={14} style={{ flexShrink: 0 }} />
+                <span>{sharedFeatureError}</span>
               </div>
             )}
           </div>
         )}
         {summaryGateError && (
-          <div className="banner danger" style={{ marginTop: 12 }}>
-            ⛔ <strong>Cannot continue:</strong> {summaryGateError}
+          <div className="banner danger" style={{ marginTop: 12, display: "flex", alignItems: "center", gap: 6 }}>
+            <AlertCircle size={14} style={{ flexShrink: 0 }} />
+            <span><strong>Cannot continue:</strong> {summaryGateError}</span>
           </div>
         )}
       </>
@@ -343,23 +365,23 @@ export default function InlineFSStep() {
   );
 }
 
-// Helper to extract feature ids from dataset
+// Helper to extract feature ids from dataset (Features are Rows)
 const getFsDatasetFeatureIds = (d: any): Set<string> => {
-  if (d.dataMode === "metadata_features" || d.fs_featuresOrientation === "headers") {
-    const sampleIdCol = d.clinicalSampleIdCol || d.geneIdCol || "SampleID";
-    const infoCols = d.geneInfoCols || [];
-    const featureCols = (d.columns || []).filter((c: string) => c !== sampleIdCol && !infoCols.includes(c));
-    return new Set(featureCols);
-  }
   if (!d.parsedData || d.parsedData.length === 0) return new Set();
-  const geneIdIdx = d.columns ? d.columns.indexOf(d.geneIdCol) : -1;
-  if (geneIdIdx === -1) return new Set(d.parsedData.map((row: any) => String(row[0])));
-  return new Set(d.parsedData.map((row: any) => String(row[geneIdIdx])));
+  const featIdx = (d.fs_featureIndexValue || 1) - 1;
+  const geneIdCol = d.geneIdCol || (d.columns && d.columns[featIdx >= 0 ? featIdx : 0]) || "Feature";
+  const geneIdIdx = d.columns?.indexOf(geneIdCol);
+  const targetIdx = geneIdIdx !== undefined && geneIdIdx !== -1 ? geneIdIdx : (featIdx >= 0 && featIdx < (d.columns?.length || 0) ? featIdx : 0);
+  return new Set(d.parsedData.map((row: any) => String(row[targetIdx])).filter(Boolean));
 };
 
 // Helper to compute intersection of features in a list of datasets
-const getSharedFeatureCountForGroup = (groupDatasets: any[]): number => {
+const getSharedFeatureCountForGroup = (groupDatasets: any[], backendCounts?: Record<string, number>): number => {
   if (groupDatasets.length <= 1) return 0;
+  if (backendCounts) {
+    const h = getHierarchyGroup(groupDatasets[0]?.dataType || "type1");
+    if (backendCounts[h] !== undefined) return backendCounts[h];
+  }
   if (groupDatasets.some(d => !d.parsedData || d.parsedData.length === 0)) return 0;
   let intersection = getFsDatasetFeatureIds(groupDatasets[0]);
   for (let i = 1; i < groupDatasets.length; i++) {
@@ -371,7 +393,7 @@ const getSharedFeatureCountForGroup = (groupDatasets: any[]): number => {
 
 function InlineFSContent({ onBack }: { onBack?: () => void }) {
   const { state, dispatch } = useAppStore();
-  const fsConfig = state.fsConfig;
+  const fsConfig = state.dpInlineFsConfig;
   const ds = state.dpDatasets.find(d => d.id === state.dpCurrentDatasetId) ?? state.dpDatasets[0];
   const allDs = state.dpDatasets;
 
@@ -391,10 +413,15 @@ function InlineFSContent({ onBack }: { onBack?: () => void }) {
     }
   });
 
+  // Authoritative shared feature counts from backend (full expression matrix, not 100-row preview)
+  const [backendSharedCounts, setBackendSharedCounts] = useState<{ general?: number; transcriptomics?: number; proteomics?: number }>({});
+
   // Pooling selection card is visible only when we have same-type datasets with >= 10 shared features
   const hasPoolableTypesAndSufficientFeatures = Object.values(typeGroups).some(group => {
     if (group.length < 2) return false;
-    const count = getSharedFeatureCountForGroup(group);
+    const h = getHierarchyGroup(group[0]?.dataType || "type1");
+    const backendCount = h === "general" ? backendSharedCounts.general : (h === "transcriptomics" ? backendSharedCounts.transcriptomics : (h === "proteomics" ? backendSharedCounts.proteomics : undefined));
+    const count = backendCount ?? getSharedFeatureCountForGroup(group);
     return count >= 10;
   });
 
@@ -490,7 +517,7 @@ function InlineFSContent({ onBack }: { onBack?: () => void }) {
     );
     const testingDsWithCv = state.dpDatasets.filter(d => 
       d.fs_datasetPurpose === "test" && 
-      (d.fs_validationStrategy === "cv-only" || d.fs_validationStrategy === "cv-and-test")
+      (d.fs_validationStrategy === "cv-only" || d.fs_validationStrategy === "cv-and-test" || fsConfig.cvEnabled)
     );
 
     if (isCombinedPool) {
@@ -531,8 +558,7 @@ function InlineFSContent({ onBack }: { onBack?: () => void }) {
       d.fs_datasetPurpose === "train-and-test" || 
       d.fs_datasetPurpose === "train-and-cv" || 
       d.fs_datasetPurpose === "train-cv-test" ||
-      !d.fs_datasetPurpose ||
-      (d.fs_datasetPurpose === "test" && (d.fs_validationStrategy === "cv-only" || d.fs_validationStrategy === "cv-and-test"))
+      !d.fs_datasetPurpose
   );
 
   const processedCVList = useMemo(() => {
@@ -541,7 +567,7 @@ function InlineFSContent({ onBack }: { onBack?: () => void }) {
            d.fs_datasetPurpose === "train-and-cv" || d.fs_datasetPurpose === "train-cv-test" || !d.fs_datasetPurpose
     );
     const testingDs = allDs.filter(
-      d => d.fs_datasetPurpose === "test" && (d.fs_validationStrategy === "cv-only" || d.fs_validationStrategy === "cv-and-test")
+      d => d.fs_datasetPurpose === "test" && (d.fs_validationStrategy === "cv-only" || d.fs_validationStrategy === "cv-and-test" || fsConfig.cvEnabled)
     );
 
     const mode = fsConfig.multiDatasetMode ?? "combine";
@@ -731,22 +757,22 @@ function InlineFSContent({ onBack }: { onBack?: () => void }) {
   useEffect(() => {
     if (trainSize < 80) {
       if (fsConfig.cvMethod !== "loocv") {
-        dispatch({ type: "FS_SET_CONFIG", patch: { cvMethod: "loocv" } });
+        dispatch({ type: "DP_INLINE_FS_SET_CONFIG", patch: { cvMethod: "loocv" } });
       }
       if (fsConfig.cvFolds !== -1) {
-        dispatch({ type: "FS_SET_CONFIG", patch: { cvFolds: -1 } });
+        dispatch({ type: "DP_INLINE_FS_SET_CONFIG", patch: { cvFolds: -1 } });
       }
     } else {
       if (fsConfig.cvMethod !== "k_fold") {
-        dispatch({ type: "FS_SET_CONFIG", patch: { cvMethod: "k_fold" } });
+        dispatch({ type: "DP_INLINE_FS_SET_CONFIG", patch: { cvMethod: "k_fold" } });
       }
       if (trainSize <= 150) {
         if (fsConfig.cvFolds !== 5) {
-          dispatch({ type: "FS_SET_CONFIG", patch: { cvFolds: 5 } });
+          dispatch({ type: "DP_INLINE_FS_SET_CONFIG", patch: { cvFolds: 5 } });
         }
       } else {
         if (fsConfig.cvFolds !== 5 && fsConfig.cvFolds !== 10) {
-          dispatch({ type: "FS_SET_CONFIG", patch: { cvFolds: 5 } });
+          dispatch({ type: "DP_INLINE_FS_SET_CONFIG", patch: { cvFolds: 5 } });
         }
       }
     }
@@ -754,7 +780,7 @@ function InlineFSContent({ onBack }: { onBack?: () => void }) {
 
   useEffect(() => {
     if (!cvAllowed && fsConfig.cvEnabled) {
-      dispatch({ type: "FS_SET_CONFIG", patch: { cvEnabled: false } });
+      dispatch({ type: "DP_INLINE_FS_SET_CONFIG", patch: { cvEnabled: false } });
     }
   }, [cvAllowed, fsConfig.cvEnabled, dispatch]);
 
@@ -763,6 +789,9 @@ function InlineFSContent({ onBack }: { onBack?: () => void }) {
   dataTypes.forEach(t => { typeCounts[t] = (typeCounts[t] || 0) + 1; });
   
   // Find group datasets of same hierarchy
+  const generalDatasets = allDs.filter(
+    d => getHierarchyGroup(d.dataType || "readcounts") === "general"
+  );
   const transcriptomicsDatasets = allDs.filter(
     d => getHierarchyGroup(d.dataType || "readcounts") === "transcriptomics"
   );
@@ -770,16 +799,15 @@ function InlineFSContent({ onBack }: { onBack?: () => void }) {
     d => getHierarchyGroup(d.dataType || "readcounts") === "proteomics"
   );
 
+  const sharedGeneralCount = getSharedFeatureCountForGroup(generalDatasets);
   const sharedTranscriptomicsCount = getSharedFeatureCountForGroup(transcriptomicsDatasets);
   const sharedProteomicsCount = getSharedFeatureCountForGroup(proteomicsDatasets);
-
-  // Authoritative shared feature counts from backend (full expression matrix, not 100-row preview)
-  const [backendSharedCounts, setBackendSharedCounts] = useState<{ transcriptomics?: number; proteomics?: number }>({});
 
   useEffect(() => {
     let cancelled = false;
     const fetchTypeCounts = async () => {
-      const groups: Array<{ key: "transcriptomics" | "proteomics"; ds: typeof allDs }> = [
+      const groups: Array<{ key: "general" | "transcriptomics" | "proteomics"; ds: typeof allDs }> = [
+        { key: "general",         ds: generalDatasets },
         { key: "transcriptomics", ds: transcriptomicsDatasets },
         { key: "proteomics",      ds: proteomicsDatasets },
       ];
@@ -789,6 +817,7 @@ function InlineFSContent({ onBack }: { onBack?: () => void }) {
           const res = await fetchDatasetInfoAPI(ds.map(d => d.id), "fs");
           if (!cancelled && res?.sharedFeaturesCount !== undefined) {
             setBackendSharedCounts(prev => ({ ...prev, [key]: res.sharedFeaturesCount }));
+            dispatch({ type: "SET_FS_SHARED_COUNTS", counts: { [key]: res.sharedFeaturesCount } });
           }
         } catch (_) { /* keep parsedData fallback */ }
       }
@@ -798,6 +827,7 @@ function InlineFSContent({ onBack }: { onBack?: () => void }) {
   }, [allDs]);
 
   // Use backend count when available; fall back to parsedData intersection (100-row preview only)
+  const sharedGeneralCountFinal = backendSharedCounts.general ?? sharedGeneralCount;
   const sharedTranscriptomicsCountFinal = backendSharedCounts.transcriptomics ?? sharedTranscriptomicsCount;
   const sharedProteomicsCountFinal = backendSharedCounts.proteomics ?? sharedProteomicsCount;
 
@@ -811,13 +841,13 @@ function InlineFSContent({ onBack }: { onBack?: () => void }) {
   useEffect(() => {
     // 1. Check CV by default
     if (fsConfig.cvEnabled === undefined) {
-      dispatch({ type: "FS_SET_CONFIG", patch: { cvEnabled: true } });
+      dispatch({ type: "DP_INLINE_FS_SET_CONFIG", patch: { cvEnabled: true } });
     }
   }, [fsConfig.cvEnabled, dispatch]);
 
   useEffect(() => {
     if (!isSingleDataset && hasPoolableTypesAndSufficientFeatures && fsConfig.multiDatasetMode !== "combine") {
-      dispatch({ type: "FS_SET_CONFIG", patch: { multiDatasetMode: "combine" } });
+      dispatch({ type: "DP_INLINE_FS_SET_CONFIG", patch: { multiDatasetMode: "combine" } });
     }
   }, [isSingleDataset, hasPoolableTypesAndSufficientFeatures, fsConfig.multiDatasetMode, dispatch]);
 
@@ -932,12 +962,8 @@ function InlineFSContent({ onBack }: { onBack?: () => void }) {
     dispatch({ type: "DP_UPDATE_DATASET", id: ds.id, patch } as never);
   };
 
-  const handleClear = async () => {
-    try {
-      await clearDatasetAPI(ds.id, "clinical");
-    } catch (e) {
-      console.warn("clearDatasetAPI failed (non-fatal):", e);
-    }
+  const handleClear = () => {
+    clearDatasetAPI(ds.id, "clinical").catch((e) => console.warn("clearDatasetAPI failed (non-fatal):", e));
     updateDs({
       clinicalFile: null,
       clinicalFileName: "",
@@ -1070,7 +1096,7 @@ function InlineFSContent({ onBack }: { onBack?: () => void }) {
     const next = fsConfig.selectedModels.includes(id)
       ? fsConfig.selectedModels.filter(m => m !== id)
       : [...fsConfig.selectedModels, id];
-    dispatch({ type: "FS_SET_CONFIG", patch: { selectedModels: next } });
+    dispatch({ type: "DP_INLINE_FS_SET_CONFIG", patch: { selectedModels: next } });
     if (!fsConfig.selectedModels.includes(id)) {
       setExpandedModels(prev => new Set([...prev, id]));
     }
@@ -1139,13 +1165,57 @@ function InlineFSContent({ onBack }: { onBack?: () => void }) {
     return val;
   };
 
+  const abortSelectionRef = useRef<AbortController | null>(null);
+  const activeFSJobIdRef = useRef<string | null>(null);
+  const abortRefitRef = useRef<AbortController | null>(null);
+  const activeRefitJobIdRef = useRef<string | null>(null);
+  const abortCVRef = useRef<AbortController | null>(null);
+  const activeCVJobIdRef = useRef<string | null>(null);
+
+  const cancelSelection = async () => {
+    abortSelectionRef.current?.abort();
+    if (activeFSJobIdRef.current) {
+      await cancelFSJobAPI(activeFSJobIdRef.current, true);
+    }
+    setLoadingSelection(false);
+    activeFSJobIdRef.current = null;
+  };
+
+  const cancelRefit = async () => {
+    abortRefitRef.current?.abort();
+    if (activeRefitJobIdRef.current) {
+      await cancelComputeJobAPI(activeRefitJobIdRef.current);
+    }
+    setIsRefitting(false);
+    activeRefitJobIdRef.current = null;
+  };
+
+  const cancelCV = async () => {
+    abortCVRef.current?.abort();
+    if (activeCVJobIdRef.current) {
+      await cancelComputeJobAPI(activeCVJobIdRef.current);
+    }
+    setLoadingCV(false);
+    activeCVJobIdRef.current = null;
+  };
+
   const handleRunSelection = async () => {
+    abortSelectionRef.current = new AbortController();
     setTrainElapsed(0);
     setLoadingSelection(true);
     if (doneSelection) {
       try {
-        await redoStepAPI("fs", state.dpDatasets.map(d => d.id));
-      } catch (e) {
+        await redoStepAPI(
+          "fs",
+          state.dpDatasets.map(d => d.id),
+          (info) => { activeFSJobIdRef.current = info.jobId; },
+          abortSelectionRef.current.signal
+        );
+      } catch (e: any) {
+        if (e?.name === "AbortError" || abortSelectionRef.current?.signal.aborted) {
+          setLoadingSelection(false);
+          return;
+        }
         console.error(e);
       }
     }
@@ -1157,8 +1227,12 @@ function InlineFSContent({ onBack }: { onBack?: () => void }) {
         state.dpDatasets[0]?.fs_trainRatio ?? 0.7,
         fullParams,
         undefined,
-        (info) => setTrainElapsed(info.elapsed),
-        fsConfig.multiDatasetMode ?? "combine"
+        (info) => {
+          activeFSJobIdRef.current = info.jobId;
+          setTrainElapsed(info.elapsed);
+        },
+        fsConfig.multiDatasetMode ?? "combine",
+        abortSelectionRef.current.signal
       );
       if (response) {
         setSelectionJobId(response.jobId || "");
@@ -1205,8 +1279,12 @@ function InlineFSContent({ onBack }: { onBack?: () => void }) {
       setSubmittedSelectionParams(null);
       setDoneSelection(true);
       setIsRefitted(false);
+      dispatch({ type: "DP_INLINE_FS_SUBMIT_CONFIG" });
       dispatch({ type: "SET_DP_INLINE_FS_DONE", done: true });
     } catch (err: any) {
+      if (err?.name === "AbortError" || err?.message?.includes("Aborted") || err?.message?.includes("Unknown job id")) {
+        return;
+      }
       console.error("Inline run selection error:", err);
       toast({
         title: "Model Training Failed",
@@ -1215,6 +1293,7 @@ function InlineFSContent({ onBack }: { onBack?: () => void }) {
       });
     } finally {
       setLoadingSelection(false);
+      activeFSJobIdRef.current = null;
     }
   };
 
@@ -1278,7 +1357,7 @@ function InlineFSContent({ onBack }: { onBack?: () => void }) {
   const revertToSubmittedSettings = () => {
     if (!submittedSelectionCfg) return;
     dispatch({
-      type: "FS_SET_CONFIG",
+      type: "DP_INLINE_FS_SET_CONFIG",
       patch: {
         selectedModels: [...submittedSelectionCfg.selectedModels]
       }
@@ -1312,13 +1391,18 @@ function InlineFSContent({ onBack }: { onBack?: () => void }) {
       return;
     }
 
+    abortRefitRef.current = new AbortController();
     setIsRefitting(true);
     try {
       const refitResponse = await refitFeaturesAPI(
         selectionJobId,
         selectionMethod,
         selectionMethod === "percentage" ? percentageValue : null,
-        selectionMethod === "max_features" ? maxFeaturesValue : null
+        selectionMethod === "max_features" ? maxFeaturesValue : null,
+        (info) => {
+          activeRefitJobIdRef.current = info.jobId;
+        },
+        abortRefitRef.current.signal
       );
       if (refitResponse) {
         const firstDsId = Object.keys(refitResponse)[0];
@@ -1341,6 +1425,9 @@ function InlineFSContent({ onBack }: { onBack?: () => void }) {
         });
       }
     } catch (err: any) {
+      if (err?.name === "AbortError" || err?.message?.includes("Aborted") || err?.message?.includes("Unknown job id")) {
+        return;
+      }
       console.error("Refit features error:", err);
       toast({
         title: "Feature Refitting Failed",
@@ -1349,6 +1436,7 @@ function InlineFSContent({ onBack }: { onBack?: () => void }) {
       });
     } finally {
       setIsRefitting(false);
+      activeRefitJobIdRef.current = null;
     }
   };
 
@@ -1358,12 +1446,22 @@ function InlineFSContent({ onBack }: { onBack?: () => void }) {
   );
 
   const handleRunCV = async () => {
+    abortCVRef.current = new AbortController();
     setLoadingCV(true);
     if (doneCV) {
       dispatch({ type: "DP_SET_CV_CACHE", results: null });
       try {
-        await redoStepAPI("cv", state.dpDatasets.map(d => d.id));
-      } catch (e) {
+        await redoStepAPI(
+          "cv",
+          state.dpDatasets.map(d => d.id),
+          undefined,
+          abortCVRef.current.signal
+        );
+      } catch (e: any) {
+        if (e?.name === "AbortError" || abortCVRef.current?.signal.aborted) {
+          setLoadingCV(false);
+          return;
+        }
         console.error(e);
       }
     }
@@ -1372,14 +1470,23 @@ function InlineFSContent({ onBack }: { onBack?: () => void }) {
         fsConfig.selectedModels,
         fsConfig.cvMethod,
         fsConfig.cvFolds,
-        state.dpDatasets
+        state.dpDatasets,
+        fsConfig.multiDatasetMode ?? "combine",
+        (info) => {
+          activeCVJobIdRef.current = info.jobId;
+        },
+        abortCVRef.current.signal
       );
       setSubmittedCVCfg({ cvMethod: fsConfig.cvMethod, cvFolds: fsConfig.cvFolds });
       setInlineCvResults(results);
       dispatch({ type: "DP_SET_CV_CACHE", results });
       setDoneCV(true);
+      dispatch({ type: "DP_INLINE_FS_SUBMIT_CONFIG" });
       dispatch({ type: "SET_DP_INLINE_FS_DONE", done: true });
     } catch (err: any) {
+      if (err?.name === "AbortError" || err?.message?.includes("Aborted") || err?.message?.includes("Unknown job id")) {
+        return;
+      }
       console.error("Inline run CV error:", err);
       toast({
         title: "Cross-Validation Failed",
@@ -1388,6 +1495,7 @@ function InlineFSContent({ onBack }: { onBack?: () => void }) {
       });
     } finally {
       setLoadingCV(false);
+      activeCVJobIdRef.current = null;
     }
   };
 
@@ -1414,8 +1522,8 @@ function InlineFSContent({ onBack }: { onBack?: () => void }) {
     return (
       <>
         {localLoading && <Spinner label={localLoadingMsg} sublabel="Please wait…" />}
-        {loadingSelection && <Spinner label="Running feature selection…" sublabel={trainElapsed > 0 ? `Training ${fsConfig.selectedModels.length} model(s) — ${Math.round(trainElapsed)}s elapsed` : `Training ${fsConfig.selectedModels.length} model(s) — estimated ~${Math.max(5, fsConfig.selectedModels.length * 3)}s`} />}
-        {isRefitting && <Spinner label="Refitting features…" sublabel="Retraining models on selected feature subset…" />}
+        {loadingSelection && <Spinner label="Running feature selection…" sublabel={trainElapsed > 0 ? `Training ${fsConfig.selectedModels.length} model(s) — ${Math.round(trainElapsed)}s elapsed` : `Training ${fsConfig.selectedModels.length} model(s) — estimated ~${Math.max(5, fsConfig.selectedModels.length * 3)}s`} onCancel={cancelSelection} />}
+        {isRefitting && <Spinner label="Refitting features…" sublabel="Retraining models on selected feature subset…" onCancel={cancelRefit} />}
 
         <div className="card" style={{ marginBottom: 14, display: "none" }}>
           <div className="card-header" style={{ marginBottom: 0 }}>
@@ -1449,7 +1557,7 @@ function InlineFSContent({ onBack }: { onBack?: () => void }) {
               onDragLeave={() => setClinicalDrag(false)}
               onDrop={e => { e.preventDefault(); setClinicalDrag(false); const f = e.dataTransfer.files?.[0]; if (f) handleClinicalFile(f); }}
               data-testid="dropzone-clinical">
-              <div className="drop-zone-icon">🧬</div>
+              <div className="drop-zone-icon"><FileSpreadsheet size={32} /></div>
               <div className="drop-zone-title">Drop clinical metadata file here</div>
               <div className="drop-zone-hint">CSV · TSV &nbsp;·&nbsp; SampleID + Group columns required</div>
             </div>
@@ -1623,8 +1731,9 @@ function InlineFSContent({ onBack }: { onBack?: () => void }) {
               <div style={{ fontSize: 11, color: "var(--muted-foreground)", marginBottom: 8 }}>
                 Multiple datasets of the same data type detected.
               </div>
-              <div className="banner info" style={{ marginTop: 0, fontSize: 12 }}>
-                ℹ️ <strong>Automatic Pooling:</strong> Datasets of the same type and hierarchy will be pooled and batch-corrected using ComBat/limma before feature selection.
+              <div className="banner info" style={{ marginTop: 0, fontSize: 12, display: "flex", alignItems: "center", gap: 6 }}>
+                <Info size={14} style={{ flexShrink: 0 }} />
+                <span><strong>Automatic Pooling:</strong> Datasets of the same type and hierarchy will be pooled and batch-corrected using ComBat/limma before feature selection.</span>
               </div>
             </div>
           )}
@@ -1993,7 +2102,7 @@ function InlineFSContent({ onBack }: { onBack?: () => void }) {
               type="checkbox"
               checked={fsConfig.cvEnabled || hasCvOnly}
               disabled={hasCvOnly}
-              onChange={e => dispatch({ type: "FS_SET_CONFIG", patch: { cvEnabled: e.target.checked } })}
+              onChange={e => dispatch({ type: "DP_INLINE_FS_SET_CONFIG", patch: { cvEnabled: e.target.checked } })}
               style={{ accentColor: "var(--primary)", width: 16, height: 16 }}
               data-testid="check-cv-enabled"
             />
@@ -2021,6 +2130,15 @@ function InlineFSContent({ onBack }: { onBack?: () => void }) {
             </div>
           )}
         </div>
+
+        {transcriptomicsDatasets.some(d => d.hasNA) && (
+          <div className="banner warn" style={{ marginBottom: 14 }}>
+            <AlertTriangle size={15} style={{ flexShrink: 0 }} />
+            <span>
+              <strong>Notice:</strong> One or more datasets contain missing values in the expression matrix. The system will automatically impute missing values using KNN imputation during model training.
+            </span>
+          </div>
+        )}
 
         {/* Model Cards */}
         <div className="card" style={{ marginBottom: 14 }}>
@@ -2212,12 +2330,18 @@ function InlineFSContent({ onBack }: { onBack?: () => void }) {
 
 
           {fsConfig.selectedModels.length === 0 && (
-            <div className="banner warn" style={{ marginTop: 12 }}>⚠ Select at least one model to proceed.</div>
+            <div className="banner warn" style={{ marginTop: 12, display: "flex", alignItems: "center", gap: 6 }}>
+              <AlertTriangle size={14} style={{ flexShrink: 0 }} />
+              <span>Select at least one model to proceed.</span>
+            </div>
           )}
           {fsConfig.selectedModels.length > 0 && (
-            <div className="banner info" style={{ marginTop: 12 }}>
-              ✓ <strong>{fsConfig.selectedModels.length} model(s) selected</strong>: {fsConfig.selectedModels.join(", ")}.
-              {fsConfig.cvEnabled && " Cross-validation will tune their hyperparameters."}
+            <div className="banner info" style={{ marginTop: 12, display: "flex", alignItems: "center", gap: 6 }}>
+              <Check size={14} style={{ flexShrink: 0 }} />
+              <span>
+                <strong>{fsConfig.selectedModels.length} model(s) selected</strong>: {fsConfig.selectedModels.join(", ")}.
+                {fsConfig.cvEnabled && " Cross-validation will tune their hyperparameters."}
+              </span>
             </div>
           )}
         </div>
@@ -2255,7 +2379,10 @@ function InlineFSContent({ onBack }: { onBack?: () => void }) {
               return (
                 <div key={d.id} style={{ display: "flex", flexDirection: "column", gap: 14 }}>
                   {dsWarnings.map((w, i) => (
-                    <div key={`w${i}`} className="banner warn" style={{ marginTop: 0 }}>⚠ {w}</div>
+                    <div key={`w${i}`} className="banner warn" style={{ marginTop: 0, display: "flex", alignItems: "center", gap: 6 }}>
+                      <AlertTriangle size={14} style={{ flexShrink: 0 }} />
+                      <span>{w}</span>
+                    </div>
                   ))}
                   {features.length > 0 && (
                     <div className="card" style={{ marginBottom: 0, opacity: hasSelectionSettingsChanged ? 0.65 : 1, transition: "opacity 0.2s ease" }}>
@@ -2474,6 +2601,72 @@ function InlineFSContent({ onBack }: { onBack?: () => void }) {
                       </div>
                     </div>
                   )}
+                </div>
+              );
+            })}
+            {(isRefitted || isOnlyBorutaStabl) && !hasSelectionMethodChanged && !hasTrainingSettingsChanged && testingDatasets.map(t => {
+              const dsRes = getDatasetResults(t.id);
+              if (!dsRes || !dsRes.performance_metrics) return null;
+              return (
+                <div key={t.id} className="card">
+                  <div className="card-title" style={{ marginBottom: 4, fontSize: 13 }}>
+                    Model Training Performance (Validation Refit — {t.name} · {formatDataTypeLabel(t.dataType || "readcounts")})
+                  </div>
+                  <div className="card-sub">
+                    Models B refitted on {t.name} training partition using the feature signature selected on the training data type.
+                  </div>
+                  <hr className="card-divider" />
+                  <div style={{ display: "grid", gridTemplateColumns: "1fr", gap: 20 }}>
+                    {dsRes.roc_plot && (
+                      <div style={{ display: "flex", flexDirection: "column", gap: 8, border: "1px solid var(--border)", borderRadius: 8, padding: 12, background: "var(--muted)" }}>
+                        <div style={{ fontSize: 12, fontWeight: 600, color: "var(--foreground)" }}>ROC Curves</div>
+                        <div style={{ display: "flex", justifyContent: "center" }}>
+                          <img src={`data:image/png;base64,${dsRes.roc_plot}`} style={{ width: 700, height: 400, objectFit: "contain", borderRadius: 8 }} alt="ROC Curves" />
+                        </div>
+                      </div>
+                    )}
+                    <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+                      {[...fsConfig.selectedModels].sort((a, b) => {
+                        const order = ["stabl", "boruta", "gbm", "randomforest", "logistic", "svm"];
+                        return order.indexOf(a) - order.indexOf(b);
+                      }).map(m => {
+                        const metrics = dsRes.performance_metrics?.[m] || { auc: 0.5, acc: 0.5, ppv: 0.5, npv: 0.5 };
+                        const modelName = MODEL_LABELS[m] || m;
+                        return (
+                          <div key={m} style={{ padding: "8px 12px", border: "1px solid var(--border)", borderRadius: 8, background: "white" }}>
+                            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 8 }}>
+                              <div style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, fontWeight: 600 }}>
+                                <div style={{ width: 6, height: 6, background: MODEL_COLORS[m], borderRadius: "50%" }} />
+                                {modelName}
+                              </div>
+                            </div>
+                            <div className="chips-row">
+                              <div className="stat-chip">
+                                <div className="stat-chip-val" style={{ color: "var(--primary)" }}>{formatMetric(metrics?.auc, 0.5, 3)}</div>
+                                <div className="stat-chip-lbl">AUC</div>
+                              </div>
+                              <div className="stat-chip" style={{ minWidth: 160 }}>
+                                <div className="stat-chip-val">{formatCi(metrics?.ci, metrics?.ci_lower, metrics?.ci_upper)}</div>
+                                <div className="stat-chip-lbl">95% CI</div>
+                              </div>
+                              <div className="stat-chip">
+                                <div className="stat-chip-val">{formatMetric(metrics?.acc, 0.5, 3)}</div>
+                                <div className="stat-chip-lbl">Balanced Accuracy</div>
+                              </div>
+                              <div className="stat-chip">
+                                <div className="stat-chip-val">{formatMetric(metrics?.ppv, 0.5, 3)}</div>
+                                <div className="stat-chip-lbl">PPV</div>
+                              </div>
+                              <div className="stat-chip">
+                                <div className="stat-chip-val">{formatMetric(metrics?.npv, 0.5, 3)}</div>
+                                <div className="stat-chip-lbl">NPV</div>
+                              </div>
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
                 </div>
               );
             })}
@@ -2712,8 +2905,10 @@ function InlineFSContent({ onBack }: { onBack?: () => void }) {
                   }
                 }}
                 data-testid="btn-redo-fs"
+                style={{ display: "inline-flex", alignItems: "center", gap: 6 }}
               >
-                🔄 Redo Model Training
+                <RotateCcw size={14} />
+                <span>Redo Model Training</span>
               </button>
             )}
 
@@ -2721,12 +2916,19 @@ function InlineFSContent({ onBack }: { onBack?: () => void }) {
             {!hasTrainingSettingsChanged && doneSelection && hasAnyRankModel && hasSelectionMethodChanged && (
               <button
                 className="btn btn-default"
-                style={{ borderColor: "var(--primary)", color: "var(--primary)" }}
+                style={{ borderColor: "var(--primary)", color: "var(--primary)", display: "inline-flex", alignItems: "center", gap: 6 }}
                 disabled={isRefitting || loadingSelection}
                 onClick={handleRefitSelection}
                 data-testid="btn-redo-inline-fs-selection"
               >
-                {isRefitting ? "Refitting Features…" : "🔄 Redo Selecting Features"}
+                {isRefitting ? (
+                  "Refitting Features…"
+                ) : (
+                  <>
+                    <RotateCcw size={14} />
+                    <span>Redo Selecting Features</span>
+                  </>
+                )}
               </button>
             )}
 
@@ -2893,7 +3095,7 @@ function InlineFSContent({ onBack }: { onBack?: () => void }) {
   return (
     <>
       {localLoading && <Spinner label={localLoadingMsg} sublabel="Please wait…" />}
-      {loadingCV && <Spinner label="Running cross-validation…" sublabel="Searching parameter space…" />}
+      {loadingCV && <Spinner label="Running cross-validation…" sublabel="Searching parameter space…" onCancel={cancelCV} />}
 
       {/* CV Method */}
       <div className="card" style={{ marginBottom: 14 }}>
@@ -2910,7 +3112,7 @@ function InlineFSContent({ onBack }: { onBack?: () => void }) {
               background: fsConfig.cvMethod === m.id ? "var(--selected-bg)" : "white",
             }}>
               <input type="radio" checked={fsConfig.cvMethod === m.id}
-                onChange={() => dispatch({ type: "FS_SET_CONFIG", patch: { cvMethod: m.id } })}
+                onChange={() => dispatch({ type: "DP_INLINE_FS_SET_CONFIG", patch: { cvMethod: m.id } })}
                 style={{ accentColor: "var(--primary)", marginTop: 2 }} />
               <div>
                 <div style={{ fontSize: 13, fontWeight: 600, color: "var(--foreground)" }}>{m.label}</div>
@@ -2938,7 +3140,7 @@ function InlineFSContent({ onBack }: { onBack?: () => void }) {
                       background: fsConfig.cvFolds === val ? "var(--selected-bg)" : "white",
                     }}>
                       <input type="radio" name="cvFolds_rand" checked={fsConfig.cvFolds === val}
-                        onChange={() => dispatch({ type: "FS_SET_CONFIG", patch: { cvFolds: val } })}
+                        onChange={() => dispatch({ type: "DP_INLINE_FS_SET_CONFIG", patch: { cvFolds: val } })}
                         style={{ accentColor: "var(--primary)", marginTop: 2 }} />
                       <div>
                         <div style={{ fontSize: 13, fontWeight: 600, color: "var(--foreground)" }}>{label}</div>
@@ -2967,7 +3169,10 @@ function InlineFSContent({ onBack }: { onBack?: () => void }) {
                   Cross-Validation Results - {displayLabel} {hasCVSettingsChanged && <span style={{ fontSize: 12, color: "hsl(38 85% 35%)", fontWeight: 400, marginLeft: 8 }}>(Outdated - settings changed)</span>}
                 </div>
 
-                <div className="banner success" style={{ marginBottom: 12 }}>✅ Cross-validation complete.</div>
+                <div className="banner success" style={{ marginBottom: 12, display: "flex", alignItems: "center", gap: 6 }}>
+                  <CheckCircle2 size={15} style={{ flexShrink: 0 }} />
+                  <span>Cross-validation complete.</span>
+                </div>
 
                 {getCVRocPlotForDataset(d.id) && (
                   <div style={{ display: "flex", justifyContent: "center", marginBottom: 14 }}>
@@ -3091,8 +3296,10 @@ function InlineFSContent({ onBack }: { onBack?: () => void }) {
                 }
               }}
               data-testid="btn-redo-cv"
+              style={{ display: "inline-flex", alignItems: "center", gap: 6 }}
             >
-              🔄 Redo Cross-Validation
+              <RotateCcw size={14} />
+              <span>Redo Cross-Validation</span>
             </button>
           )}
 

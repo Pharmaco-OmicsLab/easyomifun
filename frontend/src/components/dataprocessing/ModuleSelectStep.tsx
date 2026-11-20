@@ -1,3 +1,4 @@
+import { Package, BarChart3, Dna, Search, Check } from "lucide-react";
 import { useAppStore } from "../../store/appStore";
 import { computeDPSteps, isEAEligible } from "../../dataObject";
 import type { SelectedModule } from "../../dataObject";
@@ -16,25 +17,29 @@ export default function ModuleSelectStep() {
 
   // Dynamically build the list of available modules
 
+  const toggle = (mod: SelectedModule) => {
+    dispatch({ type: "DP_SET_MODULE", module: mod });
+  };
+
   const modules = [
     {
-      id: null as SelectedModule, icon: "📦", title: "Export Only",
+      id: null as SelectedModule, icon: <Package size={36} style={{ margin: "0 auto" }} />, title: "Export Only",
       desc: "Export processed and normalized expression data directly. No downstream analysis.",
     },
     {
-      id: "de" as SelectedModule, icon: "📊", title: "Add Differential Expression",
+      id: "de" as SelectedModule, icon: <BarChart3 size={36} style={{ margin: "0 auto" }} />, title: "Add Differential Expression",
       desc: "Run Differential Expression Analysis on the processed data without re-uploading",
       badge: "DE Analysis",
     },
     // 1. Conditionally insert Enrichment Analysis right after DE
     ...(state.dpInlineDeDone && isEAEligible(state.dpDatasets, state.dpInlineMetaDone) ? [{
-      id: "enrichment" as SelectedModule, icon: "🧬", title: "Add Enrichment Analysis",
+      id: "enrichment" as SelectedModule, icon: <Dna size={36} style={{ margin: "0 auto" }} />, title: "Add Enrichment Analysis",
       desc: "Run pathway enrichment analysis (ORA / GSEA) on the differentially expressed genes",
       badge: "Enrichment Analysis",
     }] : []),
     // 2. Feature Selection conditionally goes last
     ...(canRenderFS ? [{
-      id: "feature-selection" as SelectedModule, icon: "🔍", title: "Add Feature Selection",
+      id: "feature-selection" as SelectedModule, icon: <Search size={36} style={{ margin: "0 auto" }} />, title: "Add Feature Selection",
       desc: "Apply machine learning model to select relevant features of the processed data",
       badge: "Feature Selection",
     }] : []),
@@ -78,8 +83,17 @@ export default function ModuleSelectStep() {
           {modules.map(m => (
             <div
               key={String(m.id)}
+              role="button"
+              tabIndex={0}
               className={`module-choice-card ${selected === m.id ? "selected" : ""}`}
-              onClick={() => dispatch({ type: "DP_SET_MODULE", module: m.id })}
+              onClick={() => toggle(m.id)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" || e.key === " ") {
+                  e.preventDefault();
+                  toggle(m.id);
+                }
+              }}
+              style={selected === m.id ? { borderColor: "#1e40af", background: "#dbeafe" } : undefined}
               data-testid={`module-card-${m.id ?? "export"}`}
             >
               <div className="icon">{m.icon}</div>
@@ -88,45 +102,48 @@ export default function ModuleSelectStep() {
                 <div style={{
                   display: "inline-block", marginBottom: 8, fontSize: 10, fontWeight: 700,
                   padding: "2px 8px", borderRadius: 4,
-                  background: "var(--selected-bg)", color: "var(--foreground)",
-                  border: "1px solid var(--border)",
+                  background: selected === m.id ? "#dbeafe" : "var(--selected-bg)",
+                  color: selected === m.id ? "#1e40af" : "var(--foreground)",
+                  border: `1px solid ${selected === m.id ? "#1e40af" : "var(--border)"}`,
                 }}>
                   {m.badge}
                 </div>
               )}
               {m.id === "de" && state.dpInlineDeDone && (
                 <div style={{
-                  display: "inline-block", marginBottom: 8, fontSize: 10, fontWeight: 700,
+                  display: "inline-flex", alignItems: "center", gap: 3, marginBottom: 8, fontSize: 10, fontWeight: 700,
                   padding: "2px 8px", borderRadius: 4, marginLeft: 6,
                   background: "hsl(142 70% 93%)", color: "hsl(142 72% 29%)",
                   border: "1px solid hsl(142 70% 80%)",
                 }} data-testid="badge-de-done">
-                  ✓ Run Completed
+                  <Check size={11} /> Run Completed
                 </div>
               )}
               {m.id === "enrichment" && state.dpInlineEaDone && (
                 <div style={{
-                  display: "inline-block", marginBottom: 8, fontSize: 10, fontWeight: 700,
+                  display: "inline-flex", alignItems: "center", gap: 3, marginBottom: 8, fontSize: 10, fontWeight: 700,
                   padding: "2px 8px", borderRadius: 4, marginLeft: 6,
                   background: "hsl(142 70% 93%)", color: "hsl(142 72% 29%)",
                   border: "1px solid hsl(142 70% 80%)",
                 }} data-testid="badge-en-done">
-                  ✓ Run Completed
+                  <Check size={11} /> Run Completed
                 </div>
               )}
               {m.id === "feature-selection" && state.dpInlineFsDone && (
                 <div style={{
-                  display: "inline-block", marginBottom: 8, fontSize: 10, fontWeight: 700,
+                  display: "inline-flex", alignItems: "center", gap: 3, marginBottom: 8, fontSize: 10, fontWeight: 700,
                   padding: "2px 8px", borderRadius: 4, marginLeft: 6,
                   background: "hsl(142 70% 93%)", color: "hsl(142 72% 29%)",
                   border: "1px solid hsl(142 70% 80%)",
                 }} data-testid="badge-fs-done">
-                  ✓ Run Completed
+                  <Check size={11} /> Run Completed
                 </div>
               )}
               <div className="desc">{m.desc}</div>
               {selected === m.id && (
-                <div style={{ marginTop: 12, fontSize: 12, color: "var(--foreground)", fontWeight: 600 }}>✓ Selected</div>
+                <div style={{ marginTop: 12, fontSize: 12, color: "#1e40af", fontWeight: 600, display: "inline-flex", alignItems: "center", gap: 4 }}>
+                  <Check size={13} /> Selected
+                </div>
               )}
             </div>
           ))}

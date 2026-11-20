@@ -1,13 +1,15 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import { useLocation } from "wouter";
+import { AlertTriangle, CheckCircle2, RotateCcw } from "lucide-react";
 import { useAppStore } from "../../store/appStore";
 import { computeDPSteps } from "../../dataObject";
 import Spinner from "../Spinner";
 import SkipModal from "../shared/SkipModal";
 import ChangeWarnModal from "../shared/ChangeWarnModal";
 import DiscardWarnModal from "../shared/DiscardWarnModal";
+import InteractivePCAPlot from "../shared/InteractivePCAPlot";
 import type { NormMethod } from "../../dataObject";
-import { normalizeDatasetAPI, redoStepAPI } from "../../lib/api";
+import { normalizeDatasetAPI, redoStepAPI, cancelComputeJobAPI } from "../../lib/api";
 import { useToast } from "../../hooks/use-toast";
 
 interface Props { datasetId: string; mode?: "dp" | "de" }
@@ -80,8 +82,9 @@ function NormalizationCard({
               <div style={{ fontSize: 11, color: "var(--muted-foreground)", marginTop: 2 }}>{m.desc}</div>
               
               {m.value === "rlog" && effectiveMethod === "rlog" && nSamples > 30 && (
-                <div className="banner warn" style={{ marginTop: 8, marginBottom: 0, fontSize: 11, padding: "8px 10px" }}>
-                  ⚠ Sample size detected to be more than 30 ({nSamples} samples). We recommend using VST normalization for faster computation.
+                <div className="banner warn" style={{ marginTop: 8, marginBottom: 0, fontSize: 11, padding: "8px 10px", display: "flex", alignItems: "center", gap: 6 }}>
+                  <AlertTriangle size={13} style={{ flexShrink: 0 }} />
+                  <span>Sample size detected to be more than 30 ({nSamples} samples). We recommend using VST normalization for faster computation.</span>
                 </div>
               )}
             </div>
@@ -103,12 +106,15 @@ function NormalizationResultCard({ targetDs, submittedCfg }: { targetDs: any; su
         </div>
       </div>
       
-      <div className="banner success" style={{ marginBottom: 12 }}>
-        {targetDs.isNormalized ? (
-          <>✅ Dataset is pre-normalized.</>
-        ) : (
-          <>✅ Normalization complete using <strong>{allMethods.find(m => m.value === (targetDs.normalizationMethod || submittedCfg?.method))?.label || "TMM"}</strong>{(targetDs.normalizationLogTransform !== undefined ? targetDs.normalizationLogTransform : submittedCfg?.logTransform) ? ` with ${targetDs.normalizationTransformationType === "log10" || submittedCfg?.transformationType === "log10" ? "log₁₀" : "log₂"} transformation` : ""}.</>
-        )}
+      <div className="banner success" style={{ marginBottom: 12, display: "flex", alignItems: "center", gap: 6 }}>
+        <CheckCircle2 size={15} style={{ flexShrink: 0 }} />
+        <div>
+          {targetDs.isNormalized ? (
+            <>Dataset is pre-normalized.</>
+          ) : (
+            <>Normalization complete using <strong>{allMethods.find(m => m.value === (targetDs.normalizationMethod || submittedCfg?.method))?.label || "TMM"}</strong>{(targetDs.normalizationLogTransform !== undefined ? targetDs.normalizationLogTransform : submittedCfg?.logTransform) ? ` with ${targetDs.normalizationTransformationType === "log10" || submittedCfg?.transformationType === "log10" ? "log₁₀" : "log₂"} transformation` : ""}.</>
+          )}
+        </div>
       </div>
       
       <div className="chips-row">
@@ -250,8 +256,20 @@ export default function CountNormalizationStep({ datasetId, mode = "dp" }: Props
   if (state.dpInlineEaDone) completedModules.push("Enrichment Analysis");
 
   const downstreamDone = completedModules.length > 0;
+  const abortControllerRef = useRef<AbortController | null>(null);
+  const activeJobIdRef = useRef<string | null>(null);
+
+  const handleCancel = async () => {
+    abortControllerRef.current?.abort();
+    if (activeJobIdRef.current) {
+      await cancelComputeJobAPI(activeJobIdRef.current);
+    }
+    setLoading(false);
+    activeJobIdRef.current = null;
+  };
 
   const runNorm = async () => {
+    abortControllerRef.current = new AbortController();
     setLoading(true);
     try {
       if (rcDatasets.length > 0) {
@@ -262,28 +280,38 @@ export default function CountNormalizationStep({ datasetId, mode = "dp" }: Props
           transformationType: (!isBuiltIn && transformEnabled) ? transformType : "none",
           priorCount: isBuiltIn ? 0 : cfg.priorCount
         };
-        const results = await normalizeDatasetAPI(rcDatasets, activeRcConfig);
+        const results = await normalizeDatasetAPI(
+          rcDatasets,
+          activeRcConfig,
+          (info) => { activeJobIdRef.current = info.jobId; },
+          abortControllerRef.current.signal
+        );
         dispatch({ type: "DP_SUBMIT_NORM" });
-        results.forEach(res => {
-          const targetDs = rcDatasets.find(d => d.id === res.datasetId);
-          dispatch({
-            type: mode === "dp" ? "DP_UPDATE_DATASET" : "DE_UPDATE_DATASET",
-            id: res.datasetId,
-            patch: {
-              normalizationDone: true,
-              normalizationMethod: cfg.method,
-              normalizationLogTransform: !isBuiltIn && transformEnabled,
-              normalizationTransformationType: (!isBuiltIn && transformEnabled) ? transformType : "none",
-              parsedData: res.parsedData || undefined,
-              columns: res.columns || undefined,
-              sampleIds: res.sampleIds || undefined,
-              nFeatures: res.nFeatures || res.retainedFeatures || (res.parsedData && res.parsedData.length > 0 ? res.parsedData.length : (targetDs?.nFeatures || 0)),
-              nSamples: res.nSamples !== undefined ? res.nSamples : (targetDs?.nSamples || 0),
-              boxplotBefore: res.boxplotBefore || undefined,
-              boxplotAfter: res.boxplotAfter || undefined
-            }
+        if (Array.isArray(results)) {
+          results.forEach(res => {
+            if (!res || typeof res !== "object" || !res.datasetId) return;
+            const targetDs = rcDatasets.find(d => d.id === res.datasetId);
+            dispatch({
+              type: mode === "dp" ? "DP_UPDATE_DATASET" : "DE_UPDATE_DATASET",
+              id: res.datasetId,
+              patch: {
+                normalizationDone: true,
+                normalizationMethod: cfg.method,
+                normalizationLogTransform: !isBuiltIn && transformEnabled,
+                normalizationTransformationType: (!isBuiltIn && transformEnabled) ? transformType : "none",
+                parsedData: res.parsedData || undefined,
+                columns: res.columns || undefined,
+                sampleIds: res.sampleIds || undefined,
+                nFeatures: res.nFeatures || res.retainedFeatures || (res.parsedData && res.parsedData.length > 0 ? res.parsedData.length : (targetDs?.nFeatures || 0)),
+                nSamples: res.nSamples !== undefined ? res.nSamples : (targetDs?.nSamples || 0),
+                boxplotBefore: res.boxplotBefore || undefined,
+                boxplotAfter: res.boxplotAfter || undefined,
+                normalPca: res.normalPca || undefined,
+                qc: res.qc || targetDs?.qc || undefined
+              }
+            });
           });
-        });
+        }
       }
 
       if (proteomicsDatasets.length > 0) {
@@ -294,31 +322,41 @@ export default function CountNormalizationStep({ datasetId, mode = "dp" }: Props
           transformationType: (!isBuiltIn && transformEnabled) ? transformType : "none", 
           priorCount: 0 
         };
-        const results = await normalizeDatasetAPI(proteomicsDatasets, proteomicsCfg as any);
+        const results = await normalizeDatasetAPI(
+          proteomicsDatasets,
+          proteomicsCfg as any,
+          (info) => { activeJobIdRef.current = info.jobId; },
+          abortControllerRef.current.signal
+        );
         if (!rcDatasets.length && !othersDatasets.length) {
           dispatch({ type: "DP_SET_NORM", patch: proteomicsCfg });
           dispatch({ type: "DP_SUBMIT_NORM" });
         }
-        results.forEach(res => {
-          const targetDs = proteomicsDatasets.find(d => d.id === res.datasetId);
-          dispatch({
-            type: mode === "dp" ? "DP_UPDATE_DATASET" : "DE_UPDATE_DATASET",
-            id: res.datasetId,
-            patch: {
-              normalizationDone: true,
-              normalizationMethod: proteomicsMethod,
-              normalizationLogTransform: !isBuiltIn && transformEnabled,
-              normalizationTransformationType: (!isBuiltIn && transformEnabled) ? transformType : "none",
-              parsedData: res.parsedData || undefined,
-              columns: res.columns || undefined,
-              sampleIds: res.sampleIds || undefined,
-              nFeatures: res.nFeatures || res.retainedFeatures || (res.parsedData && res.parsedData.length > 0 ? res.parsedData.length : (targetDs?.nFeatures || 0)),
-              nSamples: res.nSamples !== undefined ? res.nSamples : (targetDs?.nSamples || 0),
-              boxplotBefore: res.boxplotBefore || undefined,
-              boxplotAfter: res.boxplotAfter || undefined
-            }
+        if (Array.isArray(results)) {
+          results.forEach(res => {
+            if (!res || typeof res !== "object" || !res.datasetId) return;
+            const targetDs = proteomicsDatasets.find(d => d.id === res.datasetId);
+            dispatch({
+              type: mode === "dp" ? "DP_UPDATE_DATASET" : "DE_UPDATE_DATASET",
+              id: res.datasetId,
+              patch: {
+                normalizationDone: true,
+                normalizationMethod: proteomicsMethod,
+                normalizationLogTransform: !isBuiltIn && transformEnabled,
+                normalizationTransformationType: (!isBuiltIn && transformEnabled) ? transformType : "none",
+                parsedData: res.parsedData || undefined,
+                columns: res.columns || undefined,
+                sampleIds: res.sampleIds || undefined,
+                nFeatures: res.nFeatures || res.retainedFeatures || (res.parsedData && res.parsedData.length > 0 ? res.parsedData.length : (targetDs?.nFeatures || 0)),
+                nSamples: res.nSamples !== undefined ? res.nSamples : (targetDs?.nSamples || 0),
+                boxplotBefore: res.boxplotBefore || undefined,
+                boxplotAfter: res.boxplotAfter || undefined,
+                normalPca: res.normalPca || undefined,
+                qc: res.qc || targetDs?.qc || undefined
+              }
+            });
           });
-        });
+        }
       }
 
       if (othersDatasets.length > 0) {
@@ -329,33 +367,46 @@ export default function CountNormalizationStep({ datasetId, mode = "dp" }: Props
           transformationType: (!isBuiltIn && transformEnabled) ? transformType : "none", 
           priorCount: 0 
         };
-        const results = await normalizeDatasetAPI(othersDatasets, othersCfg as any);
+        const results = await normalizeDatasetAPI(
+          othersDatasets,
+          othersCfg as any,
+          (info) => { activeJobIdRef.current = info.jobId; },
+          abortControllerRef.current.signal
+        );
         if (!rcDatasets.length && !proteomicsDatasets.length) {
           dispatch({ type: "DP_SET_NORM", patch: othersCfg });
           dispatch({ type: "DP_SUBMIT_NORM" });
         }
-        results.forEach(res => {
-          const targetDs = othersDatasets.find(d => d.id === res.datasetId);
-          dispatch({
-            type: mode === "dp" ? "DP_UPDATE_DATASET" : "DE_UPDATE_DATASET",
-            id: res.datasetId,
-            patch: {
-              normalizationDone: true,
-              normalizationMethod: othersMethod,
-              normalizationLogTransform: !isBuiltIn && transformEnabled,
-              normalizationTransformationType: (!isBuiltIn && transformEnabled) ? transformType : "none",
-              parsedData: res.parsedData || undefined,
-              columns: res.columns || undefined,
-              sampleIds: res.sampleIds || undefined,
-              nFeatures: res.nFeatures || res.retainedFeatures || (res.parsedData && res.parsedData.length > 0 ? res.parsedData.length : (targetDs?.nFeatures || 0)),
-              nSamples: res.nSamples !== undefined ? res.nSamples : (targetDs?.nSamples || 0),
-              boxplotBefore: res.boxplotBefore || undefined,
-              boxplotAfter: res.boxplotAfter || undefined
-            }
+        if (Array.isArray(results)) {
+          results.forEach(res => {
+            if (!res || typeof res !== "object" || !res.datasetId) return;
+            const targetDs = othersDatasets.find(d => d.id === res.datasetId);
+            dispatch({
+              type: mode === "dp" ? "DP_UPDATE_DATASET" : "DE_UPDATE_DATASET",
+              id: res.datasetId,
+              patch: {
+                normalizationDone: true,
+                normalizationMethod: othersMethod,
+                normalizationLogTransform: !isBuiltIn && transformEnabled,
+                normalizationTransformationType: (!isBuiltIn && transformEnabled) ? transformType : "none",
+                parsedData: res.parsedData || undefined,
+                columns: res.columns || undefined,
+                sampleIds: res.sampleIds || undefined,
+                nFeatures: res.nFeatures || res.retainedFeatures || (res.parsedData && res.parsedData.length > 0 ? res.parsedData.length : (targetDs?.nFeatures || 0)),
+                nSamples: res.nSamples !== undefined ? res.nSamples : (targetDs?.nSamples || 0),
+                boxplotBefore: res.boxplotBefore || undefined,
+                boxplotAfter: res.boxplotAfter || undefined,
+                normalPca: res.normalPca || undefined,
+                qc: res.qc || targetDs?.qc || undefined
+              }
+            });
           });
-        });
+        }
       }
     } catch (err: any) {
+      if (err?.name === "AbortError" || err?.message?.includes("Aborted") || err?.message?.includes("Unknown job id")) {
+        return;
+      }
       console.error("Normalization error:", err);
       toast({
         title: "Normalization Error",
@@ -364,6 +415,7 @@ export default function CountNormalizationStep({ datasetId, mode = "dp" }: Props
       });
     } finally {
       setLoading(false);
+      activeJobIdRef.current = null;
     }
   };
 
@@ -423,13 +475,19 @@ export default function CountNormalizationStep({ datasetId, mode = "dp" }: Props
           }}
         />
       )}
-      {loading && <Spinner label="Applying normalization…" sublabel={`Processing datasets…`} />}
+      {loading && (
+        <Spinner
+          label="Applying normalization…"
+          sublabel="Processing datasets…"
+          onCancel={handleCancel}
+        />
+      )}
 
       <div className="card">
         <div className="card-title" style={{ marginBottom: 4 }}>{sectionTitle}</div>
         <div className="card-sub" style={{ marginBottom: 16 }}>
           Select an appropriate normalization and transformation strategy for your data.
-          {targetDatasets.some(d => d.isNormalized) && <span style={{ marginLeft: 8, color: "hsl(38 70% 40%)", fontWeight: 500 }}>⚠ Some datasets are pre-normalized.</span>}
+          {targetDatasets.some(d => d.isNormalized) && <span style={{ marginLeft: 8, color: "hsl(38 70% 40%)", fontWeight: 500, display: "inline-flex", alignItems: "center", gap: 4 }}><AlertTriangle size={12} /> Some datasets are pre-normalized.</span>}
         </div>
         <hr className="card-divider" style={{ marginBottom: 16 }} />
 
@@ -614,30 +672,47 @@ export default function CountNormalizationStep({ datasetId, mode = "dp" }: Props
 
           {(() => {
             const activeDs = targetDatasets.find(d => d.id === (activeTabId || targetDatasets[0]?.id));
-            if (!activeDs || (!activeDs.boxplotBefore && !activeDs.boxplotAfter)) {
-              return <div style={{ fontSize: 13, color: "var(--muted-foreground)" }}>No Box Plots available for this dataset.</div>;
+            if (!activeDs || (!activeDs.boxplotBefore && !activeDs.boxplotAfter && !activeDs.normalPca)) {
+              return <div style={{ fontSize: 13, color: "var(--muted-foreground)" }}>No Box Plots or PCA available for this dataset.</div>;
             }
             return (
-              <div style={{ display: "flex", gap: 16, flexWrap: "wrap", justifyContent: "center" }}>
-                {activeDs.boxplotBefore && (
-                  <div style={{ flex: "1 1 300px", minWidth: 280, textAlign: "center" }}>
-                    <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 2, color: "var(--foreground)" }}>Before Normalization</div>
-                    <div style={{ fontSize: 11, color: "var(--muted-foreground)", marginBottom: 6 }}>{activeDs.name}</div>
-                    <img 
-                      src={`data:image/png;base64,${activeDs.boxplotBefore}`} 
-                      alt="Before Normalization Boxplot" 
-                      style={{ width: "100%", maxWidth: 500, height: "auto", border: "1px solid var(--border)", borderRadius: 6 }} 
-                    />
+              <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
+                {(activeDs.boxplotBefore || activeDs.boxplotAfter) && (
+                  <div style={{ display: "flex", gap: 16, flexWrap: "wrap", justifyContent: "center" }}>
+                    {activeDs.boxplotBefore && (
+                      <div style={{ flex: "1 1 300px", minWidth: 280, textAlign: "center" }}>
+                        <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 2, color: "var(--foreground)" }}>Before Normalization</div>
+                        <div style={{ fontSize: 11, color: "var(--muted-foreground)", marginBottom: 6 }}>{activeDs.name}</div>
+                        <img 
+                          src={`data:image/png;base64,${activeDs.boxplotBefore}`} 
+                          alt="Before Normalization Boxplot" 
+                          style={{ width: "100%", maxWidth: 500, height: "auto", border: "1px solid var(--border)", borderRadius: 6 }} 
+                        />
+                      </div>
+                    )}
+                    {activeDs.boxplotAfter && (
+                      <div style={{ flex: "1 1 300px", minWidth: 280, textAlign: "center" }}>
+                        <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 2, color: "var(--foreground)" }}>After Normalization</div>
+                        <div style={{ fontSize: 11, color: "var(--muted-foreground)", marginBottom: 6 }}>{activeDs.name}</div>
+                        <img 
+                          src={`data:image/png;base64,${activeDs.boxplotAfter}`} 
+                          alt="After Normalization Boxplot" 
+                          style={{ width: "100%", maxWidth: 500, height: "auto", border: "1px solid var(--border)", borderRadius: 6 }} 
+                        />
+                      </div>
+                    )}
                   </div>
                 )}
-                {activeDs.boxplotAfter && (
-                  <div style={{ flex: "1 1 300px", minWidth: 280, textAlign: "center" }}>
-                    <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 2, color: "var(--foreground)" }}>After Normalization</div>
-                    <div style={{ fontSize: 11, color: "var(--muted-foreground)", marginBottom: 6 }}>{activeDs.name}</div>
-                    <img 
-                      src={`data:image/png;base64,${activeDs.boxplotAfter}`} 
-                      alt="After Normalization Boxplot" 
-                      style={{ width: "100%", maxWidth: 500, height: "auto", border: "1px solid var(--border)", borderRadius: 6 }} 
+
+                {activeDs.normalPca && (
+                  <div style={{ borderTop: "1px solid var(--border)", paddingTop: 16 }}>
+                    <InteractivePCAPlot
+                      pcaData={activeDs.normalPca}
+                      title={`${activeDs.name} — Normal PCA (Normalized Data)`}
+                      colorByField="group"
+                      exportKey="pca_plots"
+                      datasetId={activeDs.id}
+                      datasetName={activeDs.name}
                     />
                   </div>
                 )}
@@ -650,12 +725,12 @@ export default function CountNormalizationStep({ datasetId, mode = "dp" }: Props
       <div className="action-row">
         <div style={{ display: "flex", gap: 8 }}>
           <button className="btn btn-default" onClick={() => dispatch({ type: mode === "dp" ? "DP_SET_STEP" : "DE_SET_STEP", step: getNextAndPrevSteps().prev } as never)}>← Back</button>
-          <button className="btn btn-default" onClick={() => setShowSkipModal(true)} data-testid="btn-skip-normalization" style={{ color: "var(--muted-foreground)" }}>Skip</button>
+          <button className="btn btn-default" onClick={() => setShowSkipModal(true)} data-testid="btn-skip-normalization">Skip</button>
         </div>
 
         <div style={{ display: "flex", gap: 8 }}>
           {hasSettingsChanged && (
-            <button className="btn btn-default" style={{ borderColor: "var(--warning-border)", color: "var(--warning-text)", background: "var(--warning-bg)" }} onClick={async () => {
+            <button className="btn btn-default" style={{ borderColor: "var(--warning-border)", color: "var(--warning-text)", background: "var(--warning-bg)", display: "inline-flex", alignItems: "center", gap: 6 }} onClick={async () => {
               if (downstreamDone) {
                 setShowDiscardModal(true);
               } else {
@@ -667,7 +742,7 @@ export default function CountNormalizationStep({ datasetId, mode = "dp" }: Props
                 runNorm();
               }
             }} data-testid="btn-redo-norm">
-              🔄 Redo Normalization
+              <RotateCcw size={14} /> Redo Normalization
             </button>
           )}
 

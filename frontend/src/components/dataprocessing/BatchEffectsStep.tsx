@@ -1,4 +1,5 @@
-import { useState, useEffect, useMemo } from "react";
+import { useState, useEffect, useMemo, useRef } from "react";
+import { Microscope, CheckCircle2, RotateCcw } from "lucide-react";
 import { useAppStore } from "../../store/appStore";
 import { computeDPSteps } from "../../dataObject";
 import Spinner from "../Spinner";
@@ -8,7 +9,8 @@ import DiscardWarnModal from "../shared/DiscardWarnModal";
 import type { BatchMethod} from "../../dataObject";
 import InlineUploadStep from "../inline/InlineUploadStep";
 import AllDatasetsUploadView from "../shared/AllDatasetsUploadView";
-import { fetchPCAResultsAPI, runBatchCorrectionAPI, redoStepAPI } from "../../lib/api";
+import InteractivePCAPlot from "../shared/InteractivePCAPlot";
+import { fetchPCAResultsAPI, runBatchCorrectionAPI, redoStepAPI, cancelComputeJobAPI } from "../../lib/api";
 import { useToast } from "../../hooks/use-toast";
 
 interface Props { datasetId: string; mode?: "dp" | "de" }
@@ -201,6 +203,18 @@ function BatchEffectsContent({ datasetId, mode = "dp", onBack }: BatchContentPro
   const { toast } = useToast();
   const cfg = state.dpBatchConfig;
   const [loading, setLoading] = useState(false);
+  const abortBatchRef = useRef<AbortController | null>(null);
+  const activeBatchJobIdRef = useRef<string | null>(null);
+
+  const cancelBatch = async () => {
+    abortBatchRef.current?.abort();
+    if (activeBatchJobIdRef.current) {
+      await cancelComputeJobAPI(activeBatchJobIdRef.current);
+    }
+    setLoading(false);
+    activeBatchJobIdRef.current = null;
+  };
+
   const [showSkipModal, setShowSkipModal] = useState(false);
   const [showWarnModal, setShowWarnModal] = useState(false);
   const [showDiscardModal, setShowDiscardModal] = useState(false);
@@ -210,6 +224,17 @@ function BatchEffectsContent({ datasetId, mode = "dp", onBack }: BatchContentPro
   const [pcaPoints, setPcaPoints] = useState<any>(null);
 
   const [loadingPCA, setLoadingPCA] = useState(false);
+  const abortPCARef = useRef<AbortController | null>(null);
+  const activePCAJobIdRef = useRef<string | null>(null);
+
+  const cancelPCA = async () => {
+    abortPCARef.current?.abort();
+    if (activePCAJobIdRef.current) {
+      await cancelComputeJobAPI(activePCAJobIdRef.current);
+    }
+    setLoadingPCA(false);
+    activePCAJobIdRef.current = null;
+  };
 
   const datasets = mode === "dp" ? state.dpDatasets : state.deDatasets;
   const ds = datasets.find(d => d.id === datasetId) ?? datasets[0];
@@ -226,14 +251,24 @@ function BatchEffectsContent({ datasetId, mode = "dp", onBack }: BatchContentPro
         return;
       }
 
+      abortPCARef.current = new AbortController();
       setLoadingPCA(true);
       try {
-        const points = await fetchPCAResultsAPI(datasets);
+        const points = await fetchPCAResultsAPI(
+          datasets,
+          (info) => {
+            activePCAJobIdRef.current = info.jobId;
+          },
+          abortPCARef.current.signal
+        );
         if (active) {
           setPcaPoints(points);
           pcaPlotsCache[cacheKey] = points;
         }
       } catch (err: any) {
+        if (err?.name === "AbortError" || err?.message?.includes("Aborted") || err?.message?.includes("Unknown job id")) {
+          return;
+        }
         console.error("Error loading pre-correction PCA:", err);
         toast({
           title: "PCA Loading Error",
@@ -243,11 +278,15 @@ function BatchEffectsContent({ datasetId, mode = "dp", onBack }: BatchContentPro
       } finally {
         if (active) {
           setLoadingPCA(false);
+          activePCAJobIdRef.current = null;
         }
       }
     };
     loadPrePCA();
-    return () => { active = false; };
+    return () => {
+      active = false;
+      abortPCARef.current?.abort();
+    };
   }, [datasets, cacheKey]);
 
   const transcriptomicsDs = datasets.filter(d => d.dataType === "readcounts" || d.dataType === "microarray");
@@ -357,14 +396,25 @@ function BatchEffectsContent({ datasetId, mode = "dp", onBack }: BatchContentPro
   };
 
   const runBatch = async () => {
+    abortBatchRef.current = new AbortController();
     setLoading(true);
     try {
-      const results = await runBatchCorrectionAPI(datasets, cfg);
+      const results = await runBatchCorrectionAPI(
+        datasets,
+        cfg,
+        (info) => {
+          activeBatchJobIdRef.current = info.jobId;
+        },
+        abortBatchRef.current.signal
+      );
       setPcaPoints(results);
       pcaPlotsCache[cacheKey] = results;
       dispatch({ type: "DP_SUBMIT_BATCH" });
       setDone(true);
     } catch (err: any) {
+      if (err?.name === "AbortError" || err?.message?.includes("Aborted") || err?.message?.includes("Unknown job id")) {
+        return;
+      }
       console.error("Batch correction error:", err);
       toast({
         title: "Batch Correction Error",
@@ -373,6 +423,7 @@ function BatchEffectsContent({ datasetId, mode = "dp", onBack }: BatchContentPro
       });
     } finally {
       setLoading(false);
+      activeBatchJobIdRef.current = null;
     }
   };
 
@@ -443,7 +494,21 @@ function BatchEffectsContent({ datasetId, mode = "dp", onBack }: BatchContentPro
     return sharedSet.size > 0 ? sharedSet.size : Math.min(...datasets.map(d => d.nFeatures || 0));
   }, [datasets]);
 
-  const renderPCACard = (title: string, beforeSrc?: string, afterSrc?: string, singleSrc?: string) => {
+  const renderPCACard = (
+    title: string,
+    entry: any,
+    cardDsId?: string,
+    cardDsName?: string,
+    isCombined?: boolean
+  ) => {
+    const beforeSrc = entry?.before_batch || entry?.plot_batch;
+    const afterSrc = entry?.after_batch;
+    const singleSrc = entry?.plot_batch || entry?.before_batch;
+    const beforeInteractive = entry?.pcaBeforeInteractive || entry?.pcaInteractive;
+    const afterInteractive = entry?.pcaAfterInteractive;
+    const singleInteractive = entry?.pcaInteractive || entry?.pcaBeforeInteractive;
+    const displayLabel = cardDsName || title;
+
     return (
       <div style={{ border: "1px solid var(--border)", borderRadius: 8, padding: 16, background: "white", marginBottom: 20 }}>
         <div style={{ fontSize: 13, fontWeight: 700, marginBottom: 12, color: "var(--foreground)" }}>
@@ -451,43 +516,50 @@ function BatchEffectsContent({ datasetId, mode = "dp", onBack }: BatchContentPro
         </div>
         {done ? (
           <div style={{ display: "flex", gap: 20, flexWrap: "wrap" }}>
-            <div style={{ flex: "1 1 280px", border: "1px solid var(--border)", borderRadius: 8, padding: 14, background: "white", display: "flex", flexDirection: "column" }}>
-              <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 10 }}>Before Correction</div>
-              {beforeSrc ? (
-                <img
-                  src={`data:image/png;base64,${beforeSrc}`}
-                  style={{ width: "100%", height: "auto", borderRadius: 8 }}
-                  alt="Before Correction PCA"
-                />
-              ) : (
-                <div style={{ padding: 40, color: "var(--muted-foreground)", fontSize: 13, textAlign: "center" }}>Some errors. Couldn't generating PCA plots</div>
-              )}
+            <div style={{ flex: "1 1 360px", display: "flex", flexDirection: "column" }}>
+              <InteractivePCAPlot
+                pcaData={beforeInteractive}
+                fallbackImgSrc={beforeSrc}
+                title={`${displayLabel} — Before Batch Correction`}
+                subtitle="PCA Stratified by Batch"
+                colorByField="batch"
+                shapeByDataset={isCombined}
+                exportKey={cardDsId ? "pca_plots_before_batch" : undefined}
+                datasetId={cardDsId}
+                datasetName={cardDsName}
+                emptyMessage="Could not generate PCA plots. Please verify batch and group assignments."
+              />
             </div>
-            <div style={{ flex: "1 1 280px", border: "1px solid var(--border)", borderRadius: 8, padding: 14, background: "white", display: "flex", flexDirection: "column" }}>
-              <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 10 }}>After Correction</div>
-              {afterSrc ? (
-                <img
-                  src={`data:image/png;base64,${afterSrc}`}
-                  style={{ width: "100%", height: "auto", borderRadius: 8 }}
-                  alt="After Correction PCA"
-                />
-              ) : (
-                <div style={{ padding: 40, color: "var(--muted-foreground)", fontSize: 13, textAlign: "center" }}>Some errors. Couldn't generating PCA plots</div>
-              )}
+            <div style={{ flex: "1 1 360px", display: "flex", flexDirection: "column" }}>
+              <InteractivePCAPlot
+                pcaData={afterInteractive}
+                fallbackImgSrc={afterSrc}
+                title={`${displayLabel} — After Batch Correction`}
+                subtitle="PCA Stratified by Batch"
+                colorByField="batch"
+                shapeByDataset={isCombined}
+                exportKey={cardDsId ? "pca_plots_after_batch" : undefined}
+                datasetId={cardDsId}
+                datasetName={cardDsName}
+                emptyMessage="Could not generate PCA plots. Please verify batch and group assignments."
+              />
             </div>
           </div>
         ) : (
           <div style={{ display: "flex", gap: 20, flexWrap: "wrap", justifyContent: "center" }}>
-            <div style={{ flex: "1 1 300px", maxWidth: "500px", display: "flex", flexDirection: "column", alignItems: "center" }}>
-              {singleSrc ? (
-                <img
-                  src={`data:image/png;base64,${singleSrc}`}
-                  style={{ width: "100%", height: "auto", borderRadius: 8 }}
-                  alt="PCA Plot"
-                />
-              ) : (
-                <div style={{ padding: 40, color: "var(--muted-foreground)", fontSize: 13, textAlign: "center" }}>Generating PCA Plot...</div>
-              )}
+            <div style={{ flex: "1 1 420px", maxWidth: "680px", display: "flex", flexDirection: "column" }}>
+              <InteractivePCAPlot
+                pcaData={singleInteractive}
+                fallbackImgSrc={singleSrc}
+                title={`${displayLabel} — Before Batch Correction`}
+                subtitle="PCA Stratified by Batch"
+                colorByField="batch"
+                shapeByDataset={isCombined}
+                exportKey={cardDsId ? "pca_plots_before_batch" : undefined}
+                datasetId={cardDsId}
+                datasetName={cardDsName}
+                emptyMessage="Generating PCA Plot..."
+              />
             </div>
           </div>
         )}
@@ -553,12 +625,14 @@ function BatchEffectsContent({ datasetId, mode = "dp", onBack }: BatchContentPro
         <Spinner
           label="Running batch effect removal…"
           sublabel={`Methods: ${hasRawCounts ? (cfg.method === "combat_seq" ? "ComBat-seq" : "removeBatchEffect") : ""} ${hasOthersOrNormalized ? (cfg.methodOthers === "combat" ? "ComBat" : "removeBatchEffect") : ""}`}
+          onCancel={cancelBatch}
         />
       )}
       {loadingPCA && (
         <Spinner
           label="Creating PCA plots..."
           sublabel="Please wait while the server transfers the plots"
+          onCancel={cancelPCA}
         />
       )}
 
@@ -570,7 +644,7 @@ function BatchEffectsContent({ datasetId, mode = "dp", onBack }: BatchContentPro
         <hr className="card-divider" />
 
         <div className="banner info" style={{ marginBottom: 14 }}>
-          🔬 Detected <strong>{datasets.length} datasets</strong>:{" "}
+          <Microscope size={15} style={{ display: "inline-block", verticalAlign: "middle", marginRight: 6 }} />Detected <strong>{datasets.length} datasets</strong>:{" "}
           {datasets.map((d) => <span key={d.id} style={{ fontWeight: 600, marginRight: 6 }}>{d.name || d.id}</span>)}
         </div>
 
@@ -593,22 +667,22 @@ function BatchEffectsContent({ datasetId, mode = "dp", onBack }: BatchContentPro
         {!done && (
           <div style={{ marginBottom: 24 }}>
             <div style={{ fontSize: 13, fontWeight: 700, color: "var(--foreground)", marginBottom: 14 }}>
-              Pre-Correction PCA Diagnostics
+              Pre-Correction PCA Diagnostics (Stratified by Batch)
             </div>
             {datasetId === "all" ? (
               datasets.map(d => (
                 <div key={d.id}>
-                  {renderPCACard(`Dataset PCA: ${d.name}`, undefined, undefined, pcaPoints?.datasets?.[d.id]?.plot_batch)}
+                  {renderPCACard(`Dataset PCA: ${d.name}`, pcaPoints?.datasets?.[d.id], d.id, d.name, false)}
                 </div>
               ))
             ) : (
               ds && (
                 <div>
-                  {renderPCACard(`Dataset PCA: ${ds.name}`, undefined, undefined, pcaPoints?.datasets?.[ds.id]?.plot_batch)}
+                  {renderPCACard(`Dataset PCA: ${ds.name}`, pcaPoints?.datasets?.[ds.id], ds.id, ds.name, false)}
                 </div>
               )
             )}
-            {multipleDs && datasetId === "all" && allSameDataType && renderPCACard("Combined Datasets PCA", undefined, undefined, pcaPoints?.combined?.plot_batch || pcaPoints?.plot_batch)}
+            {multipleDs && datasetId === "all" && allSameDataType && renderPCACard("Combined Datasets PCA", pcaPoints?.combined || pcaPoints, undefined, "Combined Datasets", true)}
           </div>
         )}
 
@@ -687,8 +761,9 @@ function BatchEffectsContent({ datasetId, mode = "dp", onBack }: BatchContentPro
             Batch Correction Results {hasSettingsChanged && <span style={{ fontSize: 12, color: "hsl(38 85% 35%)", fontWeight: 400, marginLeft: 8 }}>(Outdated - settings changed)</span>}
           </div>
 
-          <div className="banner success">
-            ✅ Batch correction complete using <strong>{getActiveMethodLabel()}</strong>. Datasets merged: <strong>{datasets.length}</strong> → <strong>1 combined matrix</strong>.
+          <div className="banner success" style={{ display: "flex", alignItems: "center", gap: 6 }}>
+            <CheckCircle2 size={15} style={{ flexShrink: 0 }} />
+            <span>Batch correction complete using <strong>{getActiveMethodLabel()}</strong>. Datasets merged: <strong>{datasets.length}</strong> → <strong>1 combined matrix</strong>.</span>
           </div>
 
           <div className="chips-row" style={{ marginTop: 10 }}>
@@ -700,22 +775,22 @@ function BatchEffectsContent({ datasetId, mode = "dp", onBack }: BatchContentPro
           {/* Before vs After PCA Plots */}
           <div style={{ marginTop: 24, borderTop: "1px solid var(--border)", paddingTop: 16 }}>
             <div style={{ fontSize: 13, fontWeight: 700, color: "var(--foreground)", marginBottom: 14 }}>
-              Before vs After Correction PCA Diagnostics
+              Before vs After Correction PCA Diagnostics (Stratified by Batch)
             </div>
             {datasetId === "all" ? (
               datasets.map(d => (
                 <div key={d.id}>
-                  {renderPCACard(`Dataset PCA: ${d.name}`, pcaPoints?.datasets?.[d.id]?.before_batch, pcaPoints?.datasets?.[d.id]?.after_batch)}
+                  {renderPCACard(`Dataset PCA: ${d.name}`, pcaPoints?.datasets?.[d.id], d.id, d.name, false)}
                 </div>
               ))
             ) : (
               ds && (
                 <div>
-                  {renderPCACard(`Dataset PCA: ${ds.name}`, pcaPoints?.datasets?.[ds.id]?.before_batch, pcaPoints?.datasets?.[ds.id]?.after_batch)}
+                  {renderPCACard(`Dataset PCA: ${ds.name}`, pcaPoints?.datasets?.[ds.id], ds.id, ds.name, false)}
                 </div>
               )
             )}
-            {multipleDs && datasetId === "all" && allSameDataType && renderPCACard("Combined Datasets PCA", pcaPoints?.combined?.before_batch || pcaPoints?.before_batch, pcaPoints?.combined?.after_batch || pcaPoints?.after_batch)}
+            {multipleDs && datasetId === "all" && allSameDataType && renderPCACard("Combined Datasets PCA", pcaPoints?.combined || pcaPoints, undefined, "Combined Datasets", true)}
           </div>
         </div>
       )}
@@ -730,15 +805,15 @@ function BatchEffectsContent({ datasetId, mode = "dp", onBack }: BatchContentPro
               dispatch({ type: mode === "dp" ? "DP_SET_STEP" : "DE_SET_STEP", step: getNextAndPrevSteps().prev } as never);
             }
           }}>← Back</button>
-          <button className="btn btn-default" onClick={() => setShowSkipModal(true)} data-testid="btn-skip-batch" style={{ color: "var(--muted-foreground)" }}>Skip</button>
+          <button className="btn btn-default" onClick={() => setShowSkipModal(true)} data-testid="btn-skip-batch">Skip</button>
         </div>
 
         <div style={{ display: "flex", gap: 8 }}>
           {hasSettingsChanged && (
-            <button className="btn btn-default" style={{ borderColor: "var(--warning-border)", color: "var(--warning-text)", background: "var(--warning-bg)" }} onClick={() => {
+            <button className="btn btn-default" style={{ borderColor: "var(--warning-border)", color: "var(--warning-text)", background: "var(--warning-bg)", display: "inline-flex", alignItems: "center", gap: 6 }} onClick={() => {
               setShowRedoWarnModal(true);
             }} data-testid="btn-redo-batch">
-              🔄 Redo Batch Correction
+              <RotateCcw size={14} /> Redo Batch Correction
             </button>
           )}
 

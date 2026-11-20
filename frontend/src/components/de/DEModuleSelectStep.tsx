@@ -1,3 +1,4 @@
+import { Package, Dna, Check } from "lucide-react";
 import { useAppStore } from "../../store/appStore";
 import { isMetaEligible, isEAEligible } from "../../dataObject";
 
@@ -15,13 +16,13 @@ export default function DEModuleSelectStep() {
   const options = [
     {
       id: null,
-      icon: "📦",
+      icon: <Package size={36} style={{ margin: "0 auto" }} />,
       title: "Export Only",
       desc: "Export the differential expression results directly. No further downstream pathway analysis.",
     },
     ...(eaEligible ? [{
       id: "enrichment",
-      icon: "🧬",
+      icon: <Dna size={36} style={{ margin: "0 auto" }} />,
       title: "Add Enrichment Analysis",
       desc: "Run pathway enrichment analysis (ORA / GSEA) on the differentially expressed genes identified from this DE analysis.",
       badge: "Enrichment Analysis",
@@ -59,6 +60,19 @@ export default function DEModuleSelectStep() {
               key={String(m.id)}
               className={`module-choice-card ${selected === m.id ? "selected" : ""}`}
               onClick={() => dispatch({ type: "DE_SET_MODULE", module: m.id as any })}
+              role="button"
+              tabIndex={0}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" || e.key === " ") {
+                  e.preventDefault();
+                  dispatch({ type: "DE_SET_MODULE", module: m.id as any });
+                }
+              }}
+              style={selected === m.id ? {
+                borderColor: "#1e40af",
+                background: "#dbeafe",
+                color: "#1e40af"
+              } : undefined}
               data-testid={`module-card-${m.id ?? "export"}`}
             >
               <div className="icon">{m.icon}</div>
@@ -67,25 +81,27 @@ export default function DEModuleSelectStep() {
                 <div style={{
                   display: "inline-block", marginBottom: 8, fontSize: 10, fontWeight: 700,
                   padding: "2px 8px", borderRadius: 4,
-                  background: "var(--selected-bg)", color: "var(--foreground)",
-                  border: "1px solid var(--border)",
+                  background: "#dbeafe", color: "#1e40af",
+                  border: "1px solid #bfdbfe",
                 }}>
                   {m.badge}
                 </div>
               )}
               {m.id === "enrichment" && state.deInlineEaDone && (
                 <div style={{
-                  display: "inline-block", marginBottom: 8, fontSize: 10, fontWeight: 700,
+                  display: "inline-flex", alignItems: "center", gap: 3, marginBottom: 8, fontSize: 10, fontWeight: 700,
                   padding: "2px 8px", borderRadius: 4, marginLeft: 6,
-                  background: "hsl(142 70% 93%)", color: "hsl(142 72% 29%)",
-                  border: "1px solid hsl(142 70% 80%)",
+                  background: "#f0fdf4", color: "#15803d",
+                  border: "1px solid #bbf7d0",
                 }} data-testid="badge-en-done">
-                  ✓ Run Completed
+                  <Check size={11} /> Run Completed
                 </div>
               )}
               <div className="desc">{m.desc}</div>
               {selected === m.id && (
-                <div style={{ marginTop: 12, fontSize: 12, color: "var(--foreground)", fontWeight: 600 }}>✓ Selected</div>
+                <div style={{ marginTop: 12, fontSize: 12, color: "#1e40af", fontWeight: 600, display: "inline-flex", alignItems: "center", gap: 4 }}>
+                  <Check size={13} /> Selected
+                </div>
               )}
             </div>
           ))}

@@ -1,4 +1,5 @@
 import { useState, useEffect, useMemo } from "react";
+import { CheckCircle2 } from "lucide-react";
 import { useAppStore } from "../../store/appStore";
 import Spinner from "../Spinner";
 import { runTestingAPI, type TestingResult } from "../../lib/api";
@@ -25,27 +26,27 @@ const MODEL_LABELS: Record<string, string> = {
   svm: "Support Vector Machine",
   randomforest: "Random Forest",
   gbm: "Gradient Boosting Model",
-  stabl: "STABL (Stability Selection)",
-  boruta: "Boruta (All-Relevant Selection)",
+  stabl: "STABL",
+  boruta: "Boruta",
 };
 
-// Helper to extract feature ids from dataset
+// Helper to extract feature ids from dataset (Features are Rows)
 const getFsDatasetFeatureIds = (d: any): Set<string> => {
-  if (d.dataMode === "metadata_features") {
-    const sampleIdCol = d.clinicalSampleIdCol || d.geneIdCol || "SampleID";
-    const infoCols = d.geneInfoCols || [];
-    const featureCols = (d.columns || []).filter((c: string) => c !== sampleIdCol && !infoCols.includes(c));
-    return new Set(featureCols);
-  }
   if (!d.parsedData || d.parsedData.length === 0) return new Set();
-  const geneIdIdx = d.columns ? d.columns.indexOf(d.geneIdCol) : -1;
-  if (geneIdIdx === -1) return new Set(d.parsedData.map((row: any) => String(row[0])));
-  return new Set(d.parsedData.map((row: any) => String(row[geneIdIdx])));
+  const featIdx = (d.fs_featureIndexValue || 1) - 1;
+  const geneIdCol = d.geneIdCol || (d.columns && d.columns[featIdx >= 0 ? featIdx : 0]) || "Feature";
+  const geneIdIdx = d.columns?.indexOf(geneIdCol);
+  const targetIdx = geneIdIdx !== undefined && geneIdIdx !== -1 ? geneIdIdx : (featIdx >= 0 && featIdx < (d.columns?.length || 0) ? featIdx : 0);
+  return new Set(d.parsedData.map((row: any) => String(row[targetIdx])).filter(Boolean));
 };
 
 // Helper to compute intersection of features in a list of datasets
-const getSharedFeatureCountForGroup = (groupDatasets: any[]): number => {
+const getSharedFeatureCountForGroup = (groupDatasets: any[], backendCounts?: Record<string, number>): number => {
   if (groupDatasets.length <= 1) return 0;
+  if (backendCounts) {
+    const h = getHierarchyGroup(groupDatasets[0]?.dataType || "type1");
+    if (backendCounts[h] !== undefined) return backendCounts[h];
+  }
   if (groupDatasets.some(d => !d.parsedData || d.parsedData.length === 0)) return 0;
   let intersection = getFsDatasetFeatureIds(groupDatasets[0]);
   for (let i = 1; i < groupDatasets.length; i++) {
@@ -83,7 +84,7 @@ export default function TestingStep({ mode = "fs", onBack, onContinue }: Props) 
   // Pooling selection card is visible only when we have same-type datasets with >= 10 shared features
   const hasPoolableTypesAndSufficientFeatures = Object.values(typeGroups).some(group => {
     if (group.length < 2) return false;
-    const count = getSharedFeatureCountForGroup(group);
+    const count = getSharedFeatureCountForGroup(group, state.fsSharedFeatureCounts);
     return count >= 10;
   });
 
@@ -334,7 +335,10 @@ export default function TestingStep({ mode = "fs", onBack, onContinue }: Props) 
                 </span>
               </div>
 
-              <div className="banner success" style={{ marginBottom: 12 }}>✅ Model evaluation complete.</div>
+              <div className="banner success" style={{ marginBottom: 12, display: "flex", alignItems: "center", gap: 6 }}>
+                <CheckCircle2 size={15} style={{ flexShrink: 0 }} />
+                <span>Model evaluation complete.</span>
+              </div>
 
               {rocPlot ? (
                 <div style={{ display: "flex", justifyContent: "center", marginBottom: 14 }}>

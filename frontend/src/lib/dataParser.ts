@@ -1,5 +1,5 @@
 import Papa from "papaparse";
-import type { GeneIdType } from "../dataObject";
+import type { GeneIdType, DataType } from "../dataObject";
 import type { AlignSamplesResponse } from "./api";
 
 export interface ParsedExpressionData {
@@ -8,10 +8,12 @@ export interface ParsedExpressionData {
   geneInfoCols: string[];
   geneIdCol: string;
   detectedGeneIdType: GeneIdType;
+  detectedDataType?: DataType;
   nSamples: number;
   nFeatures: number;
   isNormalized: boolean;
   hasNA: boolean;
+  hasDetectionPvalCols?: boolean;
 }
 
 export interface ParsedClinicalData {
@@ -29,6 +31,60 @@ export function detectGeneIdType(value: any): GeneIdType {
   if (/^AFFX-/.test(v)) return "affymetrix";
   if (/^\d+$/.test(v)) return "entrez";
   return "genename";
+}
+
+/**
+ * Fast, robust O(1) detection of normalized vs raw read counts.
+ * Evaluates non-zero numeric values across rows and exits as soon as statistical
+ * confidence is reached (at most ~30 non-zero values inspected, or early exit on floats/negatives).
+ */
+export function detectIsNormalized(
+  rows: (string | number)[][],
+  dataColsIdx?: number[]
+): boolean {
+  if (!rows || rows.length === 0) return false;
+
+  let nonZeroCount = 0;
+  let floatCount = 0;
+  const TARGET_SAMPLE_SIZE = 50;
+  const maxRows = Math.min(rows.length, 50);
+
+  for (let r = 0; r < maxRows; r++) {
+    const row = rows[r];
+    if (!row) continue;
+
+    const startCol = dataColsIdx ? 0 : 1;
+    const numCols = dataColsIdx ? dataColsIdx.length : row.length;
+
+    for (let c = startCol; c < numCols; c++) {
+      const colIdx = dataColsIdx ? dataColsIdx[c] : c;
+      const raw = row[colIdx];
+      if (raw === undefined || raw === null) continue;
+
+      const num = typeof raw === "number" ? raw : Number(String(raw).trim());
+      if (isNaN(num) || !isFinite(num) || num === 0) continue;
+
+      // 1. Negative numbers never exist in raw read counts -> instant normalized
+      if (num < -1e-5) return true;
+
+      nonZeroCount++;
+
+      // 2. Fractional check: Math.abs(num - Math.round(num)) > 1e-5
+      if (Math.abs(num - Math.round(num)) > 1e-5) {
+        floatCount++;
+        // Raw read counts never have true decimals; 3 floats are definitive proof
+        if (floatCount >= 3) return true;
+      }
+
+      if (nonZeroCount >= TARGET_SAMPLE_SIZE) break;
+    }
+
+    if (nonZeroCount >= TARGET_SAMPLE_SIZE) break;
+  }
+
+  if (nonZeroCount === 0) return false;
+  // If more than 10% of non-zero values have fractional parts, it's normalized
+  return (floatCount / nonZeroCount) > 0.10;
 }
 
 export function isDesktopMode(): boolean {
@@ -120,6 +176,7 @@ export function parseExpressionFile(
           return;
         }
         const headers = data[0];
+        const hasDetectionPvalCols = headers.some(h => h.toLowerCase().includes("detection pval"));
         const rows = data.slice(1);
         const geneIdCol = headers[0] || "GeneID";
 
@@ -162,20 +219,13 @@ export function parseExpressionFile(
         const testGeneId = rows[0]?.[0] || "";
         const detectedGeneIdType = detectGeneIdType(testGeneId);
 
-        // Auto-detect normalization
-        let isNormalized = false;
+        // Fast, robust auto-detect normalization & data type based on numeric distribution
         const testColsIdx = headers.map((col, idx) => ({ col, idx })).filter(x => x.col !== geneIdCol && !geneInfoCols.includes(x.col)).map(x => x.idx);
-        for (let rIdx = 0; rIdx < Math.min(100, rows.length); rIdx++) {
-          const row = rows[rIdx];
-          for (const cIdx of testColsIdx) {
-            const val = row[cIdx];
-            if (val && val.includes(".")) {
-              isNormalized = true;
-              break;
-            }
-          }
-          if (isNormalized) break;
-        }
+        const isNormalized = detectIsNormalized(rows, testColsIdx);
+        const isProbe = detectedGeneIdType && !["ensembl", "entrez", "genename"].includes(detectedGeneIdType);
+        const detectedDataType: DataType | undefined = !isNormalized
+          ? "readcounts"
+          : (isProbe ? "microarray" : undefined);
 
         // Calculate hasNA: check if there are any non-numeric/missing values in the expression data columns
         let hasNA = false;
@@ -222,10 +272,12 @@ export function parseExpressionFile(
           geneInfoCols,
           geneIdCol,
           detectedGeneIdType,
+          detectedDataType,
           nSamples,
           nFeatures,
           isNormalized,
           hasNA,
+          hasDetectionPvalCols,
         });
       },
       error: (error: Error) => {
@@ -302,6 +354,7 @@ export interface AlignSamplesParams {
   clinicalBatchCol?: string;
   clinicalOtherCovariates?: string[];
   nFeatures?: number;
+  detectionPvalCols?: string[];
 }
 
 function isValMissing(val: any): boolean {
@@ -354,7 +407,9 @@ export function alignSamplesLocal(params: AlignSamplesParams): AlignSamplesRespo
     clinicalBatchCol,
   } = params;
 
-  let exprSamples: string[] = getExpressionSampleColumns(expressionColumns || [], geneIdCol, geneInfoCols);
+  const detPvalSet = new Set(params.detectionPvalCols || []);
+  let exprSamples: string[] = getExpressionSampleColumns(expressionColumns || [], geneIdCol, geneInfoCols)
+    .filter(c => !detPvalSet.has(c));
 
   if (exprSamples.length === 0) {
     exprSamples = Array.from({ length: 10 }, (_, i) => `Sample_${i + 1}`);
@@ -442,7 +497,8 @@ export function alignSamplesLocal(params: AlignSamplesParams): AlignSamplesRespo
     }
   }
 
-  let detectedGeneIdType = "ensembl";
+  let detectedGeneIdType = "";
+  let detectedIsNormalized: boolean | undefined = undefined;
   if (expressionParsedData && expressionParsedData.length > 0 && expressionColumns && geneIdCol) {
     const geneIdIdx = expressionColumns.indexOf(geneIdCol);
     if (geneIdIdx !== -1) {
@@ -454,6 +510,7 @@ export function alignSamplesLocal(params: AlignSamplesParams): AlignSamplesRespo
         }
       }
     }
+    detectedIsNormalized = detectIsNormalized(expressionParsedData);
   }
 
   return {
@@ -462,7 +519,7 @@ export function alignSamplesLocal(params: AlignSamplesParams): AlignSamplesRespo
     missingExpressionSamples,
     nFeatures,
     detectedGeneIdType,
-    detectedIsNormalized: false,
+    detectedIsNormalized: detectedIsNormalized as any,
     hasMissingClinicalValues,
     removedSamplesDueToMissing,
     minGroupSampleSize,

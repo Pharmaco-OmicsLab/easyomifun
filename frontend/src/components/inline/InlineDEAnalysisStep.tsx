@@ -1,5 +1,5 @@
-import { useState, useEffect } from "react";
-import { FileText, X, AlertTriangle } from "lucide-react";
+import { useState, useEffect, useRef } from "react";
+import { FileText, X, AlertTriangle, RotateCcw, FileSpreadsheet } from "lucide-react";
 import { useAppStore } from "../../store/appStore";
 import Spinner from "../Spinner";
 import type {PValueAdjMethod} from '../../dataObject';
@@ -11,7 +11,7 @@ import DiscardWarnModal from "../shared/DiscardWarnModal";
 import { parseClinicalFile, getExpressionSampleColumns } from "../../lib/dataParser";
 import InlineUploadStep from "./InlineUploadStep";
 import AllDatasetsUploadView from "../shared/AllDatasetsUploadView";
-import { runInlineDEAPI, redoStepAPI, clearDatasetAPI, fetchDatasetInfoAPI } from "../../lib/api";
+import { runInlineDEAPI, redoStepAPI, clearDatasetAPI, fetchDatasetInfoAPI, cancelComputeJobAPI } from "../../lib/api";
 import { useToast } from "../../hooks/use-toast";
 
 
@@ -38,6 +38,7 @@ function getBaseDatasetId(id: string): string {
 interface TargetDataset { id: string; name: string; color: string; }
 
 function DEResultCard({ targetDs, results, hasSettingsChanged }: { targetDs: TargetDataset; results: any; hasSettingsChanged: boolean | null }) {
+  const { state } = useAppStore();
   const isOutdated = hasSettingsChanged === true;
   const rawList = Array.isArray(results) ? results : (results?.top10 || results?.results || []);
   const stats = results?.stats || {
@@ -97,7 +98,7 @@ function DEResultCard({ targetDs, results, hasSettingsChanged }: { targetDs: Tar
               const foldChange = r.FoldChange ?? (Math.pow(2, logFC));
               const pValue = r["P-value"] ?? r.pValue ?? r.pval ?? 1;
               const adjPValue = r["adj.P.Val."] ?? r.adjPValue ?? r.qval ?? 1;
-              const isSig = r.significant ?? (adjPValue < (state.deConfig?.pValueThreshold ?? 0.05) && Math.abs(logFC) >= (state.deConfig?.logFcThreshold ?? 1.0));
+              const isSig = r.significant ?? (adjPValue < (state.dpInlineDeConfig?.pValueThreshold ?? 0.05) && Math.abs(logFC) >= (state.dpInlineDeConfig?.logFcThreshold ?? 1.0));
               const rawDir = typeof r.direction === "string" ? r.direction.toLowerCase() : "";
               const direction = (rawDir === "up" || rawDir === "down" || rawDir === "ns")
                 ? rawDir
@@ -138,8 +139,8 @@ export default function InlineDEAnalysisStep() {
 
   // Sync state if databases update externally (e.g. clinical data cleared)
   useEffect(() => {
-    const hasIncomplete = allDs.some(isIncomplete);
-    if (hasIncomplete && state.inlineDeUploadReviewed) {
+    const allCleared = allDs.length > 0 && allDs.every(d => !d.clinicalFileName);
+    if (allCleared && state.inlineDeUploadReviewed) {
       dispatch({ type: "SET_INLINE_DE_UPLOAD_REVIEWED", reviewed: false });
     }
     if (!sorted.some(d => d.id === activeUploadDatasetId)) {
@@ -267,6 +268,18 @@ function InlineDEAnalysisContent({ onBack }: { onBack?: () => void }) {
   const showLimmaOnly = hasLimma && !hasUnnormReadcounts;
   
   const [loading, setLoading] = useState(false);
+  const abortControllerRef = useRef<AbortController | null>(null);
+  const activeJobIdRef = useRef<string | null>(null);
+
+  const handleCancel = async () => {
+    abortControllerRef.current?.abort();
+    if (activeJobIdRef.current) {
+      await cancelComputeJobAPI(activeJobIdRef.current);
+    }
+    setLoading(false);
+    activeJobIdRef.current = null;
+  };
+
   const [done, setDone] = useState(state.dpInlineDeDone);
   const [method, setMethod] = useState(showLimmaOnly ? "limma" : "deseq2");
   
@@ -301,12 +314,8 @@ function InlineDEAnalysisContent({ onBack }: { onBack?: () => void }) {
     dispatch({ type: "DP_UPDATE_DATASET", id: ds.id, patch } as never);
   };
 
-  const handleClear = async () => {
-    try {
-      await clearDatasetAPI(ds.id, "clinical");
-    } catch (e) {
-      console.warn("clearDatasetAPI failed (non-fatal):", e);
-    }
+  const handleClear = () => {
+    clearDatasetAPI(ds.id, "clinical").catch((e) => console.warn("clearDatasetAPI failed (non-fatal):", e));
     updateDs({ 
       clinicalFile: null, 
       clinicalFileName: "", 
@@ -496,11 +505,21 @@ function InlineDEAnalysisContent({ onBack }: { onBack?: () => void }) {
 
   const downstreamDone = completedModules.length > 0;
   const handleRun = async () => {
+    abortControllerRef.current = new AbortController();
     setLoading(true);
     if (done) {
       try {
-        await redoStepAPI("de", allDs.map(d => d.id));
-      } catch (e) {
+        await redoStepAPI(
+          "de",
+          allDs.map(d => d.id),
+          (info) => { activeJobIdRef.current = info.jobId; },
+          abortControllerRef.current.signal
+        );
+      } catch (e: any) {
+        if (e?.name === "AbortError" || abortControllerRef.current?.signal.aborted) {
+          setLoading(false);
+          return;
+        }
         console.error(e);
       }
     }
@@ -515,14 +534,21 @@ function InlineDEAnalysisContent({ onBack }: { onBack?: () => void }) {
           de_comparisonGroup: cmp
         };
       });
-      const resultsMap = await runInlineDEAPI(datasetsToRun, {
-        method,
-        pValueThreshold: pThresh,
-        logFcThreshold: fcThresh,
-        adjustMethod: adjMethod as PValueAdjMethod,
-        referenceGroup: "",
-        comparisonGroup: ""
-      });
+      const resultsMap = await runInlineDEAPI(
+        datasetsToRun,
+        {
+          method,
+          pValueThreshold: pThresh,
+          logFcThreshold: fcThresh,
+          adjustMethod: adjMethod as PValueAdjMethod,
+          referenceGroup: "",
+          comparisonGroup: ""
+        },
+        (info) => {
+          activeJobIdRef.current = info.jobId;
+        },
+        abortControllerRef.current.signal
+      );
 
       setSubmittedCfg({
         method,
@@ -552,10 +578,18 @@ function InlineDEAnalysisContent({ onBack }: { onBack?: () => void }) {
         } as never);
       });
       
+      dispatch({
+        type: "DP_INLINE_DE_SET_CONFIG",
+        patch: { method, pValueThreshold: pThresh, logFcThreshold: fcThresh, adjustMethod: adjMethod }
+      });
+      dispatch({ type: "DP_INLINE_DE_SUBMIT_CONFIG" });
       dispatch({ type: "SET_DP_INLINE_DE_DONE", done: true });
       dispatch({ type: "SET_DP_INLINE_META_DONE", done: false });
       setDone(true);
     } catch (err: any) {
+      if (err?.name === "AbortError" || err?.message?.includes("Aborted") || err?.message?.includes("Unknown job id")) {
+        return;
+      }
       console.error("Inline DE analysis error:", err);
       toast({
         title: "DE Analysis Error",
@@ -564,6 +598,7 @@ function InlineDEAnalysisContent({ onBack }: { onBack?: () => void }) {
       });
     } finally {
       setLoading(false);
+      activeJobIdRef.current = null;
     }
   };
 
@@ -597,7 +632,7 @@ function InlineDEAnalysisContent({ onBack }: { onBack?: () => void }) {
   return (
     <>
       {localLoading && <Spinner label={localLoadingMsg} sublabel="Please wait…" />}
-      {loading && <Spinner label="Running DE analysis…" sublabel={`Using ${DE_METHODS.find(m => m.id === method)?.label}`} />}
+      {loading && <Spinner label="Running DE analysis…" sublabel={`Using ${DE_METHODS.find(m => m.id === method)?.label}`} onCancel={handleCancel} />}
 
       {/* Clinical Data Upload */}
       <div className="card" style={{ marginBottom: 14, display: "none" }}>
@@ -638,7 +673,7 @@ function InlineDEAnalysisContent({ onBack }: { onBack?: () => void }) {
             onDragLeave={() => setClinicalDrag(false)}
             onDrop={e => { e.preventDefault(); setClinicalDrag(false); const f = e.dataTransfer.files?.[0]; if (f) handleClinicalFile(f); }}
             data-testid="dropzone-clinical">
-            <div className="drop-zone-icon">🧬</div>
+            <div className="drop-zone-icon"><FileSpreadsheet size={32} /></div>
             <div className="drop-zone-title">Drop clinical metadata file here</div>
             <div className="drop-zone-hint">CSV · TSV &nbsp;·&nbsp; SampleID + Group columns required</div>
           </div>
@@ -1093,8 +1128,8 @@ function InlineDEAnalysisContent({ onBack }: { onBack?: () => void }) {
               } else {
                 onRunClick();
               }
-            }} data-testid="btn-redo-de">
-              🔄 Redo DE Analysis
+            }} data-testid="btn-redo-de" style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
+              <RotateCcw size={14} /> Redo DE Analysis
             </button>
           )}
           {!done ? (

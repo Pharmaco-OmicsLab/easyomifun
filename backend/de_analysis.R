@@ -510,10 +510,20 @@ run_de_analysis <- function(method = "deseq2", pval_thresh = 0.05, logfc_thresh 
       # Persist the REAL volcano/MA plots to the session dir so exports ship them
       # instead of the placeholder produced by pre_generate_exports(). Same paths,
       # so the placeholder is skipped (it only writes when the file is absent).
+      volc_png <- sprintf("tmp/%s_volcano.png", ds_id_full)
+      ma_png   <- sprintf("tmp/%s_ma.png", ds_id_full)
+      volc_b64 <- ""
+      ma_b64   <- ""
       tryCatch({
         ggplot2::ggsave(sprintf("tmp/%s_volcano.pdf", ds_id_full), p_volc, width = 7, height = 5)
+        ggplot2::ggsave(volc_png, p_volc, width = 7, height = 5, dpi = 120)
+        volc_b64 <- if (file.exists(volc_png)) base64enc::base64encode(volc_png) else plot_to_base64(p_volc)
+      }, error = function(e) cat(sprintf("[DE] volcano save failed for %s: %s\n", ds_id_full, conditionMessage(e))))
+      tryCatch({
         ggplot2::ggsave(sprintf("tmp/%s_ma.pdf", ds_id_full), p_ma, width = 7, height = 5)
-      }, error = function(e) cat(sprintf("[DE] plot PDF save failed for %s: %s\n", ds_id_full, conditionMessage(e))))
+        ggplot2::ggsave(ma_png, p_ma, width = 7, height = 5, dpi = 120)
+        ma_b64 <- if (file.exists(ma_png)) base64enc::base64encode(ma_png) else plot_to_base64(p_ma)
+      }, error = function(e) cat(sprintf("[DE] ma save failed for %s: %s\n", ds_id_full, conditionMessage(e))))
 
       results[[ds_id_full]] <- list(
         stats = list(
@@ -525,8 +535,8 @@ run_de_analysis <- function(method = "deseq2", pval_thresh = 0.05, logfc_thresh 
         top10 = top10_rows,
         results = top10_rows,
         full_results = NULL,   # Written to CSV as side-effect; not held in memory
-        volcanoPlot = plot_to_base64(p_volc),
-        maPlot = plot_to_base64(p_ma),
+        volcanoPlot = volc_b64,
+        maPlot = ma_b64,
         hadDuplicates = had_duplicates,
         actualMethod = actual_method
       )
@@ -1618,10 +1628,20 @@ run_inline_de_analysis <- function(payload) {
     # 1. Initialize inline DE stacks using processed data from DP module
     dp_main <- get_latest_main_stack(ds_id)
     if (!is.null(dp_main)) {
+      if (any(is.na(dp_main$data))) {
+        cat(sprintf("[INLINE-DE] %s: missing values detected in main stack (never imputed in DP), running KNN imputation fallback.\n", ds_id))
+        dp_main$data <- impute_missing_knn(dp_main$data)
+        push_main_stack(ds_id, dp_main$data, step_name = "imputation_fallback", metadata = dp_main$metadata)
+      }
       push_inline_de_main_stack(ds_id, dp_main$data, step_name = "dp_processed", metadata = dp_main$metadata)
     }
     dp_counts <- get_latest_counts_stack(ds_id)
     if (!is.null(dp_counts)) {
+      if (any(is.na(dp_counts$data))) {
+        cat(sprintf("[INLINE-DE] %s: missing values detected in counts stack (never imputed in DP), running KNN imputation fallback.\n", ds_id))
+        dp_counts$data <- round(impute_missing_knn(dp_counts$data))
+        push_counts_stack(ds_id, dp_counts$data, step_name = "imputation_fallback", metadata = dp_counts$metadata)
+      }
       push_inline_de_counts_stack(ds_id, dp_counts$data, step_name = "dp_processed", metadata = dp_counts$metadata)
     }
 
@@ -1645,6 +1665,10 @@ run_inline_de_analysis <- function(payload) {
         }
       }
       cat(sprintf("[INLINE-DE] %s: resolved latest matrix from inline DE main stack.\n", ds_id))
+    }
+
+    if (!is.null(expr_mat) && any(is.na(expr_mat))) {
+      expr_mat <- impute_missing_knn(expr_mat)
     }
     
     # Save to de_stack

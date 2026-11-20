@@ -1,9 +1,10 @@
-import { useState, useEffect, useMemo } from "react";
+import { useState, useEffect, useMemo, useRef } from "react";
+import { Lock, Microscope, TrendingUp, Check, AlertTriangle, RotateCcw, Info } from "lucide-react";
 import { useAppStore, getSessionUserId } from "../../store/appStore";
 import Spinner from "../Spinner";
 import ChangeWarnModal from "../shared/ChangeWarnModal";
 import type { EnrichmentDb, GSEADb, EnrichmentMethod } from "../../dataObject";
-import { runInlineEAAPI, redoStepAPI } from "../../lib/api";
+import { runInlineEAAPI, redoStepAPI, cancelComputeJobAPI } from "../../lib/api";
 import { useToast } from "../../hooks/use-toast";
 
 interface OraRow {
@@ -93,7 +94,7 @@ function parseGeneName(row: any): string {
 export default function DPInlineEAStep() {
   const { state, dispatch } = useAppStore();
   const { toast } = useToast();
-  const enConfig = state.enConfig;
+  const enConfig = state.dpInlineEnConfig;
 
   const userId = state.userId || "user";
   const dpMetaKey = `${userId}_dp_meta_results`;
@@ -290,11 +291,11 @@ export default function DPInlineEAStep() {
     const currentMethods: EnrichmentMethod[] = Array.isArray(enConfig.methods) ? enConfig.methods : [];
     if (sigStatus.hasAnySig) {
       if (currentMethods.length === 0) {
-        dispatch({ type: "EN_SET_CONFIG", patch: { methods: ["ora", "gsea"] } });
+        dispatch({ type: "DP_INLINE_EN_SET_CONFIG", patch: { methods: ["ora", "gsea"] } });
       }
     } else {
       if (!currentMethods.includes("gsea") || currentMethods.includes("ora")) {
-        dispatch({ type: "EN_SET_CONFIG", patch: { methods: ["gsea"] } });
+        dispatch({ type: "DP_INLINE_EN_SET_CONFIG", patch: { methods: ["gsea"] } });
       }
     }
 
@@ -313,6 +314,18 @@ export default function DPInlineEAStep() {
 
   const [loadingAnalysis, setLoadingAnalysis] = useState(false);
   const [loadingMsg, setLoadingMsg] = useState("");
+  const abortControllerRef = useRef<AbortController | null>(null);
+  const activeJobIdRef = useRef<string | null>(null);
+
+  const handleCancel = async () => {
+    abortControllerRef.current?.abort();
+    if (activeJobIdRef.current) {
+      await cancelComputeJobAPI(activeJobIdRef.current);
+    }
+    setLoadingAnalysis(false);
+    activeJobIdRef.current = null;
+  };
+
   const [showWarnModal, setShowWarnModal] = useState(false);
   
   // Check if any active dataset has a platform-specific probe ID for microarray, which hardcodes the organism
@@ -326,7 +339,7 @@ export default function DPInlineEAStep() {
     if (isOrganismLocked && lockedOrganism) {
       if (enConfig.organism !== lockedOrganism) {
         dispatch({
-          type: "EN_SET_CONFIG",
+          type: "DP_INLINE_EN_SET_CONFIG",
           patch: { organism: lockedOrganism }
         });
       }
@@ -334,7 +347,7 @@ export default function DPInlineEAStep() {
       if (!enConfig.organism) {
         const initialOrg = state.dpAnnotationConfig?.selectOrganism || "Human (Homo sapiens)";
         dispatch({
-          type: "EN_SET_CONFIG",
+          type: "DP_INLINE_EN_SET_CONFIG",
           patch: { organism: initialOrg }
         });
       }
@@ -353,7 +366,7 @@ export default function DPInlineEAStep() {
   useEffect(() => {
     if (isOnlyOraMeta) {
       if (!selectedMethods.includes("ora") || selectedMethods.includes("gsea")) {
-        dispatch({ type: "EN_SET_CONFIG", patch: { methods: ["ora"] } });
+        dispatch({ type: "DP_INLINE_EN_SET_CONFIG", patch: { methods: ["ora"] } });
       }
     }
   }, [isOnlyOraMeta, selectedMethods, dispatch]);
@@ -398,7 +411,7 @@ export default function DPInlineEAStep() {
   };
 
   const updateConfig = (patch: Partial<typeof enConfig>) => {
-    dispatch({ type: "EN_SET_CONFIG", patch });
+    dispatch({ type: "DP_INLINE_EN_SET_CONFIG", patch });
   };
 
   const handleToggleMethod = (m: EnrichmentMethod) => {
@@ -437,15 +450,25 @@ export default function DPInlineEAStep() {
 
   const handleRunAnalysis = async () => {
     if (activeDsList.length === 0) return;
+    abortControllerRef.current = new AbortController();
+    setLoadingAnalysis(true);
+    setLoadingMsg(`Running ${selectedMethods.map(m => m.toUpperCase()).join(" + ")} analysis for ${activeType === "transcriptomics" ? "Transcriptomics" : "Proteomics"}…`);
     if (activeDone) {
       try {
-        await redoStepAPI("ea", activeDsList.map(d => d.id));
-      } catch (e) {
+        await redoStepAPI(
+          "ea",
+          activeDsList.map(d => d.id),
+          (info) => { activeJobIdRef.current = info.jobId; },
+          abortControllerRef.current.signal
+        );
+      } catch (e: any) {
+        if (e?.name === "AbortError" || abortControllerRef.current?.signal.aborted) {
+          setLoadingAnalysis(false);
+          return;
+        }
         console.error(e);
       }
     }
-    setLoadingAnalysis(true);
-    setLoadingMsg(`Running ${selectedMethods.map(m => m.toUpperCase()).join(" + ")} analysis for ${activeType === "transcriptomics" ? "Transcriptomics" : "Proteomics"}…`);
     try {
       let direction: "up" | "down" | "all";
       if (selectedOraOptions.includes("sig-up") && !selectedOraOptions.includes("sig-down")) {
@@ -468,7 +491,11 @@ export default function DPInlineEAStep() {
         datasetId,
         enConfig.geneIdType || firstDs?.geneIdType || "genename",
         direction,
-        activeDsList.map(d => ({ id: d.id, dataType: d.dataType, name: d.name, parentModule: "dp", module: "ea", isInline: true }))
+        activeDsList.map(d => ({ id: d.id, dataType: d.dataType, name: d.name, parentModule: "dp", module: "ea", isInline: true })),
+        (info) => {
+          activeJobIdRef.current = info.jobId;
+        },
+        abortControllerRef.current.signal
       );
 
       const submittedCfgPatch = {
@@ -531,8 +558,12 @@ export default function DPInlineEAStep() {
       }
 
       setShowWarnModal(false);
+      dispatch({ type: "DP_INLINE_EN_SUBMIT_CONFIG" });
       dispatch({ type: "SET_DP_INLINE_EA_DONE", done: true });
     } catch (err: any) {
+      if (err?.name === "AbortError" || err?.message?.includes("Aborted") || err?.message?.includes("Unknown job id")) {
+        return;
+      }
       console.error("Inline EA error:", err);
       toast({
         title: "Enrichment Analysis Error",
@@ -541,6 +572,7 @@ export default function DPInlineEAStep() {
       });
     } finally {
       setLoadingAnalysis(false);
+      activeJobIdRef.current = null;
     }
   };
 
@@ -604,7 +636,7 @@ export default function DPInlineEAStep() {
       (isMetaSource && state.dpDeMetaMethod !== "effect_size" && enConfig.rankByCol === "Combined Effects Size") ||
       (isMetaSource && state.dpDeMetaMethod === "effect_size" && enConfig.rankByCol === "Combined LogFC")) {
       dispatch({
-        type: "EN_SET_CONFIG",
+        type: "DP_INLINE_EN_SET_CONFIG",
         patch: { rankByCol: defaultRankBy }
       });
     }
@@ -667,7 +699,7 @@ export default function DPInlineEAStep() {
                 data-testid="details-organism-locked"
               >
                 <span>{enConfig.organism || lockedOrganism}</span>
-                <span style={{ fontSize: 11, color: "var(--muted-foreground)" }}></span>
+                <Lock size={12} style={{ color: "var(--muted-foreground)", flexShrink: 0 }} />
               </div>
             ) : (
               <details style={{ width: 200, position: "relative" }} data-testid="details-organism">
@@ -768,12 +800,12 @@ export default function DPInlineEAStep() {
           <div className="card-title" style={{ marginBottom: 12 }}>Enrichment Methods (Select multiple)</div>
           <div style={{ display: "grid", gridTemplateColumns: (isOnlyOraMeta || !sigStatus.hasAnySig) ? "1fr" : "1fr 1fr", gap: 10 }}>
             {(isOnlyOraMeta ? [
-              { id: "ora" as const, icon: "🔬", label: "ORA", desc: "Over-Representation Analysis — tests if gene sets are enriched in a list of significant genes" },
+              { id: "ora" as const, icon: <Microscope size={20} />, label: "ORA", desc: "Over-Representation Analysis — tests if gene sets are enriched in a list of significant genes" },
             ] : !sigStatus.hasAnySig ? [
-              { id: "gsea" as const, icon: "📈", label: "GSEA", desc: "Gene Set Enrichment Analysis — ranked-based enrichment using all genes" },
+              { id: "gsea" as const, icon: <TrendingUp size={20} />, label: "GSEA", desc: "Gene Set Enrichment Analysis — ranked-based enrichment using all genes" },
             ] : [
-              { id: "gsea" as const, icon: "📈", label: "GSEA", desc: "Gene Set Enrichment Analysis — ranked-based enrichment using all genes" },
-              { id: "ora" as const, icon: "🔬", label: "ORA", desc: "Over-Representation Analysis — tests if gene sets are enriched in a list of significant genes" },
+              { id: "gsea" as const, icon: <TrendingUp size={20} />, label: "GSEA", desc: "Gene Set Enrichment Analysis — ranked-based enrichment using all genes" },
+              { id: "ora" as const, icon: <Microscope size={20} />, label: "ORA", desc: "Over-Representation Analysis — tests if gene sets are enriched in a list of significant genes" },
             ]).map(m => {
               const isChosen = selectedMethods.includes(m.id);
               return (
@@ -790,9 +822,11 @@ export default function DPInlineEAStep() {
                   data-testid={`card-enmethod-${m.id}`}
                 >
                   {isChosen && (
-                    <span style={{ position: "absolute", top: 8, right: 8, fontSize: 12, color: "var(--primary)", fontWeight: 700 }}>✓</span>
+                    <span style={{ position: "absolute", top: 8, right: 8, color: "var(--primary)" }}>
+                      <Check size={14} />
+                    </span>
                   )}
-                  <div style={{ fontSize: 18, marginBottom: 6 }}>{m.icon}</div>
+                  <div style={{ marginBottom: 6, color: isChosen ? "var(--primary)" : "var(--foreground)" }}>{m.icon}</div>
                   <div style={{ fontSize: 13, fontWeight: 600, color: "var(--foreground)", marginBottom: 4 }}>{m.label}</div>
                   <div style={{ fontSize: 11, color: "var(--muted-foreground)", lineHeight: 1.5 }}>{m.desc}</div>
                 </div>
@@ -800,8 +834,9 @@ export default function DPInlineEAStep() {
             })}
           </div>
           {!sigStatus.hasAnySig && (
-            <div className="banner info" style={{ marginTop: 12, marginBottom: 0 }}>
-              ℹ️ <strong>ORA disabled:</strong> No significant genes were identified in the Differential Expression analysis. Going straight to GSEA.
+            <div className="banner info" style={{ marginTop: 12, marginBottom: 0, display: "flex", alignItems: "center", gap: 6 }}>
+              <Info size={14} style={{ flexShrink: 0 }} />
+              <span><strong>ORA disabled:</strong> No significant genes were identified in the Differential Expression analysis. Going straight to GSEA.</span>
             </div>
           )}
         </div>
@@ -1080,7 +1115,7 @@ export default function DPInlineEAStep() {
   // Analysis view
   return (
     <>
-      {loadingAnalysis && <Spinner label={loadingMsg} sublabel="Please wait…" />}
+      {loadingAnalysis && <Spinner label={loadingMsg} sublabel="Please wait…" onCancel={handleCancel} />}
 
       {showWarnModal && (
         <ChangeWarnModal 
@@ -1143,8 +1178,9 @@ export default function DPInlineEAStep() {
         </div>
                     
         {isNoDbSelected && (
-          <div className="banner warning" style={{ background: "hsl(38 90% 95%)", color: "hsl(38 80% 25%)", border: "1px solid hsl(38 70% 80%)", padding: 10, borderRadius: 6, marginTop: 14, fontSize: 12 }}>
-            ⚠️ Please select at least one database to run the analysis.
+          <div className="banner warning" style={{ background: "hsl(38 90% 95%)", color: "hsl(38 80% 25%)", border: "1px solid hsl(38 70% 80%)", padding: 10, borderRadius: 6, marginTop: 14, fontSize: 12, display: "flex", alignItems: "center", gap: 6 }}>
+            <AlertTriangle size={14} style={{ flexShrink: 0 }} />
+            <span>Please select at least one database to run the analysis.</span>
           </div>
         )}
 
@@ -1222,15 +1258,18 @@ export default function DPInlineEAStep() {
           }}
           data-testid="unmapped-genes-banner"
         >
-          <div>
-            ⚠️ <strong>Gene ID Mapping Notice:</strong>{" "}
-            {activeUnmappedGenes.length > 0 ? (
-              <>
-                <strong>{activeUnmappedGenes.length}</strong> out of <strong>{activeTotalInputGenes}</strong> gene names ({((activeUnmappedGenes.length / (activeTotalInputGenes || 1)) * 100).toFixed(1)}%) could not be mapped to Entrez ID and were excluded from enrichment analysis.
-              </>
-            ) : (
-              <>All {activeTotalInputGenes} input gene names were successfully mapped to Entrez ID.</>
-            )}
+          <div style={{ display: "flex", alignItems: "flex-start", gap: 8 }}>
+            <AlertTriangle size={15} style={{ flexShrink: 0, marginTop: 2 }} />
+            <div>
+              <strong>Gene ID Mapping Notice:</strong>{" "}
+              {activeUnmappedGenes.length > 0 ? (
+                <>
+                  <strong>{activeUnmappedGenes.length}</strong> out of <strong>{activeTotalInputGenes}</strong> gene names ({((activeUnmappedGenes.length / (activeTotalInputGenes || 1)) * 100).toFixed(1)}%) could not be mapped to Entrez ID and were excluded from enrichment analysis.
+                </>
+              ) : (
+                <>All {activeTotalInputGenes} input gene names were successfully mapped to Entrez ID.</>
+              )}
+            </div>
           </div>
           {activeUnmappedGenes.length > 0 && (
             <button
@@ -1395,8 +1434,10 @@ export default function DPInlineEAStep() {
               disabled={isNoMethodSelected || isNoDbSelected}
               onClick={handleRunAnalysis}
               data-testid="btn-en-rerun"
+              style={{ display: "inline-flex", alignItems: "center", gap: 6 }}
             >
-              🔄 Redo Enrichment Analysis
+              <RotateCcw size={14} />
+              <span>Redo Enrichment Analysis</span>
             </button>
           )}
 
